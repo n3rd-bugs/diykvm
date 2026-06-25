@@ -6,7 +6,7 @@ Depends: python3 (>= 3.9), python3-venv, python3-pip, ustreamer, dosfstools, gdi
 Recommends: socat
 Section: admin
 Priority: optional
-Homepage: https://github.com/usamamasood/diykvm
+Homepage: https://github.com/n3rd-bugs/diykvm
 Description: DIY KVM-over-IP for Raspberry Pi
  Browser-based KVM-over-IP. The Raspberry Pi presents itself to a target
  machine as a USB keyboard, mouse and mass-storage (EFI boot) device, captures
