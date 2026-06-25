@@ -10,6 +10,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write        # needed to attach the .deb to a GitHub release on tags
     steps:
       - uses: actions/checkout@v4
 
