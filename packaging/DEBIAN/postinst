@@ -1,0 +1,49 @@
+#!/bin/sh
+# diykvm postinst: build the venv, generate credentials, enable USB gadget, enable services.
+set -e
+APP=/opt/kvm/app
+VENV=/opt/kvm/venv
+
+case "$1" in
+  configure)
+    # 1. Python virtualenv + dependencies
+    if [ ! -x "$VENV/bin/python" ]; then
+      python3 -m venv "$VENV"
+    fi
+    "$VENV/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || true
+    "$VENV/bin/pip" install --quiet -r "$APP/requirements.txt"
+
+    # 2. system group used by the hidg udev rule
+    getent group kvm >/dev/null || groupadd --system kvm
+
+    # 3. credentials + dirs (generate a random admin password on first install)
+    mkdir -p /opt/kvm/images /etc/kvm/tls
+    chmod 700 /etc/kvm/tls
+    if [ ! -f /opt/kvm/config.json ]; then
+      PW="$("$VENV/bin/python" -c 'import secrets; print(secrets.token_urlsafe(9))')"
+      ( cd "$APP" && "$VENV/bin/python" setup_auth.py admin "$PW" ) >/dev/null
+      echo "diykvm: web login  ->  user 'admin'  password '$PW'"
+      echo "diykvm: change it with:  sudo $VENV/bin/python $APP/setup_auth.py <user> <pass>"
+    fi
+
+    # 4. enable USB gadget mode on the Pi's USB-C/OTG port (reboot required)
+    for CFG in /boot/firmware/config.txt /boot/config.txt; do
+      if [ -f "$CFG" ] && ! grep -q 'dtoverlay=dwc2,dr_mode=peripheral' "$CFG"; then
+        printf '\n# diykvm: USB gadget mode\ndtoverlay=dwc2,dr_mode=peripheral\n' >> "$CFG"
+        echo "diykvm: enabled USB gadget in $CFG  --  REBOOT required."
+        break
+      fi
+    done
+
+    # 5. virtual drive image
+    /usr/local/sbin/kvm-mkimage || echo "diykvm: create the drive image later with: sudo kvm-mkimage"
+
+    # 6. services
+    udevadm control --reload-rules >/dev/null 2>&1 || true
+    systemctl daemon-reload
+    systemctl enable kvm-gadget.service ustreamer.service kvm-web.service >/dev/null 2>&1 || true
+    systemctl start ustreamer.service >/dev/null 2>&1 || true
+    echo "diykvm: installed. Reboot to activate the USB gadget, then open http://<pi-ip>:8000/"
+    ;;
+esac
+exit 0

@@ -1,0 +1,2 @@
+# Group access to the USB HID gadget endpoints (groundwork for non-root operation).
+KERNEL=="hidg[0-9]*", GROUP="kvm", MODE="0660"

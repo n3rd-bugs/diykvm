@@ -1,0 +1,23 @@
+# secrets / runtime state
+config.json
+*.img
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# build artifacts
+build/
+dist/
+*.deb
+*.buildinfo
+*.changes
+
+# editor / tooling
+.vscode/
+.claude/
+
+# host-side test captures (binary)
+host-test/*.jpg

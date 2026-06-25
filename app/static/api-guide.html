@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DIY PiKVM — API guide for agents</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; background:#0f1115; color:#cdd3de; font:14px/1.6 system-ui,sans-serif; }
+  .wrap { max-width:860px; margin:0 auto; padding:24px 18px 80px; }
+  h1 { font-size:22px; } h2 { font-size:17px; margin-top:30px; border-bottom:1px solid #2a2f3a; padding-bottom:5px; }
+  h3 { font-size:14px; margin:18px 0 6px; color:#9fb0c8; }
+  code { background:#1b1f27; padding:1px 5px; border-radius:4px; font-size:13px; }
+  pre { background:#161a21; border:1px solid #262c37; border-radius:8px; padding:12px; overflow:auto; }
+  pre code { background:none; padding:0; }
+  table { border-collapse:collapse; width:100%; margin:8px 0; }
+  th,td { border:1px solid #2a2f3a; padding:6px 9px; text-align:left; font-size:13px; vertical-align:top; }
+  th { background:#1b1f27; }
+  a { color:#6db3ff; } .muted { color:#7b8694; }
+  .pill { display:inline-block; background:#1d4f8b; color:#fff; border-radius:4px; padding:1px 7px; font-size:11px; }
+</style>
+</head>
+<body><div class="wrap">
+<p><a href="/">&larr; back to console</a> · <a href="/logout">log out</a></p>
+<h1>DIY PiKVM — API guide for Claude &amp; other agents</h1>
+<p class="muted">A KVM-over-IP appliance: drive the target's keyboard/mouse, watch its screen, manage a virtual
+USB drive (an EFI System Partition), and talk to a serial console — all over HTTP/WebSocket. LAN-only.</p>
+
+<h2>1. Authentication</h2>
+<p>Humans log in at <code>/login</code> (session cookie). <b>Agents use the API key.</b> Get it by exchanging
+credentials once:</p>
+<pre><code>curl -s -X POST http://&lt;pi&gt;:8000/api/login \
+     -d username=admin -d password=YOURPASS
+# -> {"api_key":"&lt;KEY&gt;"}</code></pre>
+<p>Then send the key on every request — HTTP header <b><code>X-API-Key: &lt;KEY&gt;</code></b> (or
+<code>Authorization: Bearer &lt;KEY&gt;</code>); for WebSockets add <b><code>?token=&lt;KEY&gt;</code></b> to the URL.</p>
+
+<h2>2. Input — keyboard &amp; mouse <span class="pill">WS /ws</span></h2>
+<p>Connect to <code>ws://&lt;pi&gt;:8000/ws?token=&lt;KEY&gt;</code> and send JSON messages:</p>
+<table>
+<tr><th>Message</th><th>Effect</th></tr>
+<tr><td><code>{"t":"kd","code":"KeyA"}</code></td><td>key down (<code>code</code> = JS <code>KeyboardEvent.code</code>)</td></tr>
+<tr><td><code>{"t":"ku","code":"KeyA"}</code></td><td>key up</td></tr>
+<tr><td><code>{"t":"mm","x":0.5,"y":0.5}</code></td><td>absolute move — x,y normalized 0..1 over the target's primary display</td></tr>
+<tr><td><code>{"t":"mr","dx":10,"dy":-4}</code></td><td>relative move (trackpad), signed −127..127</td></tr>
+<tr><td><code>{"t":"mb","button":0,"down":true}</code></td><td>button 0=left 1=middle 2=right (JS MouseEvent.button)</td></tr>
+<tr><td><code>{"t":"mw","dy":1}</code></td><td>wheel (±1)</td></tr>
+<tr><td><code>{"t":"reset"}</code></td><td>release all keys &amp; buttons</td></tr>
+</table>
+<p><b>Keys:</b> use <code>KeyboardEvent.code</code> values — letters <code>KeyA</code>..<code>KeyZ</code>,
+digits <code>Digit0</code>..<code>Digit9</code>, <code>Enter Escape Backspace Tab Space</code>,
+<code>F1</code>..<code>F12</code>, <code>Arrow{Up,Down,Left,Right}</code>, <code>Home End PageUp PageDown
+Insert Delete</code>, modifiers <code>ControlLeft ShiftLeft AltLeft MetaLeft</code> (and the Right variants),
+punctuation <code>Minus Equal BracketLeft BracketRight Backslash Semicolon Quote Backquote Comma Period
+Slash</code>. To type a capital "A": <code>kd ShiftLeft</code>, <code>kd KeyA</code>, <code>ku KeyA</code>, <code>ku ShiftLeft</code>.</p>
+<h3>Example (Python)</h3>
+<pre><code>import asyncio, json, websockets
+async def type_hello(pi, key):
+    async with websockets.connect(f"ws://{pi}:8000/ws?token={key}") as ws:
+        for c in ["KeyH","KeyI"]:
+            await ws.send(json.dumps({"t":"kd","code":c}))
+            await ws.send(json.dumps({"t":"ku","code":c}))
+        await ws.send(json.dumps({"t":"mm","x":0.5,"y":0.5}))   # cursor to screen center
+asyncio.run(type_hello("192.168.1.120","&lt;KEY&gt;"))</code></pre>
+
+<h2>3. Screen <span class="pill">GET /snapshot</span> <span class="pill">GET /stream</span></h2>
+<table>
+<tr><td><code>GET /snapshot</code></td><td>single JPEG of the target screen right now</td></tr>
+<tr><td><code>GET /stream</code></td><td>live MJPEG (<code>multipart/x-mixed-replace</code>)</td></tr>
+</table>
+<pre><code>curl -s -H "X-API-Key: &lt;KEY&gt;" http://&lt;pi&gt;:8000/snapshot -o screen.jpg</code></pre>
+
+<h2>4. Virtual USB drive / EFI boot media <span class="pill">/api/msd/*</span></h2>
+<p>The target sees a removable USB disk (a GPT disk with a FAT32 EFI System Partition). The drive is either
+<b>attached</b> to the target <i>or</i> mounted on the Pi for editing — never both.</p>
+<table>
+<tr><th>Endpoint</th><th>Does</th></tr>
+<tr><td><code>GET /api/msd/status</code></td><td><code>{state, attached, editing, can_edit, image_size}</code></td></tr>
+<tr><td><code>POST /api/msd/detach</code></td><td>eject from target, mount the ESP on the Pi (enables file ops)</td></tr>
+<tr><td><code>POST /api/msd/attach</code></td><td>unmount on Pi, hand the disk back to the target</td></tr>
+<tr><td><code>GET /api/msd/ls?path=</code></td><td>list a directory (only while <code>editing</code>)</td></tr>
+<tr><td><code>POST /api/msd/upload?path=</code></td><td>multipart <code>file=@…</code> upload</td></tr>
+<tr><td><code>GET /api/msd/download?path=</code></td><td>download a file</td></tr>
+<tr><td><code>POST /api/msd/mkdir?path=</code> · <code>DELETE /api/msd/rm?path=</code></td><td>make / remove</td></tr>
+</table>
+<pre><code># put a UEFI bootloader on the ESP, then boot the target from it
+curl -s -X POST -H "X-API-Key: &lt;KEY&gt;" http://&lt;pi&gt;:8000/api/msd/detach
+curl -s -H "X-API-Key: &lt;KEY&gt;" -F file=@BOOTX64.EFI \
+     "http://&lt;pi&gt;:8000/api/msd/upload?path=EFI/BOOT"
+curl -s -X POST -H "X-API-Key: &lt;KEY&gt;" http://&lt;pi&gt;:8000/api/msd/attach</code></pre>
+
+<h2>5. Serial console <span class="pill">/api/serial/ports</span> <span class="pill">WS /ws/serial</span></h2>
+<table>
+<tr><td><code>GET /api/serial/ports</code></td><td>list serial ports: <code>{ports:[{device,desc,hwid}]}</code></td></tr>
+<tr><td><code>WS /ws/serial?device=/dev/ttyUSB0&amp;baud=115200&amp;token=&lt;KEY&gt;</code></td>
+    <td>bidirectional bytes: text you send is written to the port; data read from the port is sent to you</td></tr>
+</table>
+<pre><code>import asyncio, websockets
+async def console(pi, key, dev):
+    url=f"ws://{pi}:8000/ws/serial?device={dev}&amp;baud=115200&amp;token={key}"
+    async with websockets.connect(url) as ws:
+        await ws.send("\r")                 # nudge the prompt
+        async for line in ws: print(line, end="")
+asyncio.run(console("192.168.1.120","&lt;KEY&gt;","/dev/ttyUSB0"))</code></pre>
+
+<h2>6. Notes</h2>
+<ul>
+<li>The mouse maps to the target's <b>primary</b> display (absolute) — use relative <code>mr</code> for multi-monitor targets.</li>
+<li>Rotate the API key by re-running <code>setup_auth.py</code> on the Pi.</li>
+<li>Everything is LAN-only; there is no rate limiting — don't expose port 8000 to the internet without a VPN.</li>
+</ul>
+</div></body></html>

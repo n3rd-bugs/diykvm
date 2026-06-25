@@ -1,0 +1,12 @@
+#!/bin/sh
+# Launch uStreamer using settings from /etc/kvm/kvm.conf
+G() { kvm-conf-get "$1" "$2" "$3"; }
+exec /usr/bin/ustreamer \
+  --device="$(G video device /dev/video0)" \
+  --format=MJPEG \
+  --resolution="$(G video resolution 1920x1080)" \
+  --desired-fps="$(G video fps 30)" \
+  --drop-same-frames=30 \
+  --host="$(G video ustreamer_host 127.0.0.1)" \
+  --port="$(G video ustreamer_port 8080)" \
+  --log-level=1

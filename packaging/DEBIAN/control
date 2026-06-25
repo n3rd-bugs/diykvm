@@ -1,0 +1,18 @@
+Package: diykvm
+Version: 0.1.0
+Architecture: all
+Maintainer: Usama Masood <mirzaon@gmail.com>
+Depends: python3 (>= 3.9), python3-venv, python3-pip, ustreamer, dosfstools, gdisk, util-linux, mount, libjpeg62-turbo
+Recommends: socat
+Section: admin
+Priority: optional
+Homepage: https://github.com/usamamasood/diykvm
+Description: DIY KVM-over-IP for Raspberry Pi
+ Browser-based KVM-over-IP. The Raspberry Pi presents itself to a target
+ machine as a USB keyboard, mouse and mass-storage (EFI boot) device, captures
+ the target's HDMI through a USB capture dongle, and serves a web UI to control
+ input, manage the virtual drive and reach a serial console.
+ .
+ LAN-only, with session-cookie and API-key authentication. Settings live in
+ /etc/kvm/kvm.conf. The Python dependencies are installed into a virtualenv at
+ /opt/kvm/venv on first configure.

@@ -1,0 +1,21 @@
+[Unit]
+Description=DIY PiKVM web control plane (FastAPI -> HID)
+After=network-online.target kvm-gadget.service
+Wants=network-online.target
+Requires=kvm-gadget.service
+
+[Service]
+Type=simple
+# Runs as root: needs /dev/hidg0, configfs (USB gadget) and mount/losetup for the virtual drive.
+WorkingDirectory=/opt/kvm/app
+EnvironmentFile=-/etc/kvm/kvm.env
+ExecStart=/opt/kvm/venv/bin/python /opt/kvm/app/server.py
+Restart=on-failure
+RestartSec=2
+# Modest hardening (kept compatible with the privileged USB/mount operations).
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+case "$1" in
+  purge)
+    rm -rf /opt/kvm/venv /opt/kvm/config.json /etc/kvm/tls
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    echo "diykvm: purged (the drive image under /opt/kvm/images was kept)."
+    ;;
+esac
+exit 0

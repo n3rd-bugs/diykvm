@@ -1,0 +1,22 @@
+#!/bin/sh
+# Create the virtual USB drive image (GPT + FAT32 EFI System Partition) if absent.
+set -e
+IMG="$(kvm-conf-get usb image_path /opt/kvm/images/drive.img)"
+SIZE="$(kvm-conf-get usb image_size 1G)"
+[ -f "$IMG" ] && { echo "diykvm: $IMG already exists"; exit 0; }
+
+mkdir -p "$(dirname "$IMG")"
+truncate -s "$SIZE" "$IMG"
+sgdisk -Z "$IMG" >/dev/null 2>&1 || true
+sgdisk -n 1:0:0 -t 1:EF00 -c 1:"EFI System Partition" "$IMG" >/dev/null
+LOOP="$(losetup -f --show -P "$IMG")"
+i=0
+while [ ! -b "${LOOP}p1" ] && [ "$i" -lt 25 ]; do sleep 0.2; i=$((i + 1)); done
+mkfs.vfat -F 32 -n ESP "${LOOP}p1" >/dev/null
+MNT="$(mktemp -d)"
+mount "${LOOP}p1" "$MNT"
+mkdir -p "$MNT/EFI/BOOT"
+printf 'Upload your UEFI bootloader here as BOOTX64.EFI\n' > "$MNT/EFI/BOOT/README.txt"
+sync
+umount "$MNT"; rmdir "$MNT"; losetup -d "$LOOP"
+echo "diykvm: created $IMG ($SIZE, GPT + ESP)"

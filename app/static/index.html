@@ -1,0 +1,597 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>DIY PiKVM</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #111; color: #ddd;
+               font: 13px/1.4 system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  #mid { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: row; }
+  #bar { display: flex; gap: 8px; align-items: center; padding: 6px 10px;
+         background: #1b1b1b; border-bottom: 1px solid #333; flex: 0 0 auto; }
+  #bar button { background: #2a2a2a; color: #ddd; border: 1px solid #444;
+                border-radius: 5px; padding: 5px 9px; cursor: pointer; }
+  #bar button:hover { background: #383838; }
+  #bar button.on { background: #1d6b2f; border-color: #2c9a45; }
+  .sp { flex: 1; }
+  #dot { width: 10px; height: 10px; border-radius: 50%; background: #b33; }
+  #dot.up { background: #3a3; }
+  #wrap { position: relative; flex: 1 1 auto; min-width: 0; display: flex;
+          align-items: center; justify-content: center; overflow: hidden; }
+  #screen { max-width: 100%; max-height: 100%; display: block; cursor: crosshair;
+            background: #000; }
+  #hint { position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+          background: #000a; padding: 4px 10px; border-radius: 6px; pointer-events: none; }
+  /* file manager — in-flow right column (does not overlay the stream) */
+  #fm { flex: 0 0 360px; max-width: 92vw; background: #181818; border-left: 1px solid #333;
+        display: none; flex-direction: column; padding: 12px; gap: 10px; overflow: auto; }
+  #fm.show { display: flex; }
+  #fm h3 { margin: 0; font-size: 14px; }
+  #fm .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  #fm button { background: #2a2a2a; color: #ddd; border: 1px solid #444; border-radius: 5px;
+               padding: 5px 9px; cursor: pointer; }
+  #fm button.primary { background: #1d4f8b; border-color: #2c6fb8; }
+  #fm .state { padding: 6px 9px; border-radius: 6px; font-weight: 600; }
+  .st-attached { background: #4a3a16; color: #f2c879; }
+  .st-editing  { background: #163a1d; color: #79f29a; }
+  .st-detached { background: #3a1616; color: #f29079; }
+  #fmlist { list-style: none; margin: 0; padding: 0; border-top: 1px solid #333; }
+  #fmlist li { display: flex; align-items: center; gap: 8px; padding: 5px 2px;
+               border-bottom: 1px solid #262626; }
+  #fmlist li .nm { flex: 1; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #fmlist li .sz { color: #888; font-size: 11px; }
+  #fmlist li a, #fmlist li .del { color: #9bd; cursor: pointer; text-decoration: none; font-size: 12px; }
+  #fmmsg { color: #f29; min-height: 16px; font-size: 12px; }
+  #fmpath { color: #9ad; font-size: 12px; word-break: break-all; }
+  /* touch + on-screen controls */
+  #wrap, #screen { touch-action: none; }
+  #bar { flex-wrap: wrap; }
+  /* in-flow bottom panel (does not overlay the stream) */
+  #panel { flex: 0 0 auto; display: none; flex-direction: column; gap: 4px; padding: 6px;
+           background: #1c1c1c; border-top: 1px solid #333; max-height: 55vh; overflow-y: auto; }
+  #panel.show { display: flex; }
+  #mouserow { display: none; gap: 6px; justify-content: center; flex-wrap: wrap; }
+  #mouserow.show { display: flex; }
+  #keyrows { display: none; flex-direction: column; gap: 4px; overflow-x: auto; }
+  #keyrows.show { display: flex; }
+  .krow { display: flex; gap: 4px; justify-content: stretch; min-width: max-content; }
+  .pk { flex: 1 1 auto; min-width: 26px; text-align: center; background: #2a2a2a; color: #eee;
+        border: 1px solid #444; border-radius: 5px; padding: 9px 4px; font-size: 13px;
+        user-select: none; cursor: pointer; touch-action: manipulation; }
+  .pk:active { background: #155; }
+  .pk.wide { flex-grow: 2.2; }
+  .pk.mod.on   { background: #1d6b2f; border-color: #2c9a45; }
+  .pk.mod.lock { background: #2c9a45; border-color: #6fe08a; color: #021; }
+  #mouserow .pk { flex: 0 0 auto; min-width: 76px; padding: 11px 12px; font-size: 14px; }
+  #mouserow .pk.on { background: #1d4f8b; border-color: #2c6fb8; }
+  #mouserow .speed { display: flex; align-items: center; gap: 6px; color: #ddd;
+                     font-size: 13px; padding: 6px 10px; white-space: nowrap; }
+  #mouserow .speed input { width: 120px; touch-action: manipulation; }
+  .barlink { color: #9bd; text-decoration: none; border: 1px solid #444; border-radius: 5px;
+             padding: 5px 9px; background: #2a2a2a; }
+  .barlink:hover { background: #383838; }
+  .barchk { display: flex; align-items: center; gap: 5px; font-size: 12px; color: #9ab; cursor: pointer;
+            border: 1px solid #444; border-radius: 5px; padding: 5px 9px; background: #2a2a2a; }
+  .barchk input { cursor: pointer; margin: 0; }
+  /* serial console (in-flow bottom panel) */
+  #serialpanel { flex: 0 0 auto; display: none; flex-direction: column; gap: 6px; padding: 8px;
+                 background: #0d0f13; border-top: 1px solid #333; max-height: 44vh; }
+  #serialpanel.show { display: flex; }
+  #serialpanel .srow { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  #serialpanel select, #serialpanel button, #serin {
+     background: #222; color: #eee; border: 1px solid #444; border-radius: 5px; padding: 6px 8px; font-size: 13px; }
+  #serialpanel button { cursor: pointer; }
+  #serialpanel button.on { background: #1d6b2f; border-color: #2c9a45; }
+  #serout { flex: 1 1 auto; margin: 0; min-height: 110px; overflow: auto; background: #000; color: #9f9;
+            border: 1px solid #222; border-radius: 6px; padding: 8px;
+            font: 12px/1.35 ui-monospace, monospace; white-space: pre-wrap; word-break: break-all; }
+  #serin { width: 100%; font-family: ui-monospace, monospace; }
+  .chk { font-size: 12px; color: #9ab; display: flex; align-items: center; gap: 4px; }
+  .muted { color: #7b8694; font-size: 12px; }
+</style>
+</head>
+<body>
+  <div id="bar">
+    <span id="dot" title="link status"></span>
+    <strong>DIY&nbsp;PiKVM</strong>
+    <button id="cap">Capture input: OFF</button>
+    <button id="cad" title="Ctrl+Alt+Del">Ctrl-Alt-Del</button>
+    <button id="rel" title="release stuck keys/buttons">Release all</button>
+    <button id="files" title="virtual USB drive">Files ▾</button>
+    <button id="kbd" title="on-screen keyboard">⌨</button>
+    <button id="mouse" title="on-screen mouse buttons">🖱</button>
+    <button id="serialbtn" title="serial console">Serial</button>
+    <label class="barchk" title="send occasional mouse nudges so the target display doesn't sleep (paused while you interact)"><input type="checkbox" id="awake"> Keep awake</label>
+    <span class="sp"></span>
+    <span id="info">—</span>
+    <button id="full">Fullscreen</button>
+    <a class="barlink" href="/api-guide" target="_blank" title="API guide for agents">API</a>
+    <a class="barlink" href="/logout" title="sign out">Logout</a>
+  </div>
+  <div id="mid">
+  <div id="wrap">
+    <img id="screen" alt="target screen">
+    <div id="hint">Click the screen to capture keyboard &amp; mouse · Esc-hold or button to release</div>
+  </div>
+
+    <div id="fm">
+      <h3>Virtual USB drive · EFI System Partition</h3>
+      <div class="row">
+        <span id="fmstate" class="state st-detached">…</span>
+        <span id="fmsize" class="sz"></span>
+      </div>
+      <div class="row">
+        <button id="fmdetach" class="primary" title="eject from target, mount on the Pi to edit">Detach &amp; edit</button>
+        <button id="fmattach" title="unmount on the Pi, expose to the target">Attach to target</button>
+      </div>
+      <div id="fmedit" style="display:none; flex-direction:column; gap:8px;">
+        <div class="row">
+          <button id="fmup">Upload file…</button>
+          <button id="fmmkdir">New folder</button>
+          <button id="fmrefresh">↻</button>
+          <input id="fmfile" type="file" style="display:none">
+        </div>
+        <div id="fmpath">/</div>
+        <ul id="fmlist"></ul>
+      </div>
+      <div id="fmmsg"></div>
+      <p style="color:#888;font-size:11px;margin:4px 0 0">
+        FAT32 EFI System Partition. To make the target boot it, place a UEFI bootloader at
+        <code>/EFI/BOOT/BOOTX64.EFI</code>. The drive can be used by the target <em>or</em> edited here —
+        never both at once. Detach to edit; attach to hand it back to the target.</p>
+    </div>
+  </div>
+
+  <div id="panel">
+    <div id="mouserow"></div>
+    <div id="keyrows"></div>
+  </div>
+
+  <div id="serialpanel">
+    <div class="srow">
+      <select id="serport" title="serial port"></select>
+      <select id="serbaud" title="baud rate"></select>
+      <button id="serconn">Connect</button>
+      <button id="serrefresh" title="rescan ports">↻</button>
+      <label class="chk"><input type="checkbox" id="serraw"> raw keys</label>
+      <button id="serclear">Clear</button>
+      <span id="serstatus" class="muted"></span>
+    </div>
+    <pre id="serout" tabindex="0"></pre>
+    <input id="serin" placeholder="type a line · Enter sends · tick 'raw keys' for interactive consoles">
+  </div>
+
+<script>
+const host = location.hostname;
+const wsURL = (p) => (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + p;
+const streamURL = '/stream';                 // proxied through the authenticated app
+const img = document.getElementById('screen');
+img.src = streamURL;
+
+const dot  = document.getElementById('dot');
+const info = document.getElementById('info');
+const capBtn = document.getElementById('cap');
+let ws, capturing = false;
+
+function connect() {
+  ws = new WebSocket(wsURL('/ws'));
+  ws.onopen  = () => { dot.classList.add('up'); };
+  ws.onclose = () => { dot.classList.remove('up'); setTimeout(connect, 1000); };
+  ws.onerror = () => ws.close();
+}
+connect();
+const send = (o) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
+
+function setCapture(on) {
+  capturing = on;
+  capBtn.textContent = 'Capture input: ' + (on ? 'ON' : 'OFF');
+  capBtn.classList.toggle('on', on);
+}
+capBtn.onclick = () => setCapture(!capturing);
+
+// ---- keyboard ----
+window.addEventListener('keydown', (e) => {
+  if (!capturing) return;
+  e.preventDefault();
+  send({ t: 'kd', code: e.code });
+}, true);
+window.addEventListener('keyup', (e) => {
+  if (!capturing) return;
+  e.preventDefault();
+  send({ t: 'ku', code: e.code });
+}, true);
+
+// ---- mouse over the screen ----
+function norm(e) {
+  const r = img.getBoundingClientRect();
+  return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height };
+}
+img.addEventListener('mousemove', (e) => {
+  if (!capturing) return;
+  const p = norm(e);
+  if (p.x < 0 || p.x > 1 || p.y < 0 || p.y > 1) return;
+  send({ t: 'mm', x: p.x, y: p.y });
+  info.textContent = `${(p.x*100).toFixed(0)}% , ${(p.y*100).toFixed(0)}%`;
+});
+img.addEventListener('mousedown', (e) => {
+  if (!capturing) { setCapture(true); return; }
+  e.preventDefault(); send({ t: 'mb', button: e.button, down: true });
+});
+window.addEventListener('mouseup', (e) => {
+  if (!capturing) return;
+  send({ t: 'mb', button: e.button, down: false });
+});
+img.addEventListener('contextmenu', (e) => e.preventDefault());
+img.addEventListener('wheel', (e) => {
+  if (!capturing) return;
+  e.preventDefault();
+  send({ t: 'mw', dy: e.deltaY > 0 ? -1 : 1 });
+}, { passive: false });
+
+// ---- toolbar actions ----
+document.getElementById('cad').onclick = () => {
+  send({ t: 'kd', code: 'ControlLeft' }); send({ t: 'kd', code: 'AltLeft' });
+  send({ t: 'kd', code: 'Delete' });
+  setTimeout(() => send({ t: 'reset' }), 80);
+};
+document.getElementById('rel').onclick  = () => send({ t: 'reset' });
+document.getElementById('full').onclick = () =>
+  document.documentElement.requestFullscreen?.();
+
+// release everything if the operator tabs away (avoid stuck keys)
+window.addEventListener('blur', () => send({ t: 'reset' }));
+
+// ---------- file manager (virtual USB drive) ----------
+const fm = document.getElementById('fm');
+const fmstate = document.getElementById('fmstate');
+const fmsize = document.getElementById('fmsize');
+const fmedit = document.getElementById('fmedit');
+const fmlist = document.getElementById('fmlist');
+const fmpath = document.getElementById('fmpath');
+const fmmsg  = document.getElementById('fmmsg');
+let cwd = '';
+const fmErr = (m) => { fmmsg.textContent = m || ''; };
+const fmtSize = (n) => n >= 1048576 ? (n/1048576).toFixed(1)+' MB'
+                     : n >= 1024 ? (n/1024).toFixed(1)+' KB' : n+' B';
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const ct = r.headers.get('content-type') || '';
+  if (!r.ok) { let d; try { d = (await r.json()).detail; } catch(e){} throw new Error(d || ('HTTP '+r.status)); }
+  return ct.includes('json') ? r.json() : r;
+}
+
+document.getElementById('files').onclick = () => {
+  fm.classList.toggle('show');
+  if (fm.classList.contains('show')) fmStatus();
+};
+
+async function fmStatus() {
+  fmErr('');
+  try {
+    const s = await api('/api/msd/status');
+    fmstate.textContent = s.state;
+    fmstate.className = 'state st-' + s.state;
+    fmsize.textContent = s.image_size ? fmtSize(s.image_size) : 'no image';
+    fmedit.style.display = s.can_edit ? 'flex' : 'none';
+    document.getElementById('fmdetach').disabled = s.editing;
+    document.getElementById('fmattach').disabled = !s.editing;
+    if (s.can_edit) fmLs(cwd);
+  } catch (e) { fmErr(e.message); }
+}
+document.getElementById('fmdetach').onclick = async () => {
+  fmErr('ejecting from target & mounting on Pi…');
+  try { await api('/api/msd/detach', {method:'POST'}); cwd=''; await fmStatus(); } catch(e){ fmErr(e.message); }
+};
+document.getElementById('fmattach').onclick = async () => {
+  fmErr('unmounting & attaching to target…');
+  try { await api('/api/msd/attach', {method:'POST'}); await fmStatus(); } catch(e){ fmErr(e.message); }
+};
+async function fmLs(path) {
+  try {
+    const d = await api('/api/msd/ls?path=' + encodeURIComponent(path));
+    cwd = d.path; fmpath.textContent = '/' + cwd;
+    fmlist.innerHTML = '';
+    if (cwd) {
+      const li = document.createElement('li');
+      li.innerHTML = '<span class="nm">📁 ..</span>';
+      li.querySelector('.nm').onclick = () => fmLs(cwd.split('/').slice(0,-1).join('/'));
+      fmlist.appendChild(li);
+    }
+    for (const it of d.items) {
+      const li = document.createElement('li');
+      const full = (cwd ? cwd + '/' : '') + it.name;
+      if (it.dir) {
+        li.innerHTML = '<span class="nm">📁 '+it.name+'</span><span class="del">✕</span>';
+        li.querySelector('.nm').onclick = () => fmLs(full);
+      } else {
+        li.innerHTML = '<span class="nm">📄 '+it.name+'</span><span class="sz">'+fmtSize(it.size)+'</span>'
+          + '<a title="download" href="/api/msd/download?path='+encodeURIComponent(full)+'">⬇</a> <span class="del">✕</span>';
+      }
+      li.querySelector('.del').onclick = async () => {
+        if (!confirm('Delete '+it.name+'?')) return;
+        try { await api('/api/msd/rm?path='+encodeURIComponent(full), {method:'DELETE'}); fmLs(cwd); } catch(e){ fmErr(e.message); }
+      };
+      fmlist.appendChild(li);
+    }
+  } catch (e) { fmErr(e.message); }
+}
+document.getElementById('fmrefresh').onclick = () => fmLs(cwd);
+document.getElementById('fmup').onclick = () => document.getElementById('fmfile').click();
+document.getElementById('fmfile').onchange = async (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  fmErr('uploading '+f.name+'…');
+  const fd = new FormData(); fd.append('file', f);
+  try { await api('/api/msd/upload?path='+encodeURIComponent(cwd), {method:'POST', body: fd}); fmErr(''); fmLs(cwd); }
+  catch (err) { fmErr(err.message); }
+  e.target.value = '';
+};
+document.getElementById('fmmkdir').onclick = async () => {
+  const name = prompt('New folder name:'); if (!name) return;
+  const full = (cwd ? cwd + '/' : '') + name;
+  try { await api('/api/msd/mkdir?path='+encodeURIComponent(full), {method:'POST'}); fmLs(cwd); } catch(e){ fmErr(e.message); }
+};
+
+// ================= touch + on-screen controls =================
+const isTouch = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+let touchSens = parseFloat(localStorage.getItem('kvm_touchSens')) || 1.6;  // touch drag speed (persisted)
+const panel = document.getElementById('panel');
+const mouserow = document.getElementById('mouserow');
+const keyrows = document.getElementById('keyrows');
+const kbdBtn = document.getElementById('kbd');
+const mouseBtn = document.getElementById('mouse');
+const syncPanel = () => panel.classList.toggle('show',
+  mouserow.classList.contains('show') || keyrows.classList.contains('show'));
+mouseBtn.onclick = () => { mouserow.classList.toggle('show'); mouseBtn.classList.toggle('on', mouserow.classList.contains('show')); syncPanel(); };
+kbdBtn.onclick   = () => { keyrows.classList.toggle('show');  kbdBtn.classList.toggle('on', keyrows.classList.contains('show')); syncPanel(); };
+
+// click helpers (act at the current absolute cursor position)
+function clickBtn(b){ send({t:'mb',button:b,down:true}); setTimeout(()=>send({t:'mb',button:b,down:false}), 30); }
+const leftClick = () => clickBtn(0), rightClick = () => clickBtn(2), midClick = () => clickBtn(1);
+
+// ---- on-screen mouse buttons ----
+let dragLock = false;
+[['L click',leftClick],['R click',rightClick],['M click',midClick],
+ ['Scroll ▲',()=>send({t:'mw',dy:1})],['Scroll ▼',()=>send({t:'mw',dy:-1})]
+].forEach(([label,fn]) => { const b=document.createElement('button'); b.className='pk'; b.textContent=label; b.onclick=fn; mouserow.appendChild(b); });
+const dragB = document.createElement('button'); dragB.className='pk'; dragB.textContent='Drag (hold L)';
+dragB.onclick = () => { dragLock=!dragLock; send({t:'mb',button:0,down:dragLock}); dragB.classList.toggle('on',dragLock); };
+mouserow.appendChild(dragB);
+
+// ---- touch drag-speed (sensitivity) ----
+const speedBox = document.createElement('label'); speedBox.className = 'speed';
+const speedVal = document.createElement('span'); speedVal.textContent = touchSens.toFixed(1) + '×';
+const speed = document.createElement('input');
+speed.type='range'; speed.min='0.5'; speed.max='5'; speed.step='0.1'; speed.value=touchSens;
+speed.title = 'touch mouse speed';
+speed.oninput = () => {
+  touchSens = parseFloat(speed.value);
+  speedVal.textContent = touchSens.toFixed(1) + '×';
+  localStorage.setItem('kvm_touchSens', touchSens);
+};
+speedBox.append('Speed ', speed, ' ', speedVal);
+mouserow.appendChild(speedBox);
+
+// ---- on-screen keyboard (sticky/lockable modifiers) ----
+const MODS = {ControlLeft:'Ctrl', ShiftLeft:'Shift', AltLeft:'Alt', MetaLeft:'Win'};
+const armed = {}; const modBtns = {};
+function renderMods(){ for (const c in MODS){ const b=modBtns[c]; if(!b) continue;
+  b.classList.toggle('on', armed[c]==='armed'); b.classList.toggle('lock', armed[c]==='lock'); } }
+function tapMod(code){
+  const s = armed[code];
+  if (!s) { armed[code]='armed'; send({t:'kd',code}); }        // off -> armed (one-shot)
+  else if (s==='armed') { armed[code]='lock'; }                // armed -> locked (held)
+  else { delete armed[code]; send({t:'ku',code}); }            // locked -> off
+  renderMods();
+}
+function tapKey(code){
+  send({t:'kd',code});
+  setTimeout(()=>{ send({t:'ku',code});
+    for (const m in armed){ if (armed[m]==='armed'){ send({t:'ku',code:m}); delete armed[m]; } }
+    renderMods();
+  }, 30);
+}
+const KB = [
+  [['Esc','Escape'],['F1','F1'],['F2','F2'],['F3','F3'],['F4','F4'],['F5','F5'],['F6','F6'],['F7','F7'],['F8','F8'],['F9','F9'],['F10','F10'],['F11','F11'],['F12','F12'],['Del','Delete'],['Ins','Insert'],['PrtSc','PrintScreen']],
+  [['`','Backquote'],['1','Digit1'],['2','Digit2'],['3','Digit3'],['4','Digit4'],['5','Digit5'],['6','Digit6'],['7','Digit7'],['8','Digit8'],['9','Digit9'],['0','Digit0'],['-','Minus'],['=','Equal'],['⌫','Backspace','wide']],
+  [['Tab','Tab','wide'],['q','KeyQ'],['w','KeyW'],['e','KeyE'],['r','KeyR'],['t','KeyT'],['y','KeyY'],['u','KeyU'],['i','KeyI'],['o','KeyO'],['p','KeyP'],['[','BracketLeft'],[']','BracketRight'],['\\','Backslash']],
+  [['Caps','CapsLock','wide'],['a','KeyA'],['s','KeyS'],['d','KeyD'],['f','KeyF'],['g','KeyG'],['h','KeyH'],['j','KeyJ'],['k','KeyK'],['l','KeyL'],[';','Semicolon'],["'",'Quote'],['Enter','Enter','wide']],
+  [['Shift','ShiftLeft','mod'],['z','KeyZ'],['x','KeyX'],['c','KeyC'],['v','KeyV'],['b','KeyB'],['n','KeyN'],['m','KeyM'],[',','Comma'],['.','Period'],['/','Slash'],['↑','ArrowUp'],['Home','Home'],['End','End']],
+  [['Ctrl','ControlLeft','mod'],['Win','MetaLeft','mod'],['Alt','AltLeft','mod'],['Space','Space','wide'],['PgUp','PageUp'],['PgDn','PageDown'],['←','ArrowLeft'],['↓','ArrowDown'],['→','ArrowRight']],
+];
+for (const row of KB){
+  const r = document.createElement('div'); r.className='krow';
+  for (const [label, code, opt] of row){
+    const b = document.createElement('button');
+    b.className = 'pk' + (opt==='wide' ? ' wide' : '') + (opt==='mod' ? ' mod' : '');
+    b.textContent = label;
+    if (opt==='mod'){ modBtns[code]=b; b.onclick=()=>tapMod(code); }
+    else { b.onclick=()=>tapKey(code); }
+    r.appendChild(b);
+  }
+  keyrows.appendChild(r);
+}
+
+// ---- touch on the video (gesture model) ----
+//   1 finger: tap=left click · hold&drag=move · double-tap-hold=left held (drag if moved)
+//   2 finger: tap=right click · hold&drag=SCROLL (wheel) · double-tap-hold=right held (drag if moved)
+// Listeners on #wrap (the whole video area) so a 2nd finger in the letterbox is still counted.
+const TAP_MS    = 250;   // max duration for a no-move touch to count as a tap
+const TAP_MOVE  = 12;    // px of travel under which a touch still counts as a tap (no move)
+const DOUBLE_MS = 300;   // a touch starting within this of a tap is the "hold" half of a double-tap
+const HOLD_DELAY = 70;   // wait this long before engaging a hold, so a 2nd finger can settle the L/R choice
+const SCROLL_PX = 18;    // finger travel per wheel tick for 2-finger scroll
+const touchSurface = document.getElementById('wrap');
+let held=null, isHold=false, holdTimer=null, maxF=0, active=false, scrollAccum=0,
+    prevTapEnd=0, startT=0, sx=0, sy=0, moved=false, refX=0, refY=0;
+const midX = (ts)=>{ const n=Math.min(ts.length,2)||1; let s=0; for(let i=0;i<n;i++) s+=ts[i].clientX; return s/n; };
+const midY = (ts)=>{ const n=Math.min(ts.length,2)||1; let s=0; for(let i=0;i<n;i++) s+=ts[i].clientY; return s/n; };
+const gesture = (txt)=>{ info.textContent = txt; };
+const btnFor = ()=> maxF >= 2 ? 2 : 0;             // 0 = left (1 finger), 2 = right (2 fingers)
+function commitHold(){ holdTimer=null; held=btnFor(); send({t:'mb',button:held,down:true});
+  gesture(held===2 ? 'dbl✌ → right held' : 'dbl☝ → left held'); }
+
+touchSurface.addEventListener('touchstart', (e)=>{
+  e.preventDefault(); if(!capturing) setCapture(true);
+  const n = e.touches.length;
+  refX = sx = midX(e.touches); refY = sy = midY(e.touches); scrollAccum = 0;
+  if(!active){                                      // first finger of a new sequence
+    active = true; startT = Date.now(); moved = false; maxF = n;
+    isHold = !!(prevTapEnd && (startT - prevTapEnd) < DOUBLE_MS); prevTapEnd = 0;
+    if(isHold){ clearTimeout(holdTimer); holdTimer = setTimeout(commitHold, HOLD_DELAY); gesture('…'); }
+    else gesture(n>=2 ? '✌' : '☝');
+  } else {                                          // an extra finger joined
+    maxF = Math.max(maxF, n);
+    if(isHold && !holdTimer && held!==null && held!==btnFor()){   // already engaged -> upgrade L->R
+      send({t:'mb',button:held,down:false}); held = btnFor(); send({t:'mb',button:held,down:true});
+    }
+    if(!isHold) gesture(n>=2 ? '✌' : '☝');
+  }
+}, {passive:false});
+
+touchSurface.addEventListener('touchmove', (e)=>{
+  e.preventDefault(); if(!capturing) return;
+  if(holdTimer){ clearTimeout(holdTimer); commitHold(); }         // movement -> engage the hold now
+  const cx = midX(e.touches), cy = midY(e.touches);
+  const rdx = cx - refX, rdy = cy - refY;
+  if(Math.hypot(cx-sx, cy-sy) > TAP_MOVE) moved = true;
+  refX = cx; refY = cy;
+  if(held === null && e.touches.length >= 2){                     // plain 2-finger drag -> SCROLL (wheel)
+    scrollAccum += rdy;
+    while(Math.abs(scrollAccum) >= SCROLL_PX){
+      send({t:'mw', dy: scrollAccum > 0 ? -1 : 1});               // fingers down -> scroll down
+      scrollAccum += scrollAccum > 0 ? -SCROLL_PX : SCROLL_PX;
+    }
+    if(rdy) gesture('✌ scroll');
+  } else {                                                        // move (1-finger free, or button held = drag)
+    const dx = Math.round(rdx*touchSens), dy = Math.round(rdy*touchSens);
+    if(dx || dy) send({t:'mr',dx,dy});
+  }
+}, {passive:false});
+
+function touchEnd(e){
+  e.preventDefault();
+  if(e.touches.length > 0){                         // a finger lifted, others remain: re-baseline (no jump)
+    refX = sx = midX(e.touches); refY = sy = midY(e.touches); scrollAccum = 0;
+    return;
+  }
+  active = false;
+  if(holdTimer){                                    // hold released before it engaged = quick 2nd tap -> click
+    clearTimeout(holdTimer); holdTimer = null;
+    const b = btnFor(); send({t:'mb',button:b,down:true}); send({t:'mb',button:b,down:false});
+    prevTapEnd = Date.now();
+  } else if(held !== null){
+    send({t:'mb',button:held,down:false}); held = null;            // release held button (drag-lock / drag)
+  } else if(!moved && (Date.now()-startT) < TAP_MS){
+    const b = btnFor(); send({t:'mb',button:b,down:true}); send({t:'mb',button:b,down:false});  // tap -> click
+    prevTapEnd = Date.now();                         // arm double-tap (works for 1- and 2-finger)
+  }
+  moved = false; gesture('—');
+}
+touchSurface.addEventListener('touchend', touchEnd, {passive:false});
+touchSurface.addEventListener('touchcancel', touchEnd, {passive:false});
+
+// On a touch device, default to capture ON, reveal the mouse bar, and explain the gestures.
+if (isTouch){
+  setCapture(true);
+  mouseBtn.click();
+  document.getElementById('hint').textContent =
+    'Tap=click · 1-finger drag=move · 2-finger drag=scroll · double-tap-hold=drag · 1-finger=left/2-finger=right · ⌨ keyboard';
+}
+
+// ---------------- serial console ----------------
+const serialpanel = document.getElementById('serialpanel');
+const serport = document.getElementById('serport');
+const serbaud = document.getElementById('serbaud');
+const serout = document.getElementById('serout');
+const serin = document.getElementById('serin');
+const serstatus = document.getElementById('serstatus');
+const serconn = document.getElementById('serconn');
+const serraw = document.getElementById('serraw');
+let serWs = null;
+
+[9600,19200,38400,57600,115200,230400,460800,921600].forEach(b => {
+  const o=document.createElement('option'); o.value=b; o.textContent=b; if(b===115200) o.selected=true; serbaud.appendChild(o);
+});
+async function serLoadPorts(){
+  try {
+    const d = await api('/api/serial/ports');
+    serport.innerHTML='';
+    if(!d.ports.length){ const o=document.createElement('option'); o.value=''; o.textContent='(no serial ports detected)'; serport.appendChild(o); }
+    for(const p of d.ports){ const o=document.createElement('option'); o.value=p.device; o.textContent=p.device+(p.desc?(' — '+p.desc):''); serport.appendChild(o); }
+  } catch(e){ serstatus.textContent=e.message; }
+}
+document.getElementById('serialbtn').onclick = () => {
+  serialpanel.classList.toggle('show');
+  if(serialpanel.classList.contains('show') && !serport.options.length) serLoadPorts();
+};
+document.getElementById('serrefresh').onclick = serLoadPorts;
+document.getElementById('serclear').onclick = () => serout.textContent='';
+function serAppend(t){ serout.textContent += t; serout.scrollTop = serout.scrollHeight;
+  if(serout.textContent.length>200000) serout.textContent = serout.textContent.slice(-150000); }
+const serSend = (s) => { if(serWs && serWs.readyState===1) serWs.send(s); };
+
+serconn.onclick = () => {
+  if(serWs){ serWs.close(); return; }
+  const dev = serport.value; if(!dev){ serstatus.textContent='no port selected'; return; }
+  serWs = new WebSocket(wsURL(`/ws/serial?device=${encodeURIComponent(dev)}&baud=${serbaud.value}`));
+  serWs.onopen    = () => { serconn.textContent='Disconnect'; serconn.classList.add('on'); serstatus.textContent='connected'; (serraw.checked?serout:serin).focus(); };
+  serWs.onmessage = (e) => serAppend(e.data);
+  serWs.onclose   = () => { serconn.textContent='Connect'; serconn.classList.remove('on'); serstatus.textContent='disconnected'; serWs=null; };
+  serWs.onerror   = () => serstatus.textContent='connection error';
+};
+// line mode: type + Enter
+serin.addEventListener('keydown', (e) => {
+  if(serraw.checked) return;
+  if(e.key==='Enter'){ e.preventDefault(); serSend(serin.value + '\r'); serin.value=''; }
+});
+// raw interactive mode: capture keys on the output area
+serout.addEventListener('keydown', (e) => {
+  if(!serraw.checked || !serWs) return;
+  e.preventDefault();
+  const k=e.key; let s='';
+  if(k.length===1){ s = (e.ctrlKey && /[a-zA-Z]/.test(k)) ? String.fromCharCode(k.toUpperCase().charCodeAt(0)-64) : k; }
+  else if(k==='Enter') s='\r'; else if(k==='Backspace') s='\x7f'; else if(k==='Tab') s='\t';
+  else if(k==='Escape') s='\x1b';
+  else if(k==='ArrowUp') s='\x1b[A'; else if(k==='ArrowDown') s='\x1b[B';
+  else if(k==='ArrowRight') s='\x1b[C'; else if(k==='ArrowLeft') s='\x1b[D';
+  if(s) serSend(s);
+});
+serraw.onchange = () => { serin.disabled = serraw.checked; if(serraw.checked) serout.focus(); };
+
+// ---------------- keep-awake (anti-sleep mouse nudges) ----------------
+let keepAwake = false, lastActivity = Date.now(), awakeTimer = null;
+const IDLE_MS = 12000;                                   // only nudge after this much idle time
+const markActivity = () => { lastActivity = Date.now(); };
+['pointerdown','pointermove','keydown','wheel','touchstart','mousedown'].forEach(ev =>
+  document.addEventListener(ev, markActivity, { passive: true, capture: true }));
+function awakeNudge(){                                    // net-zero relative wiggle -> registers as activity
+  send({ t:'mr', dx: 4, dy: 0 });
+  setTimeout(() => send({ t:'mr', dx: -4, dy: 0 }), 60);
+}
+function awakeSchedule(){
+  clearTimeout(awakeTimer);
+  if(!keepAwake) return;
+  const delay = 20000 + Math.random() * 40000;           // random 20–60 s
+  awakeTimer = setTimeout(() => {
+    if(keepAwake && (Date.now() - lastActivity) > IDLE_MS) awakeNudge();   // skip if the user is interacting
+    awakeSchedule();
+  }, delay);
+}
+const awakeBox = document.getElementById('awake');
+awakeBox.checked = localStorage.getItem('kvm_keepAwake') === '1';
+keepAwake = awakeBox.checked;
+awakeBox.onchange = () => {
+  keepAwake = awakeBox.checked;
+  localStorage.setItem('kvm_keepAwake', keepAwake ? '1' : '0');
+  lastActivity = Date.now();
+  awakeSchedule();
+};
+awakeSchedule();
+</script>
+</body>
+</html>

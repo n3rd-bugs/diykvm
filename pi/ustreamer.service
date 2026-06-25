@@ -1,0 +1,15 @@
+[Unit]
+Description=DIY KVM video streamer (uStreamer, MJPEG from USB HDMI capture)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# device / resolution / fps / bind come from /etc/kvm/kvm.conf
+ExecStart=/usr/local/sbin/kvm-ustreamer
+Restart=on-failure
+RestartSec=2
+SupplementaryGroups=video
+
+[Install]
+WantedBy=multi-user.target

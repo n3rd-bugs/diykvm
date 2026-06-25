@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Read a value from /etc/kvm/kvm.conf.  Usage: kvm-conf-get SECTION KEY [DEFAULT]"""
+import configparser
+import sys
+
+c = configparser.ConfigParser()
+c.read("/etc/kvm/kvm.conf")
+section = sys.argv[1] if len(sys.argv) > 1 else ""
+key = sys.argv[2] if len(sys.argv) > 2 else ""
+default = sys.argv[3] if len(sys.argv) > 3 else ""
+print(c.get(section, key, fallback=default))
