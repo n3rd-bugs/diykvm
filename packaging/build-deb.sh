@@ -16,6 +16,7 @@ install -d "$STAGE/DEBIAN" \
            "$STAGE/usr/lib/systemd/system" \
            "$STAGE/usr/local/sbin" \
            "$STAGE/usr/lib/udev/rules.d" \
+           "$STAGE/usr/share/doc/diykvm" \
            "$STAGE/etc/kvm" "$STAGE/etc/sudoers.d"
 
 # control + maintainer scripts
@@ -42,6 +43,7 @@ install -m0755 "$PKG/files/usr/local/sbin/kvm-conf-get" \
 install -m0644 "$PKG/files/lib/udev/rules.d/99-kvm-hidg.rules" "$STAGE/usr/lib/udev/rules.d/"
 install -m0644 "$PKG/files/etc/kvm/kvm.conf" "$STAGE/etc/kvm/kvm.conf"
 install -m0440 "$PKG/files/etc/sudoers.d/diykvm" "$STAGE/etc/sudoers.d/diykvm"
+install -m0644 "$PKG/files/usr/share/doc/diykvm/copyright" "$STAGE/usr/share/doc/diykvm/copyright"
 
 dpkg-deb --root-owner-group --build "$STAGE" "$OUT"
 echo "built: $OUT"
