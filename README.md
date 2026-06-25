@@ -101,8 +101,9 @@ examples for input, screen capture, the virtual drive and serial, is at **`/api-
 LAN‑only by design. Authentication (session cookie, `SameSite=strict`, or API key) is required for
 every endpoint; WebSockets and unsafe requests are **Origin‑checked** (blocks cross‑site hijacking);
 logins are **rate‑limited**; the serial console only opens **enumerated** ports; the video stream is
-proxied behind auth. There is no internet hardening — do not expose port 8000 directly; use a VPN
-(WireGuard/Tailscale) for remote access.
+proxied behind auth. The web app itself runs **unprivileged** (user `diykvm`) — only the two
+virtual‑drive transitions are privileged, through a no‑argument `sudo` helper. There is no internet
+hardening — do not expose port 8000 directly; use a VPN (WireGuard/Tailscale) for remote access.
 
 ## Building from source
 

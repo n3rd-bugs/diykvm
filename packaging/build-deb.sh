@@ -16,7 +16,7 @@ install -d "$STAGE/DEBIAN" \
            "$STAGE/usr/lib/systemd/system" \
            "$STAGE/usr/local/sbin" \
            "$STAGE/usr/lib/udev/rules.d" \
-           "$STAGE/etc/kvm"
+           "$STAGE/etc/kvm" "$STAGE/etc/sudoers.d"
 
 # control + maintainer scripts
 install -m0644 "$PKG/DEBIAN/control"   "$STAGE/DEBIAN/control"
@@ -35,11 +35,13 @@ install -m0644 "$ROOT/pi/kvm-gadget.service" "$ROOT/pi/ustreamer.service" "$ROOT
 install -m0755 "$ROOT/pi/kvm-gadget-up.sh" "$ROOT/pi/kvm-gadget-down.sh" "$STAGE/usr/local/sbin/"
 install -m0755 "$PKG/files/usr/local/sbin/kvm-conf-get" \
                "$PKG/files/usr/local/sbin/kvm-ustreamer" \
-               "$PKG/files/usr/local/sbin/kvm-mkimage" "$STAGE/usr/local/sbin/"
+               "$PKG/files/usr/local/sbin/kvm-mkimage" \
+               "$PKG/files/usr/local/sbin/kvm-msd-helper" "$STAGE/usr/local/sbin/"
 
-# udev + default config
+# udev rule, default config, and the sudoers drop-in (0440) for the privileged helper
 install -m0644 "$PKG/files/lib/udev/rules.d/99-kvm-hidg.rules" "$STAGE/usr/lib/udev/rules.d/"
 install -m0644 "$PKG/files/etc/kvm/kvm.conf" "$STAGE/etc/kvm/kvm.conf"
+install -m0440 "$PKG/files/etc/sudoers.d/diykvm" "$STAGE/etc/sudoers.d/diykvm"
 
 dpkg-deb --root-owner-group --build "$STAGE" "$OUT"
 echo "built: $OUT"

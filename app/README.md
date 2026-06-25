@@ -29,6 +29,9 @@ Authenticate via the session cookie (browser) or `?token=<api_key>` (agent).
 | `{"t":"reset"}` | release all keys/buttons |
 
 ## Notes
-- The service runs as **root** (needs `/dev/hidg0`, configfs and `mount`/`losetup`). A udev rule
-  (`hidg*` → `kvm` group) ships as groundwork for future non‑root operation.
+- The web service runs **unprivileged** (user `diykvm`): it writes `/dev/hidg*` via the `diykvm`
+  group (udev rule), opens serial ports via `dialout`, and performs the two privileged virtual‑drive
+  transitions through `sudo /usr/local/sbin/kvm-msd-helper {attach|detach}` (no path arguments).
+  The gadget and streamer units run as root. File operations happen directly on the ESP, which the
+  helper mounts owned by `diykvm`.
 - The absolute mouse targets the captured display's **primary**; use relative `mr` for multi‑monitor.

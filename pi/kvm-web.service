@@ -6,16 +6,18 @@ Requires=kvm-gadget.service
 
 [Service]
 Type=simple
-# Runs as root: needs /dev/hidg0, configfs (USB gadget) and mount/losetup for the virtual drive.
+# Unprivileged service. It writes /dev/hidg* via the 'diykvm' group (udev rule), opens
+# serial ports via 'dialout', and performs the two privileged virtual-drive transitions
+# through "sudo kvm-msd-helper" (see /etc/sudoers.d/diykvm). NoNewPrivileges/PrivateTmp are
+# intentionally NOT set: sudo needs them off, and the helper's mount must stay visible here.
+User=diykvm
+Group=diykvm
+SupplementaryGroups=dialout
 WorkingDirectory=/opt/kvm/app
 EnvironmentFile=-/etc/kvm/kvm.env
 ExecStart=/opt/kvm/venv/bin/python /opt/kvm/app/server.py
 Restart=on-failure
 RestartSec=2
-# Modest hardening (kept compatible with the privileged USB/mount operations).
-ProtectHome=true
-PrivateTmp=true
-NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target

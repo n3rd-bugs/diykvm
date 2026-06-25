@@ -13,8 +13,17 @@ case "$1" in
     "$VENV/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || true
     "$VENV/bin/pip" install --quiet -r "$APP/requirements.txt"
 
-    # 2. system group used by the hidg udev rule
-    getent group kvm >/dev/null || groupadd --system kvm
+    # 2. dedicated unprivileged service user + group (the web app runs as this)
+    getent group diykvm >/dev/null || groupadd --system diykvm
+    getent passwd diykvm >/dev/null || useradd --system --gid diykvm --home-dir /opt/kvm \
+        --shell /usr/sbin/nologin --comment "diykvm service" diykvm
+    usermod -aG dialout diykvm 2>/dev/null || true   # serial console access
+
+    # validate + lock down the sudoers drop-in (never leave a broken sudoers file)
+    if [ -f /etc/sudoers.d/diykvm ]; then
+      chmod 0440 /etc/sudoers.d/diykvm
+      visudo -cf /etc/sudoers.d/diykvm >/dev/null 2>&1 || { echo "diykvm: invalid sudoers, removing"; rm -f /etc/sudoers.d/diykvm; }
+    fi
 
     # 3. credentials + dirs (generate a random admin password on first install)
     mkdir -p /opt/kvm/images /etc/kvm/tls
@@ -25,6 +34,8 @@ case "$1" in
       echo "diykvm: web login  ->  user 'admin'  password '$PW'"
       echo "diykvm: change it with:  sudo $VENV/bin/python $APP/setup_auth.py <user> <pass>"
     fi
+    chown diykvm:diykvm /opt/kvm/config.json 2>/dev/null || true
+    chmod 600 /opt/kvm/config.json 2>/dev/null || true
 
     # 4. enable USB gadget mode on the Pi's USB-C/OTG port (reboot required)
     for CFG in /boot/firmware/config.txt /boot/config.txt; do

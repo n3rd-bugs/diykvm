@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Privileged mass-storage transition helper for diykvm.
+
+The web app runs unprivileged; the only operations that need root are switching the
+virtual drive between "attached to the target" and "mounted on the Pi for editing".
+This helper performs exactly those two transitions and nothing else.
+
+    sudo kvm-msd-helper attach     # unmount on the Pi, expose the image to the target
+    sudo kvm-msd-helper detach     # eject from the target, mount the ESP for the app
+
+It takes NO path arguments: the image comes from /etc/kvm/kvm.conf, the mount point and
+gadget LUN are fixed. The ESP is mounted owned by the unprivileged service user so the
+app can edit files without root.
+"""
+import configparser
+import grp
+import os
+import pwd
+import subprocess
+import sys
+import time
+
+LUN = "/sys/kernel/config/usb_gadget/kvm/functions/mass_storage.usb0/lun.0/file"
+MNT = "/run/kvmmnt"
+SVC_USER = "diykvm"
+
+
+def die(msg):
+    sys.stderr.write(f"kvm-msd-helper: {msg}\n")
+    sys.exit(1)
+
+
+def conf(section, key, default):
+    c = configparser.ConfigParser()
+    c.read("/etc/kvm/kvm.conf")
+    return c.get(section, key, fallback=default)
+
+
+def loop_dev(image):
+    r = subprocess.run(["losetup", "-j", image], capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        d = line.split(":", 1)[0].strip()
+        if d:
+            return d
+    return None
+
+
+def set_lun(path):
+    with open(LUN, "w") as f:
+        f.write(path + "\n")       # trailing newline so an empty path actually ejects
+
+
+def is_attached():
+    try:
+        with open(LUN) as f:
+            return f.read().strip() != ""
+    except OSError:
+        return False
+
+
+def detach(image):
+    if is_attached():
+        set_lun("")
+        if is_attached():
+            die("could not eject from target; not mounting (would risk corruption)")
+    if os.path.ismount(MNT):
+        return
+    loop = loop_dev(image)
+    if not loop:
+        r = subprocess.run(["losetup", "-f", "--show", "-P", image], capture_output=True, text=True)
+        if r.returncode != 0:
+            die("losetup failed: " + r.stderr.strip())
+        loop = r.stdout.strip()
+    part = loop + "p1"
+    for _ in range(25):
+        if os.path.exists(part):
+            break
+        time.sleep(0.2)
+    if not os.path.exists(part):
+        die("ESP partition did not appear (is the image GPT+ESP?)")
+    os.makedirs(MNT, exist_ok=True)
+    uid = pwd.getpwnam(SVC_USER).pw_uid
+    gid = grp.getgrnam(SVC_USER).gr_gid
+    opts = f"uid={uid},gid={gid},fmask=0117,dmask=0007"
+    r = subprocess.run(["mount", "-t", "vfat", "-o", opts, part, MNT], capture_output=True, text=True)
+    if r.returncode != 0:
+        subprocess.run(["losetup", "-d", loop])
+        die("mount failed: " + r.stderr.strip())
+
+
+def attach(image):
+    if os.path.ismount(MNT):
+        subprocess.run(["sync"])
+        r = subprocess.run(["umount", MNT], capture_output=True, text=True)
+        if r.returncode != 0:
+            die("umount failed (file still open?): " + r.stderr.strip())
+    loop = loop_dev(image)
+    if loop:
+        r = subprocess.run(["losetup", "-d", loop], capture_output=True, text=True)
+        if r.returncode != 0:
+            die("could not release loop device: " + r.stderr.strip())
+    set_lun(image)                 # only now does the target regain the medium
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in ("attach", "detach"):
+        die("usage: kvm-msd-helper {attach|detach}")
+    image = conf("usb", "image_path", "/opt/kvm/images/drive.img")
+    (attach if sys.argv[1] == "attach" else detach)(image)
+
+
+if __name__ == "__main__":
+    main()

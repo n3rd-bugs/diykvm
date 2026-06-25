@@ -65,5 +65,11 @@ UDC=""
 for i in $(seq 1 50); do UDC=$(ls /sys/class/udc 2>/dev/null | head -n1); [ -n "$UDC" ] && break; sleep 0.2; done
 [ -n "$UDC" ] || { echo "ERROR: no UDC found (is dtoverlay=dwc2,dr_mode=peripheral set?)" >&2; exit 1; }
 echo "$UDC" > "$G/UDC"
+
+# Let the unprivileged web-service group write the HID endpoints (udev also sets this).
+if getent group diykvm >/dev/null 2>&1; then
+  for d in /dev/hidg*; do [ -e "$d" ] && chgrp diykvm "$d" 2>/dev/null && chmod 0660 "$d" 2>/dev/null; done
+fi
+
 echo "GADGET_UP udc=$UDC"
 ls -l /dev/hidg* 2>/dev/null

@@ -1,2 +1,2 @@
-# Group access to the USB HID gadget endpoints (groundwork for non-root operation).
-KERNEL=="hidg[0-9]*", GROUP="kvm", MODE="0660"
+# Let the unprivileged diykvm service write the USB HID gadget endpoints.
+KERNEL=="hidg[0-9]*", GROUP="diykvm", MODE="0660"

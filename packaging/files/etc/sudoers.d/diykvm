@@ -1,0 +1,3 @@
+# The unprivileged diykvm web service may run only the mass-storage transition
+# helper (no path arguments) as root — nothing else.
+diykvm ALL=(root) NOPASSWD: /usr/local/sbin/kvm-msd-helper attach, /usr/local/sbin/kvm-msd-helper detach
