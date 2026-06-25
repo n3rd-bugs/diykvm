@@ -56,11 +56,13 @@
   #panel.show { display: flex; }
   #mouserow { display: none; gap: 6px; justify-content: center; flex-wrap: wrap; }
   #mouserow.show { display: flex; }
-  #keyrows { display: none; flex-direction: column; gap: 4px; overflow-x: auto; }
+  #keyrows { display: none; flex-direction: column; gap: 4px; }
   #keyrows.show { display: flex; }
-  .krow { display: flex; gap: 4px; justify-content: stretch; min-width: max-content; }
-  .pk { flex: 1 1 auto; min-width: 26px; text-align: center; background: #2a2a2a; color: #eee;
-        border: 1px solid #444; border-radius: 5px; padding: 9px 4px; font-size: 13px;
+  .krow { display: flex; gap: 3px; }
+  /* keys share the row width and shrink to fit any screen; font/padding scale with the viewport */
+  .pk { flex: 1 1 0; min-width: 0; overflow: hidden; white-space: nowrap; text-align: center;
+        background: #2a2a2a; color: #eee; border: 1px solid #444; border-radius: 5px;
+        padding: clamp(5px, 1.4vw, 9px) 2px; font-size: clamp(10px, 2.6vw, 14px); line-height: 1.15;
         user-select: none; cursor: pointer; touch-action: manipulation; }
   .pk:active { background: #155; }
   .pk.wide { flex-grow: 2.2; }
