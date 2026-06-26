@@ -18,11 +18,12 @@ jobs:
           python3 -m py_compile app/*.py
           python3 -m pyflakes app/*.py
 
-      - name: Shellcheck maintainer scripts
+      - name: Shellcheck shell scripts
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
           shellcheck -s sh packaging/DEBIAN/postinst packaging/DEBIAN/prerm packaging/DEBIAN/postrm \
-                     packaging/files/usr/local/sbin/kvm-ustreamer packaging/files/usr/local/sbin/kvm-mkimage || true
+                     packaging/files/usr/local/sbin/kvm-ustreamer packaging/files/usr/local/sbin/kvm-mkimage
+          shellcheck pi/kvm-gadget-up.sh pi/kvm-gadget-down.sh
 
       - name: Build .deb
         run: |

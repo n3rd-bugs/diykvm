@@ -106,6 +106,7 @@ asyncio.run(console("192.168.1.120","&lt;KEY&gt;","/dev/ttyUSB0"))</code></pre>
 <h2>6. Notes</h2>
 <ul>
 <li>The mouse maps to the target's <b>primary</b> display (absolute) — use relative <code>mr</code> for multi-monitor targets.</li>
+<li>The emulated keyboard is a USB <b>boot keyboard</b>, so it works in the target's <b>BIOS/UEFI</b> setup and boot menus — not just the running OS.</li>
 <li>Rotate the API key by re-running <code>setup_auth.py</code> on the Pi.</li>
 <li>Everything is LAN-only; there is no rate limiting — don't expose port 8000 to the internet without a VPN.</li>
 </ul>

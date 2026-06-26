@@ -15,7 +15,8 @@ single‑page web UI plus an HTTP/WebSocket API.
 - **Video** — low‑latency MJPEG of the target's screen (USB HDMI capture via µStreamer).
 - **Keyboard & mouse** — full keyboard, absolute + relative mouse, on‑screen keyboard, and
   touchscreen gestures (tap = click, drag = move, two‑finger scroll, double‑tap‑hold = drag,
-  two‑finger = right button).
+  two‑finger = right button). The keyboard is a USB **boot keyboard**, so it also works in the
+  target's **BIOS/UEFI** firmware and boot menus, not just the OS.
 - **Virtual USB drive** — a GPT disk with a FAT32 **EFI System Partition** the target can
   boot from. Manage its files from the browser; attach/detach safely (the Pi and target never
   mount it at once).
@@ -123,9 +124,11 @@ TARGET ── HDMI ──▶ USB capture ──▶ /dev/video0 ──▶ ustream
 operator ◀── LAN ───────────────────────────────────────────────┘
 ```
 
-- **`kvm-gadget`** builds a composite USB gadget via configfs: one HID interface
-  (keyboard + absolute mouse + relative mouse, multiplexed by report IDs) and a mass‑storage
-  function backed by the drive image.
+- **`kvm-gadget`** builds a composite USB gadget via configfs: a **boot‑protocol keyboard**
+  interface (no Report ID, so it works in the target's BIOS/UEFI), a separate **mouse** interface
+  (absolute + relative, multiplexed by report IDs), and a mass‑storage function backed by the drive
+  image. Each HID interface is IN‑endpoint‑only so both fit the Pi's dwc2 endpoint budget alongside
+  mass storage.
 - **`ustreamer`** serves the capture as MJPEG on localhost.
 - **`kvm-web`** (FastAPI) serves the UI, proxies the video behind auth, turns WebSocket input
   events into HID reports, manages the virtual drive (configfs + loop‑mounted ESP), and bridges

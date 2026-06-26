@@ -8,8 +8,9 @@ For install/usage see the top‑level [README](../README.md); the agent API is a
 - `server.py` — FastAPI: pages, auth (session + API key, Origin‑checked, rate‑limited), video
   proxy (`/stream`, `/snapshot`), input WebSocket `/ws`, mass‑storage REST `/api/msd/*`, serial
   WebSocket `/ws/serial`. Reads `/etc/kvm/kvm.conf` (host/port/TLS, ustreamer URL, image path).
-- `hid.py` — report‑ID‑multiplexed writes to `/dev/hidg0`: keyboard (`KeyboardEvent.code`→HID
-  usage), absolute mouse (0..1 → 0..32767), relative mouse, clicks/wheel; `release_all()` safety.
+- `hid.py` — two HID devices: an 8‑byte **no‑Report‑ID boot keyboard** on `/dev/hidg0`
+  (`KeyboardEvent.code`→HID usage; BIOS/UEFI‑compatible) and a report‑ID‑multiplexed **mouse** on
+  `/dev/hidg1` (absolute 0..1 → 0..32767, relative, clicks/wheel); `release_all()` safety.
 - `msd.py` — virtual drive: attach/detach via configfs `lun.0/file`, loop‑mount the ESP for
   editing, file ops. All transitions are lock‑serialized so the Pi and target never mount it at once.
 - `auth.py` — `config.json` (pbkdf2 password hash, API key, session secret); `setup_auth.py` resets it.

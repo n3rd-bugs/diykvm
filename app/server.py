@@ -1,7 +1,7 @@
 """DIY PiKVM web control plane.
 
 - Login (session cookie) or API key (agents).
-- Single-page UI; WebSocket /ws -> HID gadget (/dev/hidg0).
+- Single-page UI; WebSocket /ws -> HID gadget (keyboard /dev/hidg0, mouse /dev/hidg1).
 - Video proxied from uStreamer (localhost) behind auth.
 - Serial console bridge over /ws/serial (device allow-listed).
 - Agent API guide at /api-guide.
