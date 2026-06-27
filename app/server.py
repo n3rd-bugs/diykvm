@@ -463,6 +463,7 @@ async def ws_serial(sock: WebSocket):
         while True:
             m = await sock.receive()
             if m.get("type") == "websocket.disconnect":
+                stop.set()                  # also stop the reader so the serial port is released
                 break
             data = m.get("bytes")
             if data is None:
