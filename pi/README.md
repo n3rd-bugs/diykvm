@@ -40,6 +40,20 @@ printf '\x00\x00\x00\x00\x00\x00\x00\x00' | sudo tee /dev/hidg0 >/dev/null
 printf '\x02\x00\xff\x3f\xff\x3f\x00' | sudo tee /dev/hidg1 >/dev/null
 ```
 
+## Target power & KVM switch (GPIO)
+Two optional GPIO features, both driven **unprivileged** through the `gpio` group (udev gives
+`/dev/gpiochip*` and `/dev/gpiomem` group `gpio`, mode 0660) — no sudo. Configure them on the **Config**
+page (or in `/etc/kvm/kvm.conf`); nothing is ever driven unless you enable it and an authenticated
+request asks for it.
+
+- **`[power]`** — connect/cut each target's power. Wire one GPIO per target to a relay that switches its
+  power, and list them as `targets = Label:BCMpin, …` (plus `active_low` for relays that are on when
+  driven low). The level is **latched** with `pinctrl` (register-level, so it survives an app restart
+  and nothing is power-cycled on restart). The UI shows On/Off per target; cutting power is a hard off.
+- **`[kvmswitch]`** — drive an external hardware KVM switch (display + USB) between targets. Wire a GPIO
+  to each of its select buttons, list them as `ports = Label:BCMpin, …`, and the UI shows one button per
+  target that **pulses** the line (`gpioset`, `pulse_ms`) to press that select button.
+
 ## Notes
 - The USB‑C port carries data only; power the Pi independently (PoE or 5 V) so the port is free.
 - The absolute pointer maps to the target's **primary** display; use relative moves for multi‑monitor.

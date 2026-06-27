@@ -47,6 +47,17 @@
   #fmlist li a, #fmlist li .del { color: #9bd; cursor: pointer; text-decoration: none; font-size: 12px; }
   #fmmsg { color: #f29; min-height: 16px; font-size: 12px; }
   #fmpath { color: #9ad; font-size: 12px; word-break: break-all; }
+  /* boot-image library */
+  #fm .fmgrp { border-top: 1px solid #2c2c2c; padding-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+  #fm .fmgrphd { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  #fm .fmhint { color: #888; font-size: 11px; margin: 2px 0 0; }
+  #fmimglist { list-style: none; margin: 0; padding: 0; }
+  #fmimglist li { display: flex; align-items: center; gap: 7px; padding: 5px 4px; border-bottom: 1px solid #262626; }
+  #fmimglist li.att { background: #163a1d; border-radius: 5px; }
+  #fmimglist li .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #fmimglist li .att-btn { background: #1d4f8b; border: 1px solid #2c6fb8; color: #fff; border-radius: 4px; padding: 3px 8px; cursor: pointer; font-size: 12px; }
+  #fmimglist li .tag { font-size: 10px; border: 1px solid #2c9a45; color: #79f29a; border-radius: 3px; padding: 0 4px; }
+  #fmupbar { width: 100%; height: 10px; }
   /* touch + on-screen controls */
   #wrap, #screen { touch-action: none; }
   #bar { flex-wrap: wrap; }
@@ -92,6 +103,31 @@
             border: 1px solid #222; border-radius: 6px; padding: 8px;
             font: 12px/1.35 ui-monospace, monospace; white-space: pre-wrap; word-break: break-all; }
   #serin { width: 100%; font-family: ui-monospace, monospace; }
+  /* target power (GPIO) — in-flow bottom panel */
+  #powerpanel { flex: 0 0 auto; display: none; gap: 8px; padding: 9px; align-items: center;
+                flex-wrap: wrap; background: #15100f; border-top: 1px solid #333; }
+  #powerpanel.show { display: flex; }
+  #powerpanel button { background: #222; color: #eee; border: 1px solid #444; border-radius: 5px;
+                       padding: 6px 10px; cursor: pointer; }
+  #powerpanel button:hover { background: #333; }
+  #powerpanel button:disabled { opacity: .45; cursor: default; }
+  #pwrtargets { display: flex; gap: 10px; flex-wrap: wrap; }
+  #pwrtargets .pt { display: flex; align-items: center; gap: 6px; border: 1px solid #3a3a3a;
+                    border-radius: 6px; padding: 4px 7px; }
+  #pwrtargets .pt .lbl { font-weight: 600; }
+  #pwrtargets .pt .dot { width: 9px; height: 9px; border-radius: 50%; background: #666; }
+  #pwrtargets .pt .dot.on { background: #3a3; } #pwrtargets .pt .dot.off { background: #b33; }
+  #pwrtargets .pt button { border-radius: 4px; padding: 3px 9px; cursor: pointer; border: 1px solid #444;
+                           background: #222; color: #eee; }
+  #pwrtargets .pt button.on { border-color: #2c9a45; } #pwrtargets .pt button.off { border-color: #8a3a3a; }
+  /* external KVM switch */
+  #kvmpanel { flex: 0 0 auto; display: none; gap: 8px; padding: 9px; align-items: center;
+              flex-wrap: wrap; background: #101418; border-top: 1px solid #333; }
+  #kvmpanel.show { display: flex; }
+  #kvmports { display: flex; gap: 8px; flex-wrap: wrap; }
+  #kvmpanel button.port { background: #1d4f8b; color: #fff; border: 1px solid #2c6fb8;
+                          border-radius: 5px; padding: 6px 12px; cursor: pointer; }
+  #kvmpanel button.port:hover { background: #2461a8; }
   .chk { font-size: 12px; color: #9ab; display: flex; align-items: center; gap: 4px; }
   .muted { color: #7b8694; font-size: 12px; }
 </style>
@@ -107,10 +143,13 @@
     <button id="kbd" title="on-screen keyboard">⌨</button>
     <button id="mouse" title="on-screen mouse buttons">🖱</button>
     <button id="serialbtn" title="serial console">Serial</button>
+    <button id="powerbtn" title="target power (GPIO)">⏻ Power</button>
+    <button id="kvmbtn" title="external KVM switch (GPIO)">⇄ KVM</button>
     <label class="barchk" title="send occasional mouse nudges so the target display doesn't sleep (paused while you interact)"><input type="checkbox" id="awake"> Keep awake</label>
     <span class="sp"></span>
     <span id="info">—</span>
     <button id="full">Fullscreen</button>
+    <a class="barlink" href="/config" title="settings">⚙ Config</a>
     <a class="barlink" href="/api-guide" target="_blank" title="API guide for agents">API</a>
     <a class="barlink" href="/logout" title="sign out">Logout</a>
   </div>
@@ -121,30 +160,52 @@
   </div>
 
     <div id="fm">
-      <h3>Virtual USB drive · EFI System Partition</h3>
+      <h3>Virtual USB drive</h3>
       <div class="row">
         <span id="fmstate" class="state st-detached">…</span>
         <span id="fmsize" class="sz"></span>
       </div>
-      <div class="row">
-        <button id="fmdetach" class="primary" title="eject from target, mount on the Pi to edit">Detach &amp; edit</button>
-        <button id="fmattach" title="unmount on the Pi, expose to the target">Attach to target</button>
-      </div>
-      <div id="fmedit" style="display:none; flex-direction:column; gap:8px;">
-        <div class="row">
-          <button id="fmup">Upload file…</button>
-          <button id="fmmkdir">New folder</button>
-          <button id="fmrefresh">↻</button>
-          <input id="fmfile" type="file" style="display:none">
+
+      <div class="fmgrp">
+        <div class="fmgrphd"><strong>Boot images</strong>
+          <span>
+            <button id="fmimgup" class="primary" title="upload a disk image or ISO to hand to the target">Upload image…</button>
+            <button id="fmeject" title="remove the drive from the target">Eject</button>
+            <button id="fmimgref" title="refresh">↻</button>
+          </span>
         </div>
-        <div id="fmpath">/</div>
-        <ul id="fmlist"></ul>
+        <input id="fmimgfile" type="file" accept=".img,.iso,.bin,.raw" style="display:none">
+        <div id="fmupwrap" style="display:none">
+          <progress id="fmupbar" max="100" value="0"></progress>
+          <span id="fmupmsg" class="sz"></span>
+        </div>
+        <ul id="fmimglist"></ul>
+        <p class="fmhint">Upload a bootable <code>.iso</code> or a disk <code>.img</code>, then <em>Attach</em> it so the
+          target boots from it (ISOs are exposed read‑only as a CD‑ROM). Only one image is attached at a time.</p>
       </div>
+
+      <div class="fmgrp">
+        <div class="fmgrphd"><strong>EFI drive (editable)</strong>
+          <span>
+            <button id="fmdetach" title="eject from target, mount on the Pi to edit">Detach &amp; edit</button>
+            <button id="fmattach" title="unmount on the Pi, expose the EFI drive to the target">Attach</button>
+          </span>
+        </div>
+        <div id="fmedit" style="display:none; flex-direction:column; gap:8px;">
+          <div class="row">
+            <button id="fmup">Upload file…</button>
+            <button id="fmmkdir">New folder</button>
+            <button id="fmrefresh">↻</button>
+            <input id="fmfile" type="file" style="display:none">
+          </div>
+          <div id="fmpath">/</div>
+          <ul id="fmlist"></ul>
+        </div>
+        <p class="fmhint">FAT32 EFI System Partition. To make the target boot it, place a UEFI bootloader at
+          <code>/EFI/BOOT/BOOTX64.EFI</code>. Detach to edit; attach to hand it back to the target.</p>
+      </div>
+
       <div id="fmmsg"></div>
-      <p style="color:#888;font-size:11px;margin:4px 0 0">
-        FAT32 EFI System Partition. To make the target boot it, place a UEFI bootloader at
-        <code>/EFI/BOOT/BOOTX64.EFI</code>. The drive can be used by the target <em>or</em> edited here —
-        never both at once. Detach to edit; attach to hand it back to the target.</p>
     </div>
   </div>
 
@@ -165,6 +226,22 @@
     </div>
     <pre id="serout" tabindex="0"></pre>
     <input id="serin" placeholder="type a line · Enter sends · tick 'raw keys' for interactive consoles">
+  </div>
+
+  <div id="powerpanel">
+    <span class="muted">Target power:</span>
+    <div id="pwrtargets"></div>
+    <button id="pwrrefresh" title="refresh">↻</button>
+    <a class="barlink" href="/config" title="set targets">Configure…</a>
+    <span id="pwrmsg" class="muted"></span>
+  </div>
+
+  <div id="kvmpanel">
+    <span class="muted">Switch display + USB to:</span>
+    <span id="kvmports"></span>
+    <button id="kvmref" title="refresh">↻</button>
+    <a class="barlink" href="/config" title="set switch buttons">Configure…</a>
+    <span id="kvmmsg" class="muted"></span>
   </div>
 
 <script>
@@ -272,17 +349,20 @@ document.getElementById('files').onclick = () => {
   if (fm.classList.contains('show')) fmStatus();
 };
 
+let defaultImg = 'drive.img';
 async function fmStatus() {
   fmErr('');
   try {
     const s = await api('/api/msd/status');
-    fmstate.textContent = s.state;
+    defaultImg = s.image ? s.image.split('/').pop() : 'drive.img';
+    fmstate.textContent = s.state === 'attached' ? ('attached: ' + (s.attached_image || '?')) : s.state;
     fmstate.className = 'state st-' + s.state;
-    fmsize.textContent = s.image_size ? fmtSize(s.image_size) : 'no image';
+    fmsize.textContent = '';
     fmedit.style.display = s.can_edit ? 'flex' : 'none';
     document.getElementById('fmdetach').disabled = s.editing;
-    document.getElementById('fmattach').disabled = !s.editing;
+    document.getElementById('fmattach').disabled = false;
     if (s.can_edit) fmLs(cwd);
+    fmImages();
   } catch (e) { fmErr(e.message); }
 }
 document.getElementById('fmdetach').onclick = async () => {
@@ -290,8 +370,8 @@ document.getElementById('fmdetach').onclick = async () => {
   try { await api('/api/msd/detach', {method:'POST'}); cwd=''; await fmStatus(); } catch(e){ fmErr(e.message); }
 };
 document.getElementById('fmattach').onclick = async () => {
-  fmErr('unmounting & attaching to target…');
-  try { await api('/api/msd/attach', {method:'POST'}); await fmStatus(); } catch(e){ fmErr(e.message); }
+  fmErr('attaching EFI drive to target…');
+  try { await api('/api/msd/images/attach?name='+encodeURIComponent(defaultImg), {method:'POST'}); await fmStatus(); } catch(e){ fmErr(e.message); }
 };
 async function fmLs(path) {
   try {
@@ -308,11 +388,13 @@ async function fmLs(path) {
       const li = document.createElement('li');
       const full = (cwd ? cwd + '/' : '') + it.name;
       if (it.dir) {
-        li.innerHTML = '<span class="nm">📁 '+it.name+'</span><span class="del">✕</span>';
+        li.innerHTML = '<span class="nm">📁 </span><span class="del">✕</span>';
+        li.querySelector('.nm').appendChild(document.createTextNode(it.name));   // name as text (no XSS)
         li.querySelector('.nm').onclick = () => fmLs(full);
       } else {
-        li.innerHTML = '<span class="nm">📄 '+it.name+'</span><span class="sz">'+fmtSize(it.size)+'</span>'
+        li.innerHTML = '<span class="nm">📄 </span><span class="sz">'+fmtSize(it.size)+'</span>'
           + '<a title="download" href="/api/msd/download?path='+encodeURIComponent(full)+'">⬇</a> <span class="del">✕</span>';
+        li.querySelector('.nm').appendChild(document.createTextNode(it.name));   // name as text (no XSS)
       }
       li.querySelector('.del').onclick = async () => {
         if (!confirm('Delete '+it.name+'?')) return;
@@ -336,6 +418,61 @@ document.getElementById('fmmkdir').onclick = async () => {
   const name = prompt('New folder name:'); if (!name) return;
   const full = (cwd ? cwd + '/' : '') + name;
   try { await api('/api/msd/mkdir?path='+encodeURIComponent(full), {method:'POST'}); fmLs(cwd); } catch(e){ fmErr(e.message); }
+};
+
+// ---------- boot images (upload a whole disk image / ISO and hand it to the target) ----------
+const fmimglist = document.getElementById('fmimglist');
+async function fmImages() {
+  try {
+    const d = await api('/api/msd/images');
+    fmimglist.innerHTML = '';
+    if (!d.images.length) {
+      const li = document.createElement('li'); li.innerHTML = '<span class="nm muted">no images uploaded</span>';
+      fmimglist.appendChild(li); return;
+    }
+    for (const im of d.images) {
+      const li = document.createElement('li'); if (im.attached) li.className = 'att';
+      const tags = (im.attached ? '<span class="tag">attached</span>' : '')
+        + (im.cdrom ? ' <span class="tag" style="color:#9bd;border-color:#46c">ISO</span>' : '')
+        + (im.default ? ' <span class="tag" style="color:#d9b36a;border-color:#a8772c">EFI</span>' : '');
+      li.innerHTML = '<span class="nm">💿 ' + im.name + '</span><span class="sz">' + fmtSize(im.size) + '</span>'
+        + tags + ' <button class="att-btn">Attach</button>' + (im.default ? '' : ' <span class="del">✕</span>');
+      li.querySelector('.att-btn').onclick = async () => {
+        fmErr('attaching ' + im.name + '…');
+        try { await api('/api/msd/images/attach?name=' + encodeURIComponent(im.name), {method:'POST'}); await fmStatus(); }
+        catch (e) { fmErr(e.message); }
+      };
+      const del = li.querySelector('.del');
+      if (del) del.onclick = async () => {
+        if (!confirm('Delete image ' + im.name + '?')) return;
+        try { await api('/api/msd/images?name=' + encodeURIComponent(im.name), {method:'DELETE'}); await fmStatus(); }
+        catch (e) { fmErr(e.message); }
+      };
+      fmimglist.appendChild(li);
+    }
+  } catch (e) { fmErr(e.message); }
+}
+document.getElementById('fmimgref').onclick = fmImages;
+document.getElementById('fmeject').onclick = async () => {
+  fmErr('ejecting…');
+  try { await api('/api/msd/eject', {method:'POST'}); await fmStatus(); } catch (e) { fmErr(e.message); }
+};
+document.getElementById('fmimgup').onclick = () => document.getElementById('fmimgfile').click();
+document.getElementById('fmimgfile').onchange = (e) => {
+  const f = e.target.files[0]; e.target.value = ''; if (!f) return;
+  const wrap = document.getElementById('fmupwrap'), bar = document.getElementById('fmupbar'), msg = document.getElementById('fmupmsg');
+  wrap.style.display = 'block'; bar.value = 0; msg.textContent = 'uploading ' + f.name + '…'; fmErr('');
+  const fd = new FormData(); fd.append('file', f);
+  const xhr = new XMLHttpRequest(); xhr.open('POST', '/api/msd/images/upload');   // same-origin: session cookie authenticates
+  xhr.upload.onprogress = (ev) => { if (ev.lengthComputable) {
+    bar.value = Math.round(ev.loaded / ev.total * 100); msg.textContent = fmtSize(ev.loaded) + ' / ' + fmtSize(ev.total); } };
+  xhr.onload = () => {
+    wrap.style.display = 'none';
+    if (xhr.status >= 200 && xhr.status < 300) { fmErr(''); fmImages(); }
+    else { let d; try { d = JSON.parse(xhr.responseText).detail; } catch (_) {} fmErr('upload failed: ' + (d || ('HTTP ' + xhr.status))); }
+  };
+  xhr.onerror = () => { wrap.style.display = 'none'; fmErr('upload failed'); };
+  xhr.send(fd);
 };
 
 // ================= touch + on-screen controls =================
@@ -564,6 +701,77 @@ serout.addEventListener('keydown', (e) => {
   if(s) serSend(s);
 });
 serraw.onchange = () => { serin.disabled = serraw.checked; if(serraw.checked) serout.focus(); };
+
+// ---------------- target power (GPIO relays, latched on/off) ----------------
+const powerpanel = document.getElementById('powerpanel');
+const pwrtargets = document.getElementById('pwrtargets');
+const pwrmsg = document.getElementById('pwrmsg');
+async function pwrRefresh() {
+  pwrmsg.textContent = ''; pwrtargets.innerHTML = '';
+  try {
+    const s = await api('/api/power/state');
+    if (!s.available) { pwrmsg.textContent = 'pinctrl/raspi-gpio not installed'; return; }
+    if (!s.enabled) { pwrmsg.textContent = 'disabled — configure on the Config page'; return; }
+    if (!s.targets.length) { pwrmsg.textContent = 'no targets configured'; return; }
+    s.targets.forEach((t, i) => {
+      const div = document.createElement('div'); div.className = 'pt';
+      const lbl = document.createElement('span'); lbl.className = 'lbl'; lbl.appendChild(document.createTextNode(t.label));
+      const dot = document.createElement('span');
+      dot.className = 'dot' + (t.on === true ? ' on' : t.on === false ? ' off' : '');
+      dot.title = t.on === true ? 'powered' : t.on === false ? 'off' : 'unknown';
+      const onB = document.createElement('button'); onB.className = 'on'; onB.textContent = 'On';
+      const offB = document.createElement('button'); offB.className = 'off'; offB.textContent = 'Off';
+      onB.onclick = () => pwrSet(i, true, t.label);
+      offB.onclick = () => pwrSet(i, false, t.label);
+      div.append(lbl, dot, onB, offB);
+      pwrtargets.appendChild(div);
+    });
+  } catch (e) { pwrmsg.textContent = e.message; }
+}
+async function pwrSet(index, on, label) {
+  if (!on && !confirm('Cut power to ' + label + '? This is a hard power-off — unsaved work is lost.')) return;
+  pwrmsg.textContent = (on ? 'powering on ' : 'cutting power to ') + label + '…';
+  try {
+    await api('/api/power', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ index, on }) });
+    pwrmsg.textContent = label + (on ? ' powered on' : ' powered off'); await pwrRefresh();
+  } catch (e) { pwrmsg.textContent = e.message; }
+}
+document.getElementById('powerbtn').onclick = () => {
+  powerpanel.classList.toggle('show');
+  if (powerpanel.classList.contains('show')) pwrRefresh();
+};
+document.getElementById('pwrrefresh').onclick = pwrRefresh;
+
+// ---------------- external KVM switch (GPIO) ----------------
+const kvmpanel = document.getElementById('kvmpanel');
+const kvmports = document.getElementById('kvmports');
+const kvmmsg = document.getElementById('kvmmsg');
+async function kvmRefresh() {
+  kvmmsg.textContent = ''; kvmports.innerHTML = '';
+  try {
+    const s = await api('/api/kvmswitch/state');
+    if (!s.available) { kvmmsg.textContent = 'gpiod not installed'; return; }
+    if (!s.enabled) { kvmmsg.textContent = 'disabled — configure on the Config page'; return; }
+    if (!s.ports.length) { kvmmsg.textContent = 'no buttons configured'; return; }
+    s.ports.forEach((p, i) => {
+      const b = document.createElement('button'); b.className = 'port';
+      b.appendChild(document.createTextNode(p.label));    // label as text (no XSS)
+      b.onclick = async () => {
+        kvmmsg.textContent = 'switching…';
+        try {
+          const r = await api('/api/kvmswitch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ index: i }) });
+          kvmmsg.textContent = 'switched to ' + (r.switched || p.label);
+        } catch (e) { kvmmsg.textContent = e.message; }
+      };
+      kvmports.appendChild(b);
+    });
+  } catch (e) { kvmmsg.textContent = e.message; }
+}
+document.getElementById('kvmbtn').onclick = () => {
+  kvmpanel.classList.toggle('show');
+  if (kvmpanel.classList.contains('show')) kvmRefresh();
+};
+document.getElementById('kvmref').onclick = kvmRefresh;
 
 // ---------------- keep-awake (anti-sleep mouse nudges) ----------------
 let keepAwake = false, lastActivity = Date.now(), awakeTimer = null;

@@ -6,13 +6,15 @@ Requires=kvm-gadget.service
 
 [Service]
 Type=simple
-# Unprivileged service. It writes /dev/hidg* via the 'diykvm' group (udev rule), opens
-# serial ports via 'dialout', and performs the two privileged virtual-drive transitions
-# through "sudo kvm-msd-helper" (see /etc/sudoers.d/diykvm). NoNewPrivileges/PrivateTmp are
-# intentionally NOT set: sudo needs them off, and the helper's mount must stay visible here.
+# Unprivileged service. It writes /dev/hidg* via the 'diykvm' group (udev rule), opens serial
+# ports via 'dialout', drives the power GPIO via 'gpio' (/dev/gpiochip*), and performs the
+# privileged virtual-drive / config transitions through "sudo kvm-*-helper" (see
+# /etc/sudoers.d/diykvm). NoNewPrivileges/PrivateTmp are intentionally NOT set: sudo needs them
+# off, and the helper's mount must stay visible here.
 User=diykvm
 Group=diykvm
-SupplementaryGroups=dialout
+SupplementaryGroups=dialout gpio
+RuntimeDirectory=kvm
 WorkingDirectory=/opt/kvm/app
 EnvironmentFile=-/etc/kvm/kvm.env
 ExecStart=/opt/kvm/venv/bin/python /opt/kvm/app/server.py

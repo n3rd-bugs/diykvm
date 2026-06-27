@@ -1,16 +1,26 @@
 """Mass Storage Drive (MSD) manager for the DIY PiKVM.
 
-Safe mutual-exclusion model — the image is EITHER:
+Two ways to give the target USB media:
+  * an image LIBRARY under /opt/kvm/images — upload whole disk images / ISOs, list, select and
+    delete them; the selected image backs the gadget LUN (ISOs are exposed read-only as a CD-ROM); or
+  * the built-in editable EFI drive (drive.img), whose ESP can be loop-mounted on the Pi for file edits.
+
+Safe mutual-exclusion model — the backing image is EITHER:
   * ATTACHED to the target (gadget lun.0/file = image path; Pi does NOT mount it), or
-  * MOUNTED ON THE PI for editing (lun.0/file = ""; image loop-mounted at MNT).
-Never both — that would corrupt the filesystem. File operations are only allowed while
-mounted on the Pi (i.e., detached from the target).
+  * MOUNTED ON THE PI for editing (lun.0/file = ""; the EFI image loop-mounted at MNT).
+Never both — that would corrupt the filesystem. File operations are only allowed while mounted on
+the Pi (i.e., detached from the target). The privileged transitions go through kvm-msd-helper.
 """
 import os
+import re
 import threading
 import subprocess
 
 IMAGE = "/opt/kvm/images/drive.img"
+IMAGES_DIR = "/opt/kvm/images"        # ROOT-owned image library (the app reads it; the helper writes it)
+NAME_PTR = "/run/kvm/msd-name"        # app writes the image name for the next attach/import/delete op
+ALLOWED_EXT = (".img", ".iso", ".bin", ".raw")
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 LUN_FILE = "/sys/kernel/config/usb_gadget/kvm/functions/mass_storage.usb0/lun.0/file"
 MNT = "/run/kvmmnt"
 HELPER = "/usr/local/sbin/kvm-msd-helper"
@@ -51,6 +61,10 @@ class MSD:
     def is_mounted(self) -> bool:
         return os.path.ismount(self.mnt)
 
+    def _attached_name(self):
+        p = self._lun_path()
+        return os.path.basename(p) if p else None
+
     @_locked
     def status(self) -> dict:
         attached = self.is_attached()
@@ -60,6 +74,7 @@ class MSD:
             "image": self.image,
             "image_size": size,
             "attached": attached,          # visible to the target
+            "attached_image": self._attached_name(),  # which image the target currently sees
             "editing": mounted,            # mounted on the Pi for file ops
             "state": "attached" if attached else ("editing" if mounted else "detached"),
             "can_edit": mounted,
@@ -77,15 +92,121 @@ class MSD:
     # ---- transitions (privileged; serialized by @_locked) ----
     @_locked
     def detach(self) -> dict:
-        """Eject from the target and mount the ESP on the Pi for editing (via the helper)."""
+        """Eject from the target and mount the ESP on the Pi for editing (via the helper).
+        Editing always targets the default EFI image, so point the selection back at it."""
+        self._set_name(os.path.basename(self.image))
         self._run_helper("detach")
         return self.status()
 
     @_locked
     def attach(self) -> dict:
-        """Unmount the ESP and hand the (updated) image back to the target (via the helper)."""
+        """Hand the active image back to the target (via the helper)."""
         self._run_helper("attach")
         return self.status()
+
+    # ---- image library (upload / select / delete whole images) ----
+    def _safe_name(self, name: str) -> str:
+        name = os.path.basename((name or "").strip())
+        if not _NAME_RE.match(name) or not name.lower().endswith(ALLOWED_EXT):
+            raise MSDError("invalid image name (letters/digits/._- ending in .img/.iso/.bin/.raw)")
+        return name
+
+    def _img_path(self, name: str) -> str:
+        return os.path.join(IMAGES_DIR, self._safe_name(name))
+
+    def _set_name(self, name: str):
+        """Record the image name for the next privileged attach/import/delete (the helper re-validates)."""
+        with open(NAME_PTR, "w") as f:
+            f.write(self._safe_name(name) + "\n")
+
+    @_locked
+    def list_images(self) -> dict:
+        attached = self._attached_name()
+        default_real = os.path.realpath(self.image)
+        items = []
+        try:
+            names = os.listdir(IMAGES_DIR)        # IMAGES_DIR is root-owned but world-readable
+        except OSError:
+            names = []
+        for name in sorted(names):
+            if name.startswith("."):
+                continue
+            full = os.path.join(IMAGES_DIR, name)
+            if not os.path.isfile(full):
+                continue
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                continue
+            items.append({"name": name, "size": size, "attached": name == attached,
+                          "default": os.path.realpath(full) == default_real,
+                          "cdrom": name.lower().endswith(".iso")})
+        return {"images": items, "attached": attached}
+
+    @_locked
+    def attach_image(self, name: str) -> dict:
+        name = self._safe_name(name)
+        if not os.path.isfile(self._img_path(name)):
+            raise MSDError("no such image")
+        self._set_name(name)
+        self._run_helper("attach")
+        return self.status()
+
+    @_locked
+    def eject(self) -> dict:
+        """Remove the medium from the target (and drop any Pi-side edit mount)."""
+        self._run_helper("eject")
+        return self.status()
+
+    @_locked
+    def save_image_upload(self, filename: str, fileobj, declared_size: int = 0) -> dict:
+        name = self._safe_name(filename)
+        if name == os.path.basename(self.image):
+            raise MSDError("cannot overwrite the default EFI drive image")
+        if name == self._attached_name():
+            raise MSDError("that image is attached to the target — eject it first")
+        try:
+            st = os.statvfs(IMAGES_DIR)
+            if declared_size and declared_size + (64 << 20) > st.f_bavail * st.f_frsize:
+                raise MSDError("not enough free space on the Pi for that image")
+        except OSError:
+            pass
+        self._set_name(name)
+        # Stream the upload into the ROOT-owned library through the privileged helper (the app cannot
+        # write IMAGES_DIR itself, which is what makes the directory untamperable / race-free).
+        proc = subprocess.Popen(["sudo", "-n", HELPER, "import"],
+                                stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            while True:
+                chunk = fileobj.read(1024 * 1024)
+                if not chunk:
+                    break
+                proc.stdin.write(chunk)
+        except BrokenPipeError:
+            pass                       # helper exited early (e.g. rejected the name); see stderr below
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+        err = proc.stderr.read().decode("utf-8", "replace")
+        if proc.wait() != 0:
+            raise MSDError(err.strip() or "upload failed")
+        full = self._img_path(name)
+        return {"name": name, "size": os.path.getsize(full) if os.path.exists(full) else 0}
+
+    @_locked
+    def delete_image(self, name: str) -> dict:
+        name = self._safe_name(name)
+        if name == os.path.basename(self.image):
+            raise MSDError("cannot delete the default EFI drive image")
+        if name == self._attached_name():
+            raise MSDError("image is attached to the target — eject it first")
+        if not os.path.isfile(self._img_path(name)):
+            raise MSDError("no such image")
+        self._set_name(name)
+        self._run_helper("delete")
+        return {"ok": True}
 
     # ---- file ops (only while mounted on the Pi) ----
     def _require_editing(self):

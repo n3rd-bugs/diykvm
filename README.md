@@ -17,10 +17,16 @@ single‑page web UI plus an HTTP/WebSocket API.
   touchscreen gestures (tap = click, drag = move, two‑finger scroll, double‑tap‑hold = drag,
   two‑finger = right button). The keyboard is a USB **boot keyboard**, so it also works in the
   target's **BIOS/UEFI** firmware and boot menus, not just the OS.
-- **Virtual USB drive** — a GPT disk with a FAT32 **EFI System Partition** the target can
-  boot from. Manage its files from the browser; attach/detach safely (the Pi and target never
-  mount it at once).
+- **Virtual USB drive** — present boot media to the target: **upload a disk image or ISO** and attach it
+  (ISOs as a read‑only CD‑ROM), or use the built‑in editable GPT/FAT32 **EFI System Partition** and manage
+  its files from the browser. Attach/detach safely (the Pi and target never mount it at once).
 - **Serial console** — talk to the target's serial port from the browser (line or raw‑key mode).
+- **Target power** — connect or cut power to two or more targets from the browser, each via a Raspberry
+  Pi **GPIO** wired to a relay (latched on/off, one On/Off control per target).
+- **External KVM switch** — drive a hardware KVM switch (display + USB) across two or more targets with
+  one button per target, by pulsing a GPIO wired to each of its select buttons.
+- **Configuration UI** — a **Config** page (and API) to edit settings in `/etc/kvm/kvm.conf` from the
+  browser; every value is validated server‑side before it's written.
 - **Keep‑awake** — optional periodic mouse nudges so the target's display doesn't sleep.
 - **Auth** — login (session cookie) for humans, API key for agents/automation.
 - **Agent API** — documented at `/api-guide`; drive everything programmatically.
@@ -131,8 +137,9 @@ operator ◀── LAN ───────────────────
   mass storage.
 - **`ustreamer`** serves the capture as MJPEG on localhost.
 - **`kvm-web`** (FastAPI) serves the UI, proxies the video behind auth, turns WebSocket input
-  events into HID reports, manages the virtual drive (configfs + loop‑mounted ESP), and bridges
-  the serial console.
+  events into HID reports, manages the virtual drive (configfs + loop‑mounted ESP), bridges the
+  serial console, controls target power over GPIO, and edits the config file through a
+  validating root helper.
 
 ## License
 

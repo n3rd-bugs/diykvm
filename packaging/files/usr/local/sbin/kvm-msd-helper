@@ -1,28 +1,41 @@
 #!/usr/bin/env python3
-"""Privileged mass-storage transition helper for diykvm.
+"""Privileged mass-storage helper for diykvm.
 
-The web app runs unprivileged; the only operations that need root are switching the
-virtual drive between "attached to the target" and "mounted on the Pi for editing".
-This helper performs exactly those two transitions and nothing else.
+The web app runs unprivileged. The image library /opt/kvm/images is ROOT-owned and the app cannot write
+it, so every change to it goes through this helper, which validates each operation. This keeps the
+directory untamperable by the unprivileged user, so attaching an image by path can never be raced into
+exposing a file outside the library (no symlink/TOCTOU surface).
 
-    sudo kvm-msd-helper attach     # unmount on the Pi, expose the image to the target
-    sudo kvm-msd-helper detach     # eject from the target, mount the ESP for the app
+    sudo kvm-msd-helper attach     # expose the selected image to the target (sets the gadget LUN)
+    sudo kvm-msd-helper detach     # eject from the target, mount the default EFI image for editing
+    sudo kvm-msd-helper eject      # remove the medium from the target (clear the gadget LUN)
+    sudo kvm-msd-helper import     # read an image from stdin into the library (name from the pointer)
+    sudo kvm-msd-helper delete     # delete a library image (name from the pointer)
 
-It takes NO path arguments: the image comes from /etc/kvm/kvm.conf, the mount point and
-gadget LUN are fixed. The ESP is mounted owned by the unprivileged service user so the
-app can edit files without root.
+It takes NO path arguments. The image NAME for attach/import/delete is read from a pointer file the app
+writes (/run/kvm/msd-name) and is re-validated here (basename only, ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$,
+ending in .img/.iso/.bin/.raw). A ".iso" is exposed read-only as a CD-ROM, anything else as a removable
+read-write disk. The default EFI image (usb.image_path) can never be imported-over or deleted.
 """
 import configparser
 import grp
 import os
 import pwd
+import re
+import shutil
 import subprocess
 import sys
 import time
 
 LUN = "/sys/kernel/config/usb_gadget/kvm/functions/mass_storage.usb0/lun.0/file"
+LUN_DIR = os.path.dirname(LUN)
 MNT = "/run/kvmmnt"
 SVC_USER = "diykvm"
+IMAGES_DIR = "/opt/kvm/images"
+NAME_PTR = "/run/kvm/msd-name"
+DEFAULT_IMAGE = "/opt/kvm/images/drive.img"
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+ALLOWED_EXT = (".img", ".iso", ".bin", ".raw")
 
 
 def die(msg):
@@ -34,6 +47,17 @@ def conf(section, key, default):
     c = configparser.ConfigParser()
     c.read("/etc/kvm/kvm.conf")
     return c.get(section, key, fallback=default)
+
+
+def read_name():
+    try:
+        with open(NAME_PTR) as f:
+            name = os.path.basename(f.read().strip())
+    except OSError:
+        name = ""
+    if not _NAME_RE.match(name) or not name.lower().endswith(ALLOWED_EXT):
+        die("missing or invalid image name")
+    return name
 
 
 def loop_dev(image):
@@ -50,6 +74,26 @@ def set_lun(path):
         f.write(path + "\n")       # trailing newline so an empty path actually ejects
 
 
+def set_lun_attrs(image):
+    """Read-only CD-ROM for .iso, removable read-write disk otherwise. Only valid while the LUN has no
+    medium (file empty), so callers set_lun('') first."""
+    iso = image.lower().endswith(".iso")
+    for attr, val in (("ro", "1" if iso else "0"), ("cdrom", "1" if iso else "0")):
+        try:
+            with open(os.path.join(LUN_DIR, attr), "w") as f:
+                f.write(val)
+        except OSError as e:
+            sys.stderr.write(f"kvm-msd-helper: warning: could not set lun.0/{attr}: {e}\n")
+
+
+def attached_name():
+    try:
+        with open(LUN) as f:
+            return os.path.basename(f.read().strip())
+    except OSError:
+        return ""
+
+
 def is_attached():
     try:
         with open(LUN) as f:
@@ -58,7 +102,23 @@ def is_attached():
         return False
 
 
+def resolve_active(default_image):
+    """The selected image: the named regular file in the (root-owned, untamperable) library, else
+    the default. Path-based binding is safe because the unprivileged user cannot write IMAGES_DIR."""
+    try:
+        with open(NAME_PTR) as f:
+            name = os.path.basename(f.read().strip())
+    except OSError:
+        name = ""
+    if name and _NAME_RE.match(name) and name.lower().endswith(ALLOWED_EXT):
+        cand = os.path.join(IMAGES_DIR, name)
+        if os.path.isfile(cand) and not os.path.islink(cand):
+            return cand
+    return default_image
+
+
 def detach(image):
+    """Eject from the target and loop-mount the default EFI image's ESP for editing on the Pi."""
     if is_attached():
         set_lun("")
         if is_attached():
@@ -88,25 +148,94 @@ def detach(image):
         die("mount failed: " + r.stderr.strip())
 
 
-def attach(image):
+def unmount_edit():
     if os.path.ismount(MNT):
         subprocess.run(["sync"])
         r = subprocess.run(["umount", MNT], capture_output=True, text=True)
         if r.returncode != 0:
             die("umount failed (file still open?): " + r.stderr.strip())
-    loop = loop_dev(image)
-    if loop:
-        r = subprocess.run(["losetup", "-d", loop], capture_output=True, text=True)
-        if r.returncode != 0:
-            die("could not release loop device: " + r.stderr.strip())
-    set_lun(image)                 # only now does the target regain the medium
+
+
+def attach(active_image, editable_image):
+    """Hand the selected image to the target. Unmount the Pi-side edit mount and free its loop first."""
+    unmount_edit()
+    for img in (editable_image, active_image):
+        loop = loop_dev(img)
+        if loop:
+            subprocess.run(["losetup", "-d", loop], capture_output=True, text=True)
+    set_lun("")                    # empty the LUN so ro/cdrom can be changed
+    set_lun_attrs(active_image)
+    set_lun(active_image)          # IMAGES_DIR is root-owned, so this path is not attacker-swappable
+
+
+def eject():
+    """Remove the medium from the target; also drop a Pi-side edit mount so the UI returns to 'detached'."""
+    if is_attached():
+        set_lun("")
+        if is_attached():
+            die("could not eject from target")
+    unmount_edit()
+    for img in (DEFAULT_IMAGE, conf("usb", "image_path", DEFAULT_IMAGE)):
+        loop = loop_dev(img)
+        if loop:
+            subprocess.run(["losetup", "-d", loop], capture_output=True, text=True)
+
+
+def import_image(editable_image):
+    """Stream an image from stdin into the root-owned library (name from the pointer)."""
+    name = read_name()
+    if name == os.path.basename(editable_image) or name == os.path.basename(DEFAULT_IMAGE):
+        die("cannot overwrite the default EFI drive image")
+    if name == attached_name():
+        die("image is attached to the target; eject it first")
+    dest = os.path.join(IMAGES_DIR, name)
+    part = os.path.join(IMAGES_DIR, "." + name + ".part")
+    try:
+        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    except OSError as e:
+        die("cannot create image file: " + str(e))
+    try:
+        with os.fdopen(fd, "wb") as out:
+            shutil.copyfileobj(sys.stdin.buffer, out, 1024 * 1024)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(part, dest)
+    except OSError as e:
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        die("upload write failed (disk full?): " + str(e))
+
+
+def delete_image(editable_image):
+    name = read_name()
+    if name == os.path.basename(editable_image) or name == os.path.basename(DEFAULT_IMAGE):
+        die("cannot delete the default EFI drive image")
+    if name == attached_name():
+        die("image is attached to the target; eject it first")
+    p = os.path.join(IMAGES_DIR, name)
+    if os.path.islink(p) or not os.path.isfile(p):
+        die("no such image")
+    os.remove(p)
 
 
 def main():
-    if len(sys.argv) != 2 or sys.argv[1] not in ("attach", "detach"):
-        die("usage: kvm-msd-helper {attach|detach}")
-    image = conf("usb", "image_path", "/opt/kvm/images/drive.img")
-    (attach if sys.argv[1] == "attach" else detach)(image)
+    verbs = ("attach", "detach", "eject", "import", "delete")
+    if len(sys.argv) != 2 or sys.argv[1] not in verbs:
+        die("usage: kvm-msd-helper {%s}" % "|".join(verbs))
+    cmd = sys.argv[1]
+    editable = conf("usb", "image_path", DEFAULT_IMAGE)
+    if cmd == "attach":
+        attach(resolve_active(editable), editable)
+    elif cmd == "detach":
+        detach(editable)
+    elif cmd == "eject":
+        eject()
+    elif cmd == "import":
+        import_image(editable)
+    else:
+        delete_image(editable)
 
 
 if __name__ == "__main__":

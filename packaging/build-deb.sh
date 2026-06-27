@@ -35,6 +35,7 @@ install -m0644 "$ROOT/pi/kvm-gadget.service" "$ROOT/pi/ustreamer.service" "$ROOT
 # gadget scripts + helpers
 install -m0755 "$ROOT/pi/kvm-gadget-up.sh" "$ROOT/pi/kvm-gadget-down.sh" "$STAGE/usr/local/sbin/"
 install -m0755 "$PKG/files/usr/local/sbin/kvm-conf-get" \
+               "$PKG/files/usr/local/sbin/kvm-conf-helper" \
                "$PKG/files/usr/local/sbin/kvm-ustreamer" \
                "$PKG/files/usr/local/sbin/kvm-mkimage" \
                "$PKG/files/usr/local/sbin/kvm-msd-helper" "$STAGE/usr/local/sbin/"

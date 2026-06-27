@@ -89,6 +89,21 @@ curl -s -H "X-API-Key: &lt;KEY&gt;" -F file=@BOOTX64.EFI \
      "http://&lt;pi&gt;:8000/api/msd/upload?path=EFI/BOOT"
 curl -s -X POST -H "X-API-Key: &lt;KEY&gt;" http://&lt;pi&gt;:8000/api/msd/attach</code></pre>
 
+<h3>Boot images — upload a whole image / ISO</h3>
+<p>Instead of editing the EFI drive, upload a complete disk image or installer ISO and hand it to the target.</p>
+<table>
+<tr><th>Endpoint</th><th>Does</th></tr>
+<tr><td><code>GET /api/msd/images</code></td><td>list images: <code>{images:[{name,size,attached,default,cdrom}], attached}</code></td></tr>
+<tr><td><code>POST /api/msd/images/upload</code></td><td>multipart <code>file=@disk.img</code> — stream a whole image/ISO into the library (<code>.img/.iso/.bin/.raw</code>)</td></tr>
+<tr><td><code>POST /api/msd/images/attach?name=</code></td><td>hand that image to the target (ISOs are exposed read‑only as a CD‑ROM)</td></tr>
+<tr><td><code>POST /api/msd/eject</code></td><td>remove the medium from the target</td></tr>
+<tr><td><code>DELETE /api/msd/images?name=</code></td><td>delete an image (not the attached one or the default EFI drive)</td></tr>
+</table>
+<pre><code># upload an installer ISO and boot the target from it
+curl -s -X POST -H "X-API-Key: &lt;KEY&gt;" -F file=@ubuntu.iso \
+     http://&lt;pi&gt;:8000/api/msd/images/upload
+curl -s -X POST -H "X-API-Key: &lt;KEY&gt;" "http://&lt;pi&gt;:8000/api/msd/images/attach?name=ubuntu.iso"</code></pre>
+
 <h2>5. Serial console <span class="pill">/api/serial/ports</span> <span class="pill">WS /ws/serial</span></h2>
 <table>
 <tr><td><code>GET /api/serial/ports</code></td><td>list serial ports: <code>{ports:[{device,desc,hwid}]}</code></td></tr>
@@ -103,10 +118,37 @@ async def console(pi, key, dev):
         async for line in ws: print(line, end="")
 asyncio.run(console("192.168.1.120","&lt;KEY&gt;","/dev/ttyUSB0"))</code></pre>
 
-<h2>6. Notes</h2>
+<h2>6. Power, KVM switch &amp; configuration <span class="pill">/api/power</span> <span class="pill">/api/kvmswitch</span> <span class="pill">/api/config</span></h2>
+<p>Configure the GPIO targets on the <code>/config</code> page first. <b>Target power</b> — each target's
+GPIO drives a relay that connects or cuts its power (latched on/off):</p>
+<table>
+<tr><th>Endpoint</th><th>Does</th></tr>
+<tr><td><code>GET /api/power/state</code></td><td><code>{enabled, available, targets:[{label, on}]}</code> — <code>on</code> is true (powered), false (cut), or null (not yet driven)</td></tr>
+<tr><td><code>POST /api/power</code> <code>{"index":0,"on":true}</code></td><td>connect power to that target (<code>"on":false</code> cuts it — a hard power-off)</td></tr>
+</table>
+<p><b>External KVM switch</b> — pulse a GPIO to press a hardware switch's select button (display + USB):</p>
+<table>
+<tr><td><code>GET /api/kvmswitch/state</code></td><td><code>{enabled, available, ports:[{label}]}</code></td></tr>
+<tr><td><code>POST /api/kvmswitch</code> <code>{"index":0}</code></td><td>momentary press of the Nth select button (switch to that target)</td></tr>
+</table>
+<p class="muted">Both return <code>409</code> if disabled or the index isn't configured.</p>
+<p>Read or change settings (i.e. <code>/etc/kvm/kvm.conf</code>) programmatically:</p>
+<table>
+<tr><td><code>GET /api/config</code></td><td><code>{sections:[{section,title,note,fields:[{key,label,type,value}]}]}</code></td></tr>
+<tr><td><code>POST /api/config</code></td><td>body <code>{"&lt;section&gt;":{"&lt;key&gt;":"&lt;value&gt;"}}</code> — validated server-side (unknown keys / bad values rejected with <code>400</code>). Power settings apply immediately; web/video/USB changes need the relevant service restart.</td></tr>
+<tr><td><code>POST /api/config/restart-streamer</code></td><td>restart the video streamer to apply <code>[video]</code> changes</td></tr>
+</table>
+<pre><code># connect power to the first target, then switch the KVM to it
+curl -s -X POST -H "X-API-Key: &lt;KEY&gt;" -H "Content-Type: application/json" \
+     -d '{"index":0,"on":true}' http://&lt;pi&gt;:8000/api/power
+curl -s -X POST -H "X-API-Key: &lt;KEY&gt;" -H "Content-Type: application/json" \
+     -d '{"index":0}' http://&lt;pi&gt;:8000/api/kvmswitch</code></pre>
+
+<h2>7. Notes</h2>
 <ul>
 <li>The mouse maps to the target's <b>primary</b> display (absolute) — use relative <code>mr</code> for multi-monitor targets.</li>
 <li>The emulated keyboard is a USB <b>boot keyboard</b>, so it works in the target's <b>BIOS/UEFI</b> setup and boot menus — not just the running OS.</li>
+<li>GPIO power and KVM-switch control must be wired and enabled on the <code>/config</code> page first; cutting a target's power is a hard power-off (unsaved work is lost).</li>
 <li>Rotate the API key by re-running <code>setup_auth.py</code> on the Pi.</li>
 <li>Everything is LAN-only; there is no rate limiting — don't expose port 8000 to the internet without a VPN.</li>
 </ul>

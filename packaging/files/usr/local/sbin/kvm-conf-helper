@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Privileged configuration helper for diykvm.
+
+The web app runs unprivileged and cannot write the root-owned /etc/kvm/kvm.conf. This helper accepts
+a proposed config on stdin, validates it against a STRICT allowlist of sections, keys and value
+formats, and only then atomically installs it. The allowlist is the security boundary: it guarantees
+the unprivileged app can never inject unexpected sections/keys or shell-unsafe values into settings
+that root-run services (gadget, streamer, mkimage) later read from the file.
+
+    sudo kvm-conf-helper write             # validate stdin and atomically write /etc/kvm/kvm.conf
+    sudo kvm-conf-helper restart-streamer  # systemctl restart ustreamer (apply video settings)
+
+It takes no other arguments and performs no other action.
+"""
+import configparser
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+CONF = "/etc/kvm/kvm.conf"
+
+# Value formats (matched case-insensitively, anchored). Values may never contain '..'.
+BOOL = r"(1|0|true|false|yes|no|on|off)"
+PORT = r"\d{1,5}"
+BAUD = r"\d{3,7}"
+INT = r"\d{1,6}"
+HOST = r"([A-Za-z0-9_]([A-Za-z0-9_.\-]{0,252})?)?"   # hostname / IP / blank; never option-like
+PATH = r"/[A-Za-z0-9_./\-]{1,255}"            # absolute, no spaces or shell metacharacters
+DEV = r"/dev/[A-Za-z0-9_./\-]{1,250}"
+RES = r"\d{2,5}x\d{2,5}"
+SIZE = r"\d{1,5}[MG]?"
+CHIP = r"gpiochip\d{1,2}"
+ORIGINS = r"[A-Za-z0-9_.\-:, ]{0,512}"        # comma-separated host[:port], or blank
+PORTS = r"[A-Za-z0-9 _:,.\-]{0,256}"          # comma-separated Label:pin pairs, or blank
+
+SCHEMA = {
+    "web": {"host": HOST, "port": PORT, "tls": BOOL,
+            "tls_cert": PATH, "tls_key": PATH, "allowed_origins": ORIGINS},
+    "video": {"device": DEV, "resolution": RES, "fps": INT,
+              "ustreamer_host": HOST, "ustreamer_port": PORT},
+    "usb": {"image_path": PATH, "image_size": SIZE},
+    "serial": {"default_baud": BAUD},
+    "power": {"enabled": BOOL, "active_low": BOOL, "targets": PORTS},
+    "kvmswitch": {"enabled": BOOL, "chip": CHIP, "active_low": BOOL, "pulse_ms": INT, "ports": PORTS},
+}
+
+
+def die(msg):
+    sys.stderr.write("kvm-conf-helper: " + msg + "\n")
+    sys.exit(1)
+
+
+def validate(c):
+    if c.defaults():
+        die("a [DEFAULT] section is not allowed")
+    for section in c.sections():
+        if section not in SCHEMA:
+            die("unknown section [%s]" % section)
+        for key, val in c.items(section):
+            if key not in SCHEMA[section]:
+                die("unknown key %s.%s" % (section, key))
+            val = (val or "").strip()
+            if ".." in val:
+                die("invalid value for %s.%s (contains '..')" % (section, key))
+            if not re.fullmatch(SCHEMA[section][key], val, re.IGNORECASE):
+                die("invalid value for %s.%s: %r" % (section, key, val))
+
+
+def write_conf(text):
+    c = configparser.ConfigParser()
+    try:
+        c.read_string(text)
+    except configparser.Error as e:
+        die("could not parse config: " + str(e).replace("\n", " "))
+    validate(c)
+    d = os.path.dirname(CONF) or "/etc/kvm"
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".kvm.conf.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write("# DIY KVM configuration (managed by the web Config page).\n"
+                    "# After editing:  sudo systemctl restart kvm-web ustreamer kvm-gadget\n\n")
+            c.write(f)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, CONF)            # atomic
+    except Exception as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        die("write failed: " + str(e))
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in ("write", "restart-streamer"):
+        die("usage: kvm-conf-helper {write|restart-streamer}")
+    if sys.argv[1] == "write":
+        write_conf(sys.stdin.read())
+    else:
+        subprocess.run(["systemctl", "restart", "ustreamer.service"], check=False)
+
+
+if __name__ == "__main__":
+    main()

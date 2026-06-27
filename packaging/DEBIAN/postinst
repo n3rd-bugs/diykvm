@@ -18,6 +18,8 @@ case "$1" in
     getent passwd diykvm >/dev/null || useradd --system --gid diykvm --home-dir /opt/kvm \
         --shell /usr/sbin/nologin --comment "diykvm service" diykvm
     usermod -aG dialout diykvm 2>/dev/null || true   # serial console access
+    getent group gpio >/dev/null || groupadd --system gpio   # GPIO power control (/dev/gpiochip*)
+    usermod -aG gpio diykvm 2>/dev/null || true      # (kvm-web.service requires the gpio group to exist)
 
     # validate + lock down the sudoers drop-in (never leave a broken sudoers file)
     if [ -f /etc/sudoers.d/diykvm ]; then
@@ -28,6 +30,8 @@ case "$1" in
     # 3. credentials + dirs (generate a random admin password on first install)
     mkdir -p /opt/kvm/images /etc/kvm/tls
     chmod 700 /etc/kvm/tls
+    # /opt/kvm/images stays ROOT-owned: the unprivileged app reads it but writes images only through
+    # kvm-msd-helper, so the directory the helper trusts can never be tampered with (no symlink races).
     if [ ! -f /opt/kvm/config.json ]; then
       PW="$("$VENV/bin/python" -c 'import secrets; print(secrets.token_urlsafe(9))')"
       ( cd "$APP" && "$VENV/bin/python" setup_auth.py admin "$PW" ) >/dev/null

@@ -9,9 +9,11 @@
 Runtime options come from a config file (default /etc/kvm/kvm.conf); every value
 falls back to a sane default, so the app also runs with no config file present.
 """
+import io
 import os
 import time
 import asyncio
+import subprocess
 import configparser
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
@@ -19,20 +21,24 @@ from concurrent.futures import ThreadPoolExecutor
 import httpx
 import serial
 from fastapi import (FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File,
-                     Query, HTTPException, Request, Depends, Form, Response)
+                     Query, HTTPException, Request, Depends, Form, Response, Body)
 from fastapi.responses import FileResponse, StreamingResponse, RedirectResponse, JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
 
 import auth
 from hid import HIDController
 from msd import MSD, MSDError
+from power import PowerController, PowerError
+from kvmswitch import KvmSwitch, SwitchError
 from serialbridge import list_serial_ports, COMMON_BAUDS
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ----------------------------- config -----------------------------
+CONF_PATH = os.environ.get("KVM_CONF", "/etc/kvm/kvm.conf")
+CONF_HELPER = "/usr/local/sbin/kvm-conf-helper"
 _cp = configparser.ConfigParser()
-_cp.read(os.environ.get("KVM_CONF", "/etc/kvm/kvm.conf"))
+_cp.read(CONF_PATH)
 
 
 def _conf(section, key, default):
@@ -60,6 +66,8 @@ app.add_middleware(SessionMiddleware, secret_key=cfg["secret_key"], max_age=8640
                    same_site="strict", https_only=TLS)
 hid = HIDController()
 msd = MSD(image=MSD_IMAGE)
+power = PowerController()
+kvmswitch = KvmSwitch()
 _serial_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="serial")
 
 
@@ -176,6 +184,13 @@ def index(request: Request):
 @app.get("/api-guide")
 def api_guide(_: bool = Depends(require_auth)):
     return FileResponse(os.path.join(HERE, "static", "api-guide.html"))
+
+
+@app.get("/config")
+def config_page(request: Request):
+    if not request.session.get("user"):
+        return RedirectResponse("/login", status_code=303)
+    return FileResponse(os.path.join(HERE, "static", "config.html"))
 
 
 @app.get("/healthz")
@@ -301,6 +316,36 @@ def msd_upload(path: str = Query(""), file: UploadFile = File(...), _: bool = De
     return {"ok": True, "name": file.filename}
 
 
+# ---- image library: upload a whole disk image / ISO and hand it to the target ----
+@app.get("/api/msd/images")
+def msd_images(_: bool = Depends(require_auth)):
+    return _msd(msd.list_images)
+
+
+@app.post("/api/msd/images/upload")
+def msd_image_upload(request: Request, file: UploadFile = File(...), _: bool = Depends(require_auth)):
+    try:
+        declared = max(0, int(request.headers.get("content-length", "0")))
+    except ValueError:
+        declared = 0
+    return _msd(msd.save_image_upload, file.filename, file.file, declared)
+
+
+@app.post("/api/msd/images/attach")
+def msd_image_attach(name: str = Query(...), _: bool = Depends(require_auth)):
+    return _msd(msd.attach_image, name)
+
+
+@app.delete("/api/msd/images")
+def msd_image_delete(name: str = Query(...), _: bool = Depends(require_auth)):
+    return _msd(msd.delete_image, name)
+
+
+@app.post("/api/msd/eject")
+def msd_eject(_: bool = Depends(require_auth)):
+    return _msd(msd.eject)
+
+
 # ----------------------------- serial console -----------------------------
 @app.get("/api/serial/ports")
 def serial_ports(_: bool = Depends(require_auth)):
@@ -369,6 +414,143 @@ async def ws_serial(sock: WebSocket):
             ser.close()
         except Exception:
             pass
+
+
+# ----------------------------- target power (GPIO) -----------------------------
+@app.get("/api/power/state")
+def power_state(_: bool = Depends(require_auth)):
+    return power.status()
+
+
+@app.post("/api/power")
+def power_action(payload: dict = Body(default={}), _: bool = Depends(require_auth)):
+    # body: {"index": N, "on": true|false} -> connect/cut that target's power (latched relay)
+    p = payload or {}
+    try:
+        return power.set(p.get("index"), bool(p.get("on")))
+    except PowerError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+# ----------------------------- external KVM switch (GPIO) -----------------------------
+@app.get("/api/kvmswitch/state")
+def kvmswitch_state(_: bool = Depends(require_auth)):
+    return kvmswitch.status()
+
+
+@app.post("/api/kvmswitch")
+def kvmswitch_press(payload: dict = Body(default={}), _: bool = Depends(require_auth)):
+    # body: {"index": N} -> momentary press of the Nth configured select button
+    try:
+        return kvmswitch.press((payload or {}).get("index"))
+    except SwitchError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+# ----------------------------- configuration management -----------------------------
+# The editable schema, also used to render the Config page. Only these sections/keys are exposed;
+# the privileged kvm-conf-helper re-validates every value before writing /etc/kvm/kvm.conf.
+CONFIG_FIELDS = [
+    {"section": "web", "title": "Web server",
+     "note": "Applied after: sudo systemctl restart kvm-web",
+     "fields": [
+         {"key": "host", "label": "Bind address", "type": "text", "default": "0.0.0.0"},
+         {"key": "port", "label": "Port", "type": "number", "default": "8000"},
+         {"key": "tls", "label": "Enable HTTPS (TLS)", "type": "bool", "default": "false"},
+         {"key": "tls_cert", "label": "TLS certificate path", "type": "text", "default": "/etc/kvm/tls/cert.pem"},
+         {"key": "tls_key", "label": "TLS key path", "type": "text", "default": "/etc/kvm/tls/key.pem"},
+         {"key": "allowed_origins", "label": "Extra allowed origins (host[:port], comma-separated)",
+          "type": "text", "default": ""},
+     ]},
+    {"section": "video", "title": "Video capture",
+     "note": "Apply with the “Restart streamer” button.",
+     "fields": [
+         {"key": "device", "label": "Capture device", "type": "text", "default": "/dev/video0"},
+         {"key": "resolution", "label": "Resolution (WxH)", "type": "text", "default": "1920x1080"},
+         {"key": "fps", "label": "Frames per second", "type": "number", "default": "30"},
+         {"key": "ustreamer_host", "label": "uStreamer host", "type": "text", "default": "127.0.0.1"},
+         {"key": "ustreamer_port", "label": "uStreamer port", "type": "number", "default": "8080"},
+     ]},
+    {"section": "usb", "title": "Virtual USB drive",
+     "note": "Applied after: sudo systemctl restart kvm-gadget (briefly re-enumerates USB).",
+     "fields": [
+         {"key": "image_path", "label": "Drive image path", "type": "text", "default": "/opt/kvm/images/drive.img"},
+         {"key": "image_size", "label": "Image size (e.g. 1G, 512M)", "type": "text", "default": "1G"},
+     ]},
+    {"section": "serial", "title": "Serial console",
+     "note": "Default baud for the console UI.",
+     "fields": [
+         {"key": "default_baud", "label": "Default baud", "type": "number", "default": "115200"},
+     ]},
+    {"section": "power", "title": "Target power (GPIO relays)",
+     "note": "Applied immediately. Each target's GPIO drives a relay that connects or cuts its power "
+             "(latched on/off); list targets as Label:BCMpin pairs.",
+     "fields": [
+         {"key": "enabled", "label": "Enable power control", "type": "bool", "default": "false"},
+         {"key": "active_low", "label": "Active-low relays (drive line low = power on)", "type": "bool", "default": "false"},
+         {"key": "targets", "label": "Targets — Label:pin, comma-separated (e.g. PC1:5, PC2:6)",
+          "type": "text", "default": ""},
+     ]},
+    {"section": "kvmswitch", "title": "External KVM switch (GPIO)",
+     "note": "Applied immediately. Wire a GPIO to each select button of a hardware KVM switch that "
+             "toggles display + USB between targets; list buttons as Label:BCMpin pairs.",
+     "fields": [
+         {"key": "enabled", "label": "Enable KVM switch", "type": "bool", "default": "false"},
+         {"key": "chip", "label": "GPIO chip", "type": "text", "default": "gpiochip0"},
+         {"key": "active_low", "label": "Active-low wiring", "type": "bool", "default": "false"},
+         {"key": "pulse_ms", "label": "Button press (ms)", "type": "number", "default": "300"},
+         {"key": "ports", "label": "Buttons — Label:pin, comma-separated (e.g. PC1:5, PC2:6)",
+          "type": "text", "default": ""},
+     ]},
+]
+
+
+def _read_config_values():
+    c = configparser.ConfigParser()
+    c.read(CONF_PATH)                            # read fresh from disk (reflects edits)
+    out = []
+    for sec in CONFIG_FIELDS:
+        fields = [dict(f, value=c.get(sec["section"], f["key"], fallback=f["default"]))
+                  for f in sec["fields"]]
+        out.append({"section": sec["section"], "title": sec["title"], "note": sec["note"], "fields": fields})
+    return out
+
+
+@app.get("/api/config")
+def config_get(_: bool = Depends(require_auth)):
+    return {"sections": _read_config_values()}
+
+
+@app.post("/api/config")
+def config_save(payload: dict = Body(default={}), _: bool = Depends(require_auth)):
+    # Rebuild the config from the known schema only (every key written with the submitted value or
+    # its default); the privileged helper re-validates each value before it touches the real file.
+    data = payload if isinstance(payload, dict) else {}
+    c = configparser.ConfigParser()
+    for sec in CONFIG_FIELDS:
+        name = sec["section"]
+        c.add_section(name)
+        incoming = data.get(name) if isinstance(data.get(name), dict) else {}
+        for f in sec["fields"]:
+            v = incoming.get(f["key"], f["default"])
+            if isinstance(v, bool):
+                v = "true" if v else "false"
+            c.set(name, f["key"], str(v))
+    buf = io.StringIO()
+    c.write(buf)
+    proc = subprocess.run(["sudo", "-n", CONF_HELPER, "write"],
+                          input=buf.getvalue(), capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise HTTPException(status_code=400, detail=(proc.stderr or proc.stdout or "config rejected").strip())
+    return {"ok": True}
+
+
+@app.post("/api/config/restart-streamer")
+def config_restart_streamer(_: bool = Depends(require_auth)):
+    proc = subprocess.run(["sudo", "-n", CONF_HELPER, "restart-streamer"], capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise HTTPException(status_code=502, detail=(proc.stderr or "restart failed").strip())
+    return {"ok": True}
 
 
 if __name__ == "__main__":

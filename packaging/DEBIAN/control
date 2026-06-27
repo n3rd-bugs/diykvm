@@ -2,7 +2,7 @@ Package: diykvm
 Version: 0.1.0
 Architecture: all
 Maintainer: Usama Masood <mirzaon@gmail.com>
-Depends: python3 (>= 3.9), python3-venv, python3-pip, ustreamer, dosfstools, gdisk, util-linux, mount, libjpeg62-turbo
+Depends: python3 (>= 3.9), python3-venv, python3-pip, ustreamer, dosfstools, gdisk, util-linux, mount, libjpeg62-turbo, gpiod, raspi-gpio
 Recommends: socat
 Section: admin
 Priority: optional

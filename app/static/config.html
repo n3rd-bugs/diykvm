@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DIY PiKVM · Configuration</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: #111; color: #ddd; font: 14px/1.5 system-ui, sans-serif; }
+  #bar { display: flex; gap: 8px; align-items: center; padding: 8px 12px;
+         background: #1b1b1b; border-bottom: 1px solid #333; position: sticky; top: 0; }
+  #bar .sp { flex: 1; }
+  .barlink { color: #9bd; text-decoration: none; border: 1px solid #444; border-radius: 5px;
+             padding: 5px 9px; background: #2a2a2a; }
+  .barlink:hover { background: #383838; }
+  main { max-width: 760px; margin: 0 auto; padding: 16px 14px 60px; }
+  fieldset { border: 1px solid #333; border-radius: 8px; background: #181818; margin: 0 0 16px; padding: 12px 14px; }
+  legend { padding: 0 6px; font-weight: 600; font-size: 15px; color: #cfe; }
+  .note { color: #8794a3; font-size: 12px; margin: 2px 0 10px; }
+  .field { display: flex; align-items: center; gap: 12px; padding: 5px 0; flex-wrap: wrap; }
+  .field label { flex: 1 1 240px; min-width: 0; color: #cdd; }
+  .field input[type=text], .field input[type=number] {
+     flex: 1 1 200px; min-width: 0; background: #222; color: #eee; border: 1px solid #444;
+     border-radius: 5px; padding: 7px 9px; font: inherit; }
+  .field input[type=checkbox] { width: 18px; height: 18px; }
+  #actions { position: fixed; bottom: 0; left: 0; right: 0; display: flex; gap: 10px; align-items: center;
+             padding: 10px 14px; background: #161616; border-top: 1px solid #333; }
+  button { background: #2a2a2a; color: #ddd; border: 1px solid #444; border-radius: 6px;
+           padding: 8px 14px; cursor: pointer; font: inherit; }
+  button:hover { background: #383838; }
+  button.primary { background: #1d4f8b; border-color: #2c6fb8; color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  #msg { flex: 1; font-size: 13px; }
+  #msg.ok { color: #79f29a; }
+  #msg.err { color: #f2918a; }
+</style>
+</head>
+<body>
+  <div id="bar">
+    <strong>⚙ Configuration</strong>
+    <span class="sp"></span>
+    <a class="barlink" href="/">← KVM</a>
+    <a class="barlink" href="/api-guide" target="_blank">API</a>
+    <a class="barlink" href="/logout">Logout</a>
+  </div>
+  <main>
+    <form id="form"><p id="loading" class="note">Loading…</p></form>
+  </main>
+  <div id="actions">
+    <button id="save" class="primary" disabled>Save</button>
+    <button id="restart" title="restart the video streamer to apply [video] changes" disabled>Restart streamer</button>
+    <span id="msg"></span>
+  </div>
+
+<script>
+const form = document.getElementById('form');
+const saveBtn = document.getElementById('save');
+const restartBtn = document.getElementById('restart');
+const msg = document.getElementById('msg');
+let SECTIONS = [];
+
+function setMsg(text, cls) { msg.textContent = text || ''; msg.className = cls || ''; }
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) { let d; try { d = (await r.json()).detail; } catch (e) {} throw new Error(d || ('HTTP ' + r.status)); }
+  return (r.headers.get('content-type') || '').includes('json') ? r.json() : r;
+}
+
+function fieldId(sec, key) { return 'f_' + sec + '_' + key; }
+
+async function load() {
+  try {
+    const d = await api('/api/config');
+    SECTIONS = d.sections;
+    form.innerHTML = '';
+    for (const sec of SECTIONS) {
+      const fs = document.createElement('fieldset');
+      const lg = document.createElement('legend'); lg.textContent = sec.title; fs.appendChild(lg);
+      if (sec.note) { const n = document.createElement('div'); n.className = 'note'; n.textContent = sec.note; fs.appendChild(n); }
+      for (const f of sec.fields) {
+        const row = document.createElement('div'); row.className = 'field';
+        const lab = document.createElement('label'); lab.textContent = f.label; lab.htmlFor = fieldId(sec.section, f.key);
+        const inp = document.createElement('input'); inp.id = fieldId(sec.section, f.key);
+        if (f.type === 'bool') {
+          inp.type = 'checkbox';
+          inp.checked = String(f.value).toLowerCase() === 'true' || f.value === '1' || f.value === 'on' || f.value === 'yes';
+        } else {
+          inp.type = (f.type === 'number') ? 'number' : 'text';
+          inp.value = f.value == null ? '' : f.value;
+        }
+        row.append(lab, inp); fs.appendChild(row);
+      }
+      form.appendChild(fs);
+    }
+    saveBtn.disabled = false; restartBtn.disabled = false;
+    setMsg('');
+  } catch (e) { setMsg(e.message, 'err'); }
+}
+
+function collect() {
+  const out = {};
+  for (const sec of SECTIONS) {
+    out[sec.section] = {};
+    for (const f of sec.fields) {
+      const inp = document.getElementById(fieldId(sec.section, f.key));
+      out[sec.section][f.key] = (f.type === 'bool') ? (inp.checked ? 'true' : 'false') : inp.value.trim();
+    }
+  }
+  return out;
+}
+
+saveBtn.onclick = async () => {
+  saveBtn.disabled = true; setMsg('Saving…');
+  try {
+    await api('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(collect()) });
+    setMsg('Saved. Power settings apply now; web/video/USB changes need the relevant service restart.', 'ok');
+  } catch (e) { setMsg('Rejected: ' + e.message, 'err'); }
+  saveBtn.disabled = false;
+};
+
+restartBtn.onclick = async () => {
+  restartBtn.disabled = true; setMsg('Restarting streamer…');
+  try { await api('/api/config/restart-streamer', { method: 'POST' }); setMsg('Streamer restarted.', 'ok'); }
+  catch (e) { setMsg(e.message, 'err'); }
+  restartBtn.disabled = false;
+};
+
+load();
+</script>
+</body>
+</html>
