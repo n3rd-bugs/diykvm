@@ -13,23 +13,25 @@ single‑page web UI plus an HTTP/WebSocket API.
 ## Features
 
 - **Video** — low‑latency MJPEG of the target's screen (USB HDMI capture via µStreamer).
-- **Keyboard & mouse** — full keyboard, absolute + relative mouse, on‑screen keyboard, and
-  touchscreen gestures (tap = click, drag = move, two‑finger scroll, double‑tap‑hold = drag,
-  two‑finger = right button). The keyboard is a USB **boot keyboard**, so it also works in the
-  target's **BIOS/UEFI** firmware and boot menus, not just the OS.
+- **Keyboard & mouse** — full keyboard, switchable **absolute (point)** or **relative (trackpad, adjustable
+  speed)** mouse, on‑screen keyboard, and touchscreen gestures (tap = click, drag = move, two‑finger
+  scroll, double‑tap‑hold = drag, two‑finger = right button). The keyboard is a USB **boot keyboard**, so
+  it also works in the target's **BIOS/UEFI** firmware and boot menus, not just the OS.
 - **Virtual USB drive** — present boot media to the target: **upload a disk image or ISO** and attach it
   (ISOs as a read‑only CD‑ROM), or use the built‑in editable GPT/FAT32 **EFI System Partition** and manage
   its files from the browser. Attach/detach safely (the Pi and target never mount it at once).
-- **Serial console** — talk to the target's serial port from the browser (line or raw‑key mode).
+- **Serial console** — talk to the target's serial port from the browser (line or raw‑key mode);
+  **binary‑clean** end to end (raw bytes both directions) for agents/automation.
 - **Target power** — connect or cut power to two or more targets from the browser, each via a Raspberry
-  Pi **GPIO** wired to a relay (latched on/off, one On/Off control per target).
+  Pi **GPIO** wired to a relay (latched on/off per target; **push‑pull or open‑drain** output).
 - **External KVM switch** — drive a hardware KVM switch (display + USB) across two or more targets with
   one button per target, by pulsing a GPIO wired to each of its select buttons.
 - **Configuration UI** — a **Config** page (and API) to edit settings in `/etc/kvm/kvm.conf` from the
   browser; every value is validated server‑side before it's written.
 - **Keep‑awake** — optional periodic mouse nudges so the target's display doesn't sleep.
 - **Auth** — login (session cookie) for humans, API key for agents/automation.
-- **Agent API** — documented at `/api-guide`; drive everything programmatically.
+- **Agent API** — a machine-readable endpoint list at `/api` (JSON, public for discovery) plus a human
+  guide at `/api-guide`; drive everything programmatically.
 
 ## Hardware
 

@@ -42,7 +42,7 @@ SCHEMA = {
               "ustreamer_host": HOST, "ustreamer_port": PORT},
     "usb": {"image_path": PATH, "image_size": SIZE},
     "serial": {"default_baud": BAUD},
-    "power": {"enabled": BOOL, "active_low": BOOL, "targets": PORTS},
+    "power": {"enabled": BOOL, "active_low": BOOL, "open_drain": BOOL, "targets": PORTS},
     "kvmswitch": {"enabled": BOOL, "chip": CHIP, "active_low": BOOL, "pulse_ms": INT, "ports": PORTS},
 }
 

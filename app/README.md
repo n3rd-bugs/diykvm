@@ -6,9 +6,10 @@ For install/usage see the top‑level [README](../README.md); the agent API is a
 
 ## Modules
 - `server.py` — FastAPI: pages, auth (session + API key, Origin‑checked, rate‑limited), video
-  proxy (`/stream`, `/snapshot`), input WebSocket `/ws`, mass‑storage REST `/api/msd/*`, serial
-  WebSocket `/ws/serial`, target power `/api/power`, and config read/write `/api/config`
-  (+ the `/config` page). Reads `/etc/kvm/kvm.conf` (host/port/TLS, ustreamer URL, image path).
+  proxy (`/stream`, `/snapshot`), input WebSocket `/ws`, mass‑storage REST `/api/msd/*`, binary‑clean
+  serial WebSocket `/ws/serial`, target power `/api/power`, external KVM switch `/api/kvmswitch`, config
+  read/write `/api/config` (+ the `/config` page), and a public machine‑readable API descriptor `/api`.
+  Reads `/etc/kvm/kvm.conf` (host/port/TLS, ustreamer URL, image path).
 - `power.py` — latched per-target power over GPIO: drives a relay line on/off (`pinctrl`) to connect or
   cut each target's power, and reads the line back for state.
 - `kvmswitch.py` — external KVM switch over GPIO: pulses a configured line per target (`gpioset`) to

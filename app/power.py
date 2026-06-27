@@ -5,6 +5,10 @@ momentary front-panel button, this is a held (latched) on/off level: 'on' connec
 The level is driven with pinctrl (register-level, so it latches and survives an app restart) via the
 unprivileged `gpio` group (/dev/gpiomem); raspi-gpio is used if pinctrl is absent.
 
+Output style is selectable: push-pull (default; drives high or low per active_low) or open_drain (on
+sinks the line to ground, off releases it to high-Z and never drives high — provide an external
+pull-up to set the off level; handy for 5 V relay/opto inputs and shared lines).
+
 Settings live in the [power] section and are read fresh on each call, so Config-page changes take effect
 immediately. Targets are listed as Label:BCMpin pairs:
 
@@ -64,6 +68,7 @@ class PowerController:
         return {
             "enabled": _bool(c, "enabled", "false"),
             "active_low": _bool(c, "active_low", "false"),
+            "open_drain": _bool(c, "open_drain", "false"),
             "targets": _parse_targets(_get(c, "targets", "")),
         }
 
@@ -78,7 +83,7 @@ class PowerController:
             on = None
             if tool:
                 try:
-                    on = self._read(tool, t["pin"], s["active_low"])
+                    on = self._read(tool, t["pin"], s)
                 except PowerError:
                     on = None
             targets.append({"label": t["label"], "on": on})   # on True/False, or None = not yet set
@@ -96,24 +101,25 @@ class PowerController:
             raise PowerError((r.stderr or r.stdout or "gpio command failed").strip())
         return r.stdout
 
-    def _read(self, tool, pin, active_low):
-        """Return True (powered/on), False (cut/off), or None if the pin isn't driven as an output yet."""
+    def _read(self, tool, pin, s):
+        """Return True (on), False (off), or None if the pin's state is unknown."""
         out = self._run(tool, ["get", str(pin)])
         if "level=" in out:                       # raspi-gpio: "GPIO 5: level=1 fsel=1 func=OUTPUT"
-            if "func=OUTPUT" not in out and "func=OP" not in out:
-                return None
+            is_output = ("func=OUTPUT" in out) or ("func=OP" in out)
             level_high = "level=1" in out
         else:                                     # pinctrl: "5: op dh pd | hi // GPIO5 = output"
             toks = out.split()
-            if len(toks) < 2 or toks[1] != "op":
-                return None
-            if "hi" in toks:
-                level_high = True
-            elif "lo" in toks:
-                level_high = False
-            else:
-                return None                       # unrecognized format -> unknown, not 'off'
-        return level_high != active_low           # active-low: a low level means 'on'
+            is_output = len(toks) >= 2 and toks[1] == "op"
+            level_high = True if "hi" in toks else (False if "lo" in toks else None)
+        if s["open_drain"]:
+            # on = actively drained LOW; off = released (input / high-Z)
+            if not is_output:
+                return False
+            return (not level_high) if level_high is not None else None
+        # push-pull: only a driven output pin has a definite state
+        if not is_output or level_high is None:
+            return None
+        return level_high != s["active_low"]      # active-low: a low level means 'on'
 
     def set(self, index, on: bool) -> dict:
         with self._lock:
@@ -127,6 +133,14 @@ class PowerController:
             tool = self._tool()
             if not tool:
                 raise PowerError("pinctrl/raspi-gpio not installed (sudo apt install raspi-gpio)")
-            drive = "dh" if (bool(on) != s["active_low"]) else "dl"   # on -> active level (high unless active-low)
-            self._run(tool, ["set", str(t["pin"]), "op", drive])
+            pin = str(t["pin"])
+            if s["open_drain"]:
+                # open-drain: 'on' sinks the line to ground; 'off' releases it to high-Z (input, NO
+                # internal pull) so an external pull-up sets the off level. The line is never driven
+                # high -- safe for 5 V relay/opto inputs and shared lines.
+                args = ["set", pin, "op", "dl"] if on else ["set", pin, "ip", "pn"]
+            else:
+                drive = "dh" if (bool(on) != s["active_low"]) else "dl"   # push-pull: on -> active level
+                args = ["set", pin, "op", drive]
+            self._run(tool, args)
         return self.status()

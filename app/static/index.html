@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>DIY PiKVM</title>
+<!-- AI agents: a machine-readable API descriptor is served at GET /api (JSON, public). Human guide: /api-guide -->
+<link rel="help" type="application/json" href="/api" title="Agent API descriptor (JSON)">
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -142,6 +144,9 @@
     <button id="files" title="virtual USB drive">Files ▾</button>
     <button id="kbd" title="on-screen keyboard">⌨</button>
     <button id="mouse" title="on-screen mouse buttons">🖱</button>
+    <button id="mmode" title="mouse control: Absolute (point where you move) vs Relative (trackpad, adjustable speed)">Mouse: Absolute</button>
+    <span id="msenswrap" style="display:none; align-items:center; gap:5px; font-size:12px; color:#9ab;">
+      <span>speed</span><input type="range" id="msens" min="0.2" max="3" step="0.1" style="width:90px"><span id="msensval">1.0×</span></span>
     <button id="serialbtn" title="serial console">Serial</button>
     <button id="powerbtn" title="target power (GPIO)">⏻ Power</button>
     <button id="kvmbtn" title="external KVM switch (GPIO)">⇄ KVM</button>
@@ -285,23 +290,62 @@ window.addEventListener('keyup', (e) => {
 }, true);
 
 // ---- mouse over the screen ----
+// Two mouse styles (touch gestures below are unchanged):
+//   Absolute — the target cursor jumps to where you point (precise; default).
+//   Relative — a trackpad: click to grab (Pointer Lock), then movement nudges the cursor by
+//              (delta × speed); Esc releases. The speed slider tames a too-fast mouse.
+let mouseMode = localStorage.getItem('kvm_mouseMode') || 'absolute';
+let mouseSens = parseFloat(localStorage.getItem('kvm_mouseSens')) || 1.0;
+const mmodeBtn = document.getElementById('mmode');
+const msens = document.getElementById('msens');
+const msensWrap = document.getElementById('msenswrap');
+const msensVal = document.getElementById('msensval');
+const lockedToImg = () => document.pointerLockElement === img;
+function renderMouseMode() {
+  mmodeBtn.textContent = 'Mouse: ' + (mouseMode === 'relative' ? 'Relative' : 'Absolute');
+  mmodeBtn.classList.toggle('on', mouseMode === 'relative');
+  msensWrap.style.display = mouseMode === 'relative' ? 'inline-flex' : 'none';
+}
+msens.value = mouseSens; msensVal.textContent = mouseSens.toFixed(1) + '×';
+msens.oninput = () => { mouseSens = parseFloat(msens.value); msensVal.textContent = mouseSens.toFixed(1) + '×';
+  localStorage.setItem('kvm_mouseSens', mouseSens); };
+mmodeBtn.onclick = () => {
+  mouseMode = (mouseMode === 'relative') ? 'absolute' : 'relative';
+  localStorage.setItem('kvm_mouseMode', mouseMode);
+  if (mouseMode !== 'relative' && lockedToImg()) document.exitPointerLock();
+  renderMouseMode();
+};
+renderMouseMode();
+document.addEventListener('pointerlockchange', () => {
+  if (lockedToImg()) { setCapture(true); info.textContent = 'relative mouse — Esc to release'; }
+  else if (mouseMode === 'relative') info.textContent = 'click the screen to grab the mouse';
+});
+
 function norm(e) {
   const r = img.getBoundingClientRect();
   return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height };
 }
 img.addEventListener('mousemove', (e) => {
   if (!capturing) return;
+  if (mouseMode === 'relative') {
+    if (!lockedToImg()) return;
+    const dx = Math.round(e.movementX * mouseSens), dy = Math.round(e.movementY * mouseSens);
+    if (dx || dy) send({ t: 'mr', dx, dy });
+    return;
+  }
   const p = norm(e);
   if (p.x < 0 || p.x > 1 || p.y < 0 || p.y > 1) return;
   send({ t: 'mm', x: p.x, y: p.y });
   info.textContent = `${(p.x*100).toFixed(0)}% , ${(p.y*100).toFixed(0)}%`;
 });
 img.addEventListener('mousedown', (e) => {
-  if (!capturing) { setCapture(true); return; }
+  if (!capturing) { setCapture(true); if (mouseMode === 'relative') img.requestPointerLock(); return; }
+  if (mouseMode === 'relative' && !lockedToImg()) { img.requestPointerLock(); return; }  // grab first
   e.preventDefault(); send({ t: 'mb', button: e.button, down: true });
 });
 window.addEventListener('mouseup', (e) => {
   if (!capturing) return;
+  if (mouseMode === 'relative' && !lockedToImg()) return;   // the lock-acquiring click sends no button
   send({ t: 'mb', button: e.button, down: false });
 });
 img.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -678,8 +722,12 @@ serconn.onclick = () => {
   if(serWs){ serWs.close(); return; }
   const dev = serport.value; if(!dev){ serstatus.textContent='no port selected'; return; }
   serWs = new WebSocket(wsURL(`/ws/serial?device=${encodeURIComponent(dev)}&baud=${serbaud.value}`));
+  serWs.binaryType = 'arraybuffer';                 // serial RX arrives as raw binary frames
+  const dec = new TextDecoder('utf-8', { fatal: false });
   serWs.onopen    = () => { serconn.textContent='Disconnect'; serconn.classList.add('on'); serstatus.textContent='connected'; (serraw.checked?serout:serin).focus(); };
-  serWs.onmessage = (e) => serAppend(e.data);
+  serWs.onmessage = (e) => serAppend(typeof e.data === 'string'
+    ? e.data                                        // text frame = status/info line
+    : dec.decode(new Uint8Array(e.data), { stream: true }));   // binary frame = serial bytes
   serWs.onclose   = () => { serconn.textContent='Connect'; serconn.classList.remove('on'); serstatus.textContent='disconnected'; serWs=null; };
   serWs.onerror   = () => serstatus.textContent='connection error';
 };

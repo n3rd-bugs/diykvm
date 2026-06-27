@@ -25,6 +25,8 @@
 <h1>DIY PiKVM — API guide for Claude &amp; other agents</h1>
 <p class="muted">A KVM-over-IP appliance: drive the target's keyboard/mouse, watch its screen, manage a virtual
 USB drive (an EFI System Partition), and talk to a serial console — all over HTTP/WebSocket. LAN-only.</p>
+<p class="muted">Machine-readable? <code>GET /api</code> returns this whole endpoint list as JSON (public, no auth) —
+agents can fetch it to discover everything below programmatically.</p>
 
 <h2>1. Authentication</h2>
 <p>Humans log in at <code>/login</code> (session cookie). <b>Agents use the API key.</b> Get it by exchanging
@@ -108,14 +110,18 @@ curl -s -X POST -H "X-API-Key: &lt;KEY&gt;" "http://&lt;pi&gt;:8000/api/msd/imag
 <table>
 <tr><td><code>GET /api/serial/ports</code></td><td>list serial ports: <code>{ports:[{device,desc,hwid}]}</code></td></tr>
 <tr><td><code>WS /ws/serial?device=/dev/ttyUSB0&amp;baud=115200&amp;token=&lt;KEY&gt;</code></td>
-    <td>bidirectional bytes: text you send is written to the port; data read from the port is sent to you</td></tr>
+    <td><b>Binary-clean.</b> Serial RX arrives as WebSocket <b>BINARY</b> frames (raw bytes). To transmit, send
+    <b>BINARY</b> frames (written verbatim) or <b>TEXT</b> frames (UTF-8). Status lines (connected/closed)
+    arrive as <b>TEXT</b> frames — tell them apart from serial data by frame type.</td></tr>
 </table>
 <pre><code>import asyncio, websockets
 async def console(pi, key, dev):
     url=f"ws://{pi}:8000/ws/serial?device={dev}&amp;baud=115200&amp;token={key}"
     async with websockets.connect(url) as ws:
-        await ws.send("\r")                 # nudge the prompt
-        async for line in ws: print(line, end="")
+        await ws.send(b"\r")                            # bytes -> written verbatim
+        async for msg in ws:
+            if isinstance(msg, bytes): handle_serial_bytes(msg)   # raw RX (lossless)
+            else: print("[status]", msg)               # text frame = status/info
 asyncio.run(console("192.168.1.120","&lt;KEY&gt;","/dev/ttyUSB0"))</code></pre>
 
 <h2>6. Power, KVM switch &amp; configuration <span class="pill">/api/power</span> <span class="pill">/api/kvmswitch</span> <span class="pill">/api/config</span></h2>

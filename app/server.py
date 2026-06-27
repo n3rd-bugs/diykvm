@@ -186,6 +186,63 @@ def api_guide(_: bool = Depends(require_auth)):
     return FileResponse(os.path.join(HERE, "static", "api-guide.html"))
 
 
+# Machine-readable API descriptor for agents (public, no secrets — aids discovery before auth).
+API_INFO = {
+    "name": "DIY PiKVM",
+    "description": "KVM-over-IP: drive the target's keyboard & mouse, watch its screen, serve virtual "
+                   "USB boot media, bridge a serial console, switch GPIO power and an external KVM "
+                   "switch. LAN-only.",
+    "human_guide": "/api-guide",
+    "auth": {
+        "type": "api_key",
+        "obtain": "POST /api/login (form fields: username, password) -> {\"api_key\": \"...\"}",
+        "send": "HTTP header 'X-API-Key: <key>' or 'Authorization: Bearer <key>'; "
+                "for WebSockets append '?token=<key>' to the URL.",
+    },
+    "endpoints": [
+        {"method": "POST", "path": "/api/login", "auth": False, "body": "form: username, password",
+         "returns": "{api_key}", "desc": "Exchange credentials for an API key."},
+        {"method": "WS", "path": "/ws", "auth": True, "query": "token",
+         "desc": "Keyboard & mouse. Send JSON: {t:'kd'|'ku',code} key down/up (JS KeyboardEvent.code); "
+                 "{t:'mm',x,y} absolute move (0..1); {t:'mr',dx,dy} relative move; "
+                 "{t:'mb',button,down} button (0=left,1=middle,2=right); {t:'mw',dy} wheel; "
+                 "{t:'reset'} release everything."},
+        {"method": "GET", "path": "/snapshot", "auth": True, "desc": "JPEG of the target screen now."},
+        {"method": "GET", "path": "/stream", "auth": True, "desc": "Live MJPEG stream."},
+        {"method": "GET", "path": "/api/msd/status", "auth": True, "desc": "Virtual USB drive status."},
+        {"method": "POST", "path": "/api/msd/detach", "auth": True, "desc": "Eject from target; mount the EFI drive on the Pi to edit files."},
+        {"method": "POST", "path": "/api/msd/attach", "auth": True, "desc": "Hand the EFI drive back to the target."},
+        {"method": "GET", "path": "/api/msd/ls", "auth": True, "query": "path", "desc": "List EFI drive directory (while editing)."},
+        {"method": "POST", "path": "/api/msd/upload", "auth": True, "query": "path", "body": "multipart file", "desc": "Upload a file into the EFI drive."},
+        {"method": "GET", "path": "/api/msd/download", "auth": True, "query": "path", "desc": "Download a file from the EFI drive."},
+        {"method": "POST", "path": "/api/msd/mkdir", "auth": True, "query": "path", "desc": "Make a directory."},
+        {"method": "DELETE", "path": "/api/msd/rm", "auth": True, "query": "path", "desc": "Delete a file/empty directory."},
+        {"method": "GET", "path": "/api/msd/images", "auth": True, "desc": "List boot images (uploaded disk images / ISOs)."},
+        {"method": "POST", "path": "/api/msd/images/upload", "auth": True, "body": "multipart file (.img/.iso/.bin/.raw)", "desc": "Upload a whole boot image / ISO."},
+        {"method": "POST", "path": "/api/msd/images/attach", "auth": True, "query": "name", "desc": "Attach an image to the target (ISOs as a read-only CD-ROM)."},
+        {"method": "POST", "path": "/api/msd/eject", "auth": True, "desc": "Remove the medium from the target."},
+        {"method": "DELETE", "path": "/api/msd/images", "auth": True, "query": "name", "desc": "Delete a boot image."},
+        {"method": "GET", "path": "/api/serial/ports", "auth": True, "desc": "List serial ports and common baud rates."},
+        {"method": "WS", "path": "/ws/serial", "auth": True, "query": "device, baud, token",
+         "desc": "Serial console, binary-clean. Serial RX arrives as WebSocket BINARY frames (raw bytes); "
+                 "to transmit, send BINARY frames (written verbatim) or TEXT frames (UTF-8). Status/info "
+                 "lines (connected/closed) arrive as TEXT frames, so distinguish them by frame type."},
+        {"method": "GET", "path": "/api/power/state", "auth": True, "desc": "Per-target power relay state: {targets:[{label, on}]}."},
+        {"method": "POST", "path": "/api/power", "auth": True, "body": "{index, on}", "desc": "Connect (on=true) or cut (on=false) a target's power (latched relay)."},
+        {"method": "GET", "path": "/api/kvmswitch/state", "auth": True, "desc": "External KVM-switch buttons: {ports:[{label}]}."},
+        {"method": "POST", "path": "/api/kvmswitch", "auth": True, "body": "{index}", "desc": "Press a select button (switch display + USB to that target)."},
+        {"method": "GET", "path": "/api/config", "auth": True, "desc": "Read settings (sections/fields with current values)."},
+        {"method": "POST", "path": "/api/config", "auth": True, "body": "{section:{key:value}}", "desc": "Update settings (validated server-side)."},
+        {"method": "POST", "path": "/api/config/restart-streamer", "auth": True, "desc": "Restart the video streamer to apply [video] changes."},
+    ],
+}
+
+
+@app.get("/api")
+def api_index():
+    return API_INFO
+
+
 @app.get("/config")
 def config_page(request: Request):
     if not request.session.get("user"):
@@ -390,19 +447,30 @@ async def ws_serial(sock: WebSocket):
     loop = asyncio.get_event_loop()
     stop = asyncio.Event()
 
+    # Binary-clean both ways: serial RX is sent as WebSocket BINARY frames (raw bytes, lossless), and
+    # TX accepts BINARY frames (written verbatim) or TEXT frames (UTF-8 encoded — convenient for typing).
+    # Status/info lines above/below are TEXT frames, so clients tell them apart from serial data by type.
     async def reader():
         while not stop.is_set():
             data = await loop.run_in_executor(_serial_pool, ser.read, 4096)
             if data and not stop.is_set():
                 try:
-                    await sock.send_text(data.decode("utf-8", "replace"))
+                    await sock.send_bytes(data)
                 except Exception:
                     break
 
     async def writer():
         while True:
-            msg = await sock.receive_text()
-            await loop.run_in_executor(_serial_pool, ser.write, msg.encode("utf-8", "replace"))
+            m = await sock.receive()
+            if m.get("type") == "websocket.disconnect":
+                break
+            data = m.get("bytes")
+            if data is None:
+                txt = m.get("text")
+                if txt is None:
+                    continue
+                data = txt.encode("utf-8", "replace")
+            await loop.run_in_executor(_serial_pool, ser.write, data)
 
     try:
         await asyncio.gather(reader(), writer())
@@ -488,6 +556,7 @@ CONFIG_FIELDS = [
      "fields": [
          {"key": "enabled", "label": "Enable power control", "type": "bool", "default": "false"},
          {"key": "active_low", "label": "Active-low relays (drive line low = power on)", "type": "bool", "default": "false"},
+         {"key": "open_drain", "label": "Open-drain output (on = sink to ground, off = release/high-Z, never drives high)", "type": "bool", "default": "false"},
          {"key": "targets", "label": "Targets — Label:pin, comma-separated (e.g. PC1:5, PC2:6)",
           "type": "text", "default": ""},
      ]},

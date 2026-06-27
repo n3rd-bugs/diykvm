@@ -48,8 +48,9 @@ request asks for it.
 
 - **`[power]`** — connect/cut each target's power. Wire one GPIO per target to a relay that switches its
   power, and list them as `targets = Label:BCMpin, …` (plus `active_low` for relays that are on when
-  driven low). The level is **latched** with `pinctrl` (register-level, so it survives an app restart
-  and nothing is power-cycled on restart). The UI shows On/Off per target; cutting power is a hard off.
+  driven low, or `open_drain` to *sink to ground / release high‑Z* instead of ever driving the line high
+  — handy for 5 V relay/opto inputs). The level is **latched** with `pinctrl` (register-level, so it
+  survives an app restart and nothing is power-cycled on restart). The UI shows On/Off per target.
 - **`[kvmswitch]`** — drive an external hardware KVM switch (display + USB) between targets. Wire a GPIO
   to each of its select buttons, list them as `ports = Label:BCMpin, …`, and the UI shows one button per
   target that **pulses** the line (`gpioset`, `pulse_ms`) to press that select button.

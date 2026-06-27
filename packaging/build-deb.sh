@@ -40,8 +40,9 @@ install -m0755 "$PKG/files/usr/local/sbin/kvm-conf-get" \
                "$PKG/files/usr/local/sbin/kvm-mkimage" \
                "$PKG/files/usr/local/sbin/kvm-msd-helper" "$STAGE/usr/local/sbin/"
 
-# udev rule, default config, and the sudoers drop-in (0440) for the privileged helper
-install -m0644 "$PKG/files/lib/udev/rules.d/99-kvm-hidg.rules" "$STAGE/usr/lib/udev/rules.d/"
+# udev rules, default config, and the sudoers drop-in (0440) for the privileged helper
+install -m0644 "$PKG/files/lib/udev/rules.d/99-kvm-hidg.rules" \
+               "$PKG/files/lib/udev/rules.d/99-kvm-serial.rules" "$STAGE/usr/lib/udev/rules.d/"
 install -m0644 "$PKG/files/etc/kvm/kvm.conf" "$STAGE/etc/kvm/kvm.conf"
 install -m0440 "$PKG/files/etc/sudoers.d/diykvm" "$STAGE/etc/sudoers.d/diykvm"
 install -m0644 "$PKG/files/usr/share/doc/diykvm/copyright" "$STAGE/usr/share/doc/diykvm/copyright"

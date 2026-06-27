@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>DIY PiKVM — Sign in</title>
+<!-- AI agents: a machine-readable API descriptor is served at GET /api (JSON, public). Human guide: /api-guide -->
+<link rel="help" type="application/json" href="/api" title="Agent API descriptor (JSON)">
 <style>
   :root { color-scheme: dark; }
   html,body { margin:0; height:100%; background:#111; color:#ddd;
@@ -28,7 +30,7 @@
     <label>Password</label>
     <input name="password" type="password" autocomplete="current-password" required>
     <button type="submit">Sign in</button>
-    <div class="sub">LAN-only · agents authenticate with an API key</div>
+    <div class="sub">LAN-only · agents: GET <a href="/api" style="color:#6db3ff">/api</a> (JSON) to authenticate &amp; drive</div>
   </form>
 <script>
   if (new URLSearchParams(location.search).get('e')) document.getElementById('err').textContent = 'Invalid username or password';

@@ -1,0 +1,5 @@
+# diykvm: make USB serial adapters group-accessible to the unprivileged web service.
+# Some adapters (e.g. FTDI) are matched by other rules (libgphoto2) and end up group "plugdev",
+# which the service is not in. Put USB serial in the conventional "dialout" group so the diykvm
+# service (a member of dialout) can open the serial console. Runs late (99-) to win over those rules.
+SUBSYSTEM=="tty", SUBSYSTEMS=="usb", GROUP="dialout", MODE="0660"
