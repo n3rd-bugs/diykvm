@@ -15,13 +15,16 @@ single‑page web UI plus an HTTP/WebSocket API.
 - **Video** — low‑latency MJPEG of the target's screen (USB HDMI capture via µStreamer).
 - **Keyboard & mouse** — full keyboard, switchable **absolute (point)** or **relative (trackpad, adjustable
   speed)** mouse, on‑screen keyboard, and touchscreen gestures (tap = click, drag = move, two‑finger
-  scroll, double‑tap‑hold = drag, two‑finger = right button). The keyboard is a USB **boot keyboard**, so
-  it also works in the target's **BIOS/UEFI** firmware and boot menus, not just the OS.
+  scroll, double‑tap‑hold = drag, two‑finger = right button). Mouse motion is coalesced server‑side so it
+  stays smooth even with high‑DPI / high‑polling mice. Release input capture with a **configurable
+  shortcut** (default **Ctrl+Space**). The keyboard is a USB **boot keyboard**, so it also works in the
+  target's **BIOS/UEFI** firmware and boot menus, not just the OS.
 - **Virtual USB drive** — present boot media to the target: **upload a disk image or ISO** and attach it
   (ISOs as a read‑only CD‑ROM), or use the built‑in editable GPT/FAT32 **EFI System Partition** and manage
   its files from the browser. Attach/detach safely (the Pi and target never mount it at once).
-- **Serial console** — talk to the target's serial port from the browser (line or raw‑key mode);
-  **binary‑clean** end to end (raw bytes both directions) for agents/automation.
+- **Serial console** — talk to a serial port from the browser (line or raw‑key mode); **binary‑clean**
+  end to end (raw bytes both directions) for agents/automation. Use a USB/RS‑232 adapter, **or** have the
+  Pi present its **own USB serial (CDC‑ACM) COM port** to the target over the same cable — no extra wiring.
 - **Target power** — connect or cut power to two or more targets from the browser, each via a Raspberry
   Pi **GPIO** wired to a relay (latched on/off per target; **push‑pull or open‑drain** output).
 - **External KVM switch** — drive a hardware KVM switch (display + USB) across two or more targets with
@@ -29,6 +32,7 @@ single‑page web UI plus an HTTP/WebSocket API.
 - **Configuration UI** — a **Config** page (and API) to edit settings in `/etc/kvm/kvm.conf` from the
   browser; every value is validated server‑side before it's written.
 - **Keep‑awake** — optional periodic mouse nudges so the target's display doesn't sleep.
+- **Latency tool** — a `/pingtest` page shows live browser↔Pi round‑trip time over the input WebSocket.
 - **Auth** — login (session cookie) for humans, API key for agents/automation.
 - **Agent API** — a machine-readable endpoint list at `/api` (JSON, public for discovery) plus a human
   guide at `/api-guide`; drive everything programmatically.
@@ -47,7 +51,7 @@ single‑page web UI plus an HTTP/WebSocket API.
 Install the Debian package on Raspberry Pi OS (Bookworm):
 
 ```sh
-sudo apt install ./diykvm_0.1.0_all.deb
+sudo apt install ./diykvm_0.4.0_all.deb
 sudo reboot            # first install enables USB gadget mode (dtoverlay=dwc2,dr_mode=peripheral)
 ```
 
@@ -75,7 +79,9 @@ sudo systemctl restart kvm-web ustreamer kvm-gadget
 | `web` | `allowed_origins` | _(blank)_ | extra browser origins permitted to connect |
 | `video` | `device`, `resolution`, `fps` | `/dev/video0`, `1920x1080`, `30` | capture + stream |
 | `usb` | `image_path`, `image_size` | `/opt/kvm/images/drive.img`, `1G` | virtual drive |
+| `usb` | `usb_serial` | `false` | also present a USB serial (CDC‑ACM) COM port to the target (Pi side `/dev/ttyGS0`) |
 | `serial` | `default_baud` | `115200` | serial console default |
+| `ui` | `capture_exit` | `Ctrl+Space` | shortcut to release input capture (blank = on‑screen button only) |
 
 ### Enabling HTTPS
 
@@ -134,9 +140,10 @@ operator ◀── LAN ───────────────────
 
 - **`kvm-gadget`** builds a composite USB gadget via configfs: a **boot‑protocol keyboard**
   interface (no Report ID, so it works in the target's BIOS/UEFI), a separate **mouse** interface
-  (absolute + relative, multiplexed by report IDs), and a mass‑storage function backed by the drive
-  image. Each HID interface is IN‑endpoint‑only so both fit the Pi's dwc2 endpoint budget alongside
-  mass storage.
+  (absolute + relative, multiplexed by report IDs), a mass‑storage function backed by the drive image,
+  and — when `usb.usb_serial` is set — a **CDC‑ACM serial** interface the target sees as a COM port (the
+  Pi side is `/dev/ttyGS0`). Each HID interface is IN‑endpoint‑only so they fit the Pi's dwc2 endpoint
+  budget alongside mass storage and the optional serial.
 - **`ustreamer`** serves the capture as MJPEG on localhost.
 - **`kvm-web`** (FastAPI) serves the UI, proxies the video behind auth, turns WebSocket input
   events into HID reports, manages the virtual drive (configfs + loop‑mounted ESP), bridges the

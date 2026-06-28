@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KVM latency — browser ↔ Pi</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, -apple-system, sans-serif; background:#111; color:#eee; margin:0; padding:24px; }
+  h1 { font-size:18px; font-weight:600; margin:0 0 4px; }
+  .sub { color:#999; font-size:13px; margin-bottom:18px; max-width:660px; line-height:1.5; }
+  code { background:#222; padding:1px 5px; border-radius:4px; }
+  .big { font-size:64px; font-weight:700; line-height:1; margin:8px 0; font-variant-numeric:tabular-nums; }
+  .unit { font-size:24px; color:#999; font-weight:400; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(110px,1fr)); gap:12px; max-width:660px; margin:16px 0; }
+  .card { background:#1c1c1c; border:1px solid #2a2a2a; border-radius:8px; padding:12px 14px; }
+  .card .k { color:#888; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  .card .v { font-size:22px; font-weight:600; font-variant-numeric:tabular-nums; margin-top:4px; }
+  #spark { width:100%; max-width:660px; height:90px; background:#1c1c1c; border:1px solid #2a2a2a; border-radius:8px; display:block; margin-top:8px; }
+  .status { font-size:13px; margin-top:14px; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; vertical-align:middle; }
+  .ok { background:#3ad06a; } .bad { background:#e0533a; } .warn { background:#e0b93a; }
+  .hint { color:#888; font-size:12px; max-width:660px; margin-top:18px; line-height:1.6; }
+  button { background:#2a2a2a; color:#eee; border:1px solid #3a3a3a; border-radius:6px; padding:6px 12px; cursor:pointer; font-size:13px; }
+</style>
+</head>
+<body>
+  <h1>KVM latency — browser ↔ Pi</h1>
+  <div class="sub">Round-trip time of a ping over the <b>same WebSocket (<code>/ws</code>) the mouse uses</b>.
+    If this is low, the browser↔Pi network is not the cause of a laggy pointer; if it's high or jittery, it is.</div>
+  <div><span class="big" id="cur">—</span><span class="unit"> ms</span></div>
+  <div class="grid">
+    <div class="card"><div class="k">Min</div><div class="v" id="min">—</div></div>
+    <div class="card"><div class="k">Avg (50)</div><div class="v" id="avg">—</div></div>
+    <div class="card"><div class="k">Max (50)</div><div class="v" id="max">—</div></div>
+    <div class="card"><div class="k">Jitter</div><div class="v" id="jit">—</div></div>
+    <div class="card"><div class="k">Samples</div><div class="v" id="cnt">0</div></div>
+    <div class="card"><div class="k">Lost</div><div class="v" id="lost">0</div></div>
+  </div>
+  <canvas id="spark" width="660" height="90"></canvas>
+  <div class="status"><span class="dot bad" id="dot"></span><span id="st">connecting…</span></div>
+  <div class="hint">
+    Rough guide: <b>&lt;20&nbsp;ms</b> excellent, <b>20–60&nbsp;ms</b> fine, <b>&gt;60&nbsp;ms</b> or high jitter would be felt as mouse lag.
+    Leave open ~15&nbsp;s for a stable read. &nbsp;<button onclick="window._reset()">reset stats</button>
+  </div>
+<script>
+(function(){
+  var proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  var url = proto + '://' + location.host + '/ws';
+  var ws, pending = new Map(), win = [], cnt = 0, lost = 0, mn = Infinity, mx = 0, timer = null, lossTimer = null;
+  function $(id){ return document.getElementById(id); }
+  function fmt(x){ return (x === Infinity || x == null) ? '—' : x.toFixed(1); }
+  function setStatus(cls, txt){ $('dot').className = 'dot ' + cls; $('st').textContent = txt; }
+  function reset(){ win = []; cnt = 0; lost = 0; mn = Infinity; mx = 0; pending.clear();
+    $('cnt').textContent = '0'; $('lost').textContent = '0'; $('cur').textContent = '—';
+    $('min').textContent = $('avg').textContent = $('max').textContent = $('jit').textContent = '—'; draw(); }
+  window._reset = reset;
+  function draw(){
+    var c = $('spark'), g = c.getContext('2d'), W = c.width, H = c.height;
+    g.clearRect(0, 0, W, H);
+    if (!win.length) return;
+    var hi = Math.max(20, Math.max.apply(null, win));
+    g.strokeStyle = '#3a9ad0'; g.lineWidth = 2; g.beginPath();
+    for (var i = 0; i < win.length; i++){
+      var x = i / Math.max(1, win.length - 1) * W;
+      var y = H - (win[i] / hi) * (H - 10) - 5;
+      i ? g.lineTo(x, y) : g.moveTo(x, y);
+    }
+    g.stroke();
+    g.fillStyle = '#666'; g.font = '11px system-ui'; g.fillText(hi.toFixed(0) + ' ms', 5, 13);
+  }
+  function onPong(ts){
+    var rtt = performance.now() - ts;
+    pending.delete(ts);
+    cnt++; win.push(rtt); if (win.length > 50) win.shift();
+    mn = Math.min(mn, rtt); mx = Math.max.apply(null, win);
+    var avg = win.reduce(function(a, b){ return a + b; }, 0) / win.length;
+    var jit = win.length > 1 ? Math.sqrt(win.reduce(function(a, b){ return a + (b - avg) * (b - avg); }, 0) / win.length) : 0;
+    $('cur').textContent = fmt(rtt); $('min').textContent = fmt(mn); $('max').textContent = fmt(mx);
+    $('avg').textContent = fmt(avg); $('jit').textContent = fmt(jit); $('cnt').textContent = cnt;
+    $('cur').style.color = rtt < 20 ? '#3ad06a' : rtt < 60 ? '#e0b93a' : '#e0533a';
+    draw();
+  }
+  function start(){
+    stop();
+    timer = setInterval(function(){
+      if (ws && ws.readyState === 1){ var ts = performance.now(); pending.set(ts, ts); ws.send(JSON.stringify({ t: 'ping', ts: ts })); }
+    }, 150);
+    lossTimer = setInterval(function(){
+      var now = performance.now();
+      pending.forEach(function(v, ts){ if (now - ts > 2000){ pending.delete(ts); lost++; $('lost').textContent = lost; } });
+    }, 1000);
+  }
+  function stop(){ if (timer) clearInterval(timer); if (lossTimer) clearInterval(lossTimer); timer = lossTimer = null; }
+  function connect(){
+    setStatus('warn', 'connecting…');
+    ws = new WebSocket(url);
+    ws.onopen = function(){ setStatus('ok', 'connected — measuring (' + url + ')'); start(); };
+    ws.onmessage = function(e){ try { var m = JSON.parse(e.data); if (m.t === 'pong' && typeof m.ts === 'number') onPong(m.ts); } catch (_) {} };
+    ws.onclose = function(){ setStatus('bad', 'disconnected — retrying'); stop(); setTimeout(connect, 1000); };
+    ws.onerror = function(){ setStatus('bad', 'error — is the session logged in?'); };
+  }
+  connect();
+})();
+</script>
+</body>
+</html>

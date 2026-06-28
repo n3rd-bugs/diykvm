@@ -48,7 +48,10 @@ credentials once:</p>
 <tr><td><code>{"t":"mb","button":0,"down":true}</code></td><td>button 0=left 1=middle 2=right (JS MouseEvent.button)</td></tr>
 <tr><td><code>{"t":"mw","dy":1}</code></td><td>wheel (±1)</td></tr>
 <tr><td><code>{"t":"reset"}</code></td><td>release all keys &amp; buttons</td></tr>
+<tr><td><code>{"t":"ping","ts":N}</code></td><td>latency probe — server replies <code>{"t":"pong","ts":N}</code> echoing your <code>ts</code>, so you can measure round-trip time over this same socket</td></tr>
 </table>
+<p><b>Latency tool:</b> a live browser↔Pi round-trip meter (using the <code>ping</code>/<code>pong</code> above over <code>/ws</code>) is served at
+<a href="/pingtest" target="_blank"><code>/pingtest</code></a> — useful to separate network/transport lag from input-device or rendering lag.</p>
 <p><b>Keys:</b> use <code>KeyboardEvent.code</code> values — letters <code>KeyA</code>..<code>KeyZ</code>,
 digits <code>Digit0</code>..<code>Digit9</code>, <code>Enter Escape Backspace Tab Space</code>,
 <code>F1</code>..<code>F12</code>, <code>Arrow{Up,Down,Left,Right}</code>, <code>Home End PageUp PageDown
@@ -108,7 +111,9 @@ curl -s -X POST -H "X-API-Key: &lt;KEY&gt;" "http://&lt;pi&gt;:8000/api/msd/imag
 
 <h2>5. Serial console <span class="pill">/api/serial/ports</span> <span class="pill">WS /ws/serial</span></h2>
 <table>
-<tr><td><code>GET /api/serial/ports</code></td><td>list serial ports: <code>{ports:[{device,desc,hwid}]}</code></td></tr>
+<tr><td><code>GET /api/serial/ports</code></td><td>list serial ports: <code>{ports:[{device,desc,hwid}]}</code>.
+    Includes <code>/dev/ttyGS0</code> ("USB gadget serial") when the Pi presents a CDC-ACM COM port to the
+    target (set <code>usb.usb_serial</code>) — open it like any other port to talk to the target over USB.</td></tr>
 <tr><td><code>WS /ws/serial?device=/dev/ttyUSB0&amp;baud=115200&amp;token=&lt;KEY&gt;</code></td>
     <td><b>Binary-clean.</b> Serial RX arrives as WebSocket <b>BINARY</b> frames (raw bytes). To transmit, send
     <b>BINARY</b> frames (written verbatim) or <b>TEXT</b> frames (UTF-8). Status lines (connected/closed)

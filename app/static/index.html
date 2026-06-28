@@ -156,12 +156,13 @@
     <button id="full">Fullscreen</button>
     <a class="barlink" href="/config" title="settings">⚙ Config</a>
     <a class="barlink" href="/api-guide" target="_blank" title="API guide for agents">API</a>
+    <a class="barlink" href="/pingtest" target="_blank" title="browser↔Pi round-trip latency test">⏱ Latency</a>
     <a class="barlink" href="/logout" title="sign out">Logout</a>
   </div>
   <div id="mid">
   <div id="wrap">
     <img id="screen" alt="target screen">
-    <div id="hint">Click the screen to capture keyboard &amp; mouse · Esc-hold or button to release</div>
+    <div id="hint">Click the screen to capture keyboard &amp; mouse · Ctrl+Space or button to release</div>
   </div>
 
     <div id="fm">
@@ -270,16 +271,74 @@ function connect() {
 connect();
 const send = (o) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
 
+// Keyboard Lock lets Esc (and other system keys) reach the target instead of the browser using it to
+// exit Pointer Lock / Fullscreen. It only works in fullscreen on a secure (HTTPS) context; elsewhere
+// these are harmless no-ops and Esc keeps the browser's built-in behaviour.
+function lockKbd() { try { var p = navigator.keyboard && navigator.keyboard.lock && navigator.keyboard.lock(); if (p && p.catch) p.catch(function () {}); } catch (e) {} }
+function unlockKbd() { try { if (navigator.keyboard && navigator.keyboard.unlock) navigator.keyboard.unlock(); } catch (e) {} }
 function setCapture(on) {
   capturing = on;
   capBtn.textContent = 'Capture input: ' + (on ? 'ON' : 'OFF');
   capBtn.classList.toggle('on', on);
+  if (on) lockKbd(); else unlockKbd();
 }
+document.addEventListener('fullscreenchange', () => { if (capturing && document.fullscreenElement) lockKbd(); });
 capBtn.onclick = () => setCapture(!capturing);
+
+// ---- release-capture shortcut (configurable on the Config page; default Ctrl+Space) ----
+function parseCombo(s) {
+  if (!s) return null;
+  const c = { ctrl: false, alt: false, shift: false, meta: false, code: null };
+  for (const p of String(s).split('+')) {
+    const t = p.trim(), tl = t.toLowerCase();
+    if (tl === 'ctrl' || tl === 'control') c.ctrl = true;
+    else if (tl === 'alt') c.alt = true;
+    else if (tl === 'shift') c.shift = true;
+    else if (tl === 'meta' || tl === 'win' || tl === 'cmd') c.meta = true;
+    else if (t) c.code = t;
+  }
+  return c.code ? c : null;
+}
+let exitCombo = parseCombo('Ctrl+Space');
+function comboMatches(e) {
+  const c = exitCombo;
+  return !!c && e.code === c.code && e.ctrlKey === c.ctrl && e.altKey === c.alt && e.shiftKey === c.shift && e.metaKey === c.meta;
+}
+function comboLabel() {
+  const c = exitCombo; if (!c) return 'the release button';
+  const m = []; if (c.ctrl) m.push('Ctrl'); if (c.alt) m.push('Alt'); if (c.shift) m.push('Shift'); if (c.meta) m.push('Meta');
+  m.push(c.code.replace(/^Key/, '').replace(/^Digit/, ''));
+  return m.join('+');
+}
+function updateHint() {
+  const h = document.getElementById('hint');
+  if (h) h.textContent = 'Click the screen to capture keyboard & mouse · ' + comboLabel() + ' or the button to release';
+}
+updateHint();
+(async () => {
+  try {
+    const r = await fetch('/api/config');
+    if (r.ok) {
+      const d = await r.json();
+      const ui = (d.sections || []).find(s => s.section === 'ui');
+      const f = ui && ui.fields.find(x => x.key === 'capture_exit');
+      if (f) exitCombo = parseCombo(f.value);   // null if blank -> shortcut disabled
+    }
+  } catch (e) {}
+  updateHint();
+})();
 
 // ---- keyboard ----
 window.addEventListener('keydown', (e) => {
   if (!capturing) return;
+  if (comboMatches(e)) {                 // release-capture shortcut: let go of the target, don't forward
+    e.preventDefault();
+    send({ t: 'reset' });                // clear any half-pressed keys (e.g. the modifier) on the target
+    setCapture(false);
+    if (lockedToImg()) document.exitPointerLock();
+    info.textContent = 'input released';
+    return;
+  }
   e.preventDefault();
   send({ t: 'kd', code: e.code });
 }, true);
@@ -317,7 +376,7 @@ mmodeBtn.onclick = () => {
 };
 renderMouseMode();
 document.addEventListener('pointerlockchange', () => {
-  if (lockedToImg()) { setCapture(true); info.textContent = 'relative mouse — Esc to release'; }
+  if (lockedToImg()) { setCapture(true); info.textContent = 'relative mouse — ' + comboLabel() + ' to release'; }
   else if (mouseMode === 'relative') info.textContent = 'click the screen to grab the mouse';
 });
 
@@ -325,34 +384,55 @@ function norm(e) {
   const r = img.getBoundingClientRect();
   return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height };
 }
+// Coalesce mouse motion to one message per animation frame. A high-DPI / high-polling-rate mouse can
+// fire ~1000 mousemove events/sec; sending each as its own WS message floods the HID write pipeline so
+// the cursor lags behind the hand. Instead we accumulate motion and flush at the display frame rate
+// (~60-144 Hz): relative deltas are summed, absolute keeps only the latest point.
+let _accDx = 0, _accDy = 0, _absPend = null, _rafId = 0;
+function _flushMotion() {
+  _rafId = 0;
+  if (mouseMode === 'relative') {
+    const dx = Math.round(_accDx), dy = Math.round(_accDy);
+    _accDx -= dx; _accDy -= dy;             // keep sub-pixel remainder for smoothness
+    if (dx || dy) send({ t: 'mr', dx, dy });
+  } else if (_absPend) {
+    send({ t: 'mm', x: _absPend.x, y: _absPend.y });
+    _absPend = null;
+  }
+}
+function _scheduleMotion() { if (!_rafId) _rafId = requestAnimationFrame(_flushMotion); }
+// Flush any rAF-pending motion immediately so a click/scroll is sent AFTER the move and lands in place.
+function _flushNow() { if (_rafId) cancelAnimationFrame(_rafId); _flushMotion(); }
 img.addEventListener('mousemove', (e) => {
   if (!capturing) return;
   if (mouseMode === 'relative') {
     if (!lockedToImg()) return;
-    const dx = Math.round(e.movementX * mouseSens), dy = Math.round(e.movementY * mouseSens);
-    if (dx || dy) send({ t: 'mr', dx, dy });
+    _accDx += e.movementX * mouseSens;
+    _accDy += e.movementY * mouseSens;
+    _scheduleMotion();
     return;
   }
   const p = norm(e);
   if (p.x < 0 || p.x > 1 || p.y < 0 || p.y > 1) return;
-  send({ t: 'mm', x: p.x, y: p.y });
+  _absPend = p;
   info.textContent = `${(p.x*100).toFixed(0)}% , ${(p.y*100).toFixed(0)}%`;
+  _scheduleMotion();
 });
 img.addEventListener('mousedown', (e) => {
   if (!capturing) { setCapture(true); if (mouseMode === 'relative') img.requestPointerLock(); return; }
   if (mouseMode === 'relative' && !lockedToImg()) { img.requestPointerLock(); return; }  // grab first
-  e.preventDefault(); send({ t: 'mb', button: e.button, down: true });
+  e.preventDefault(); _flushNow(); send({ t: 'mb', button: e.button, down: true });
 });
 window.addEventListener('mouseup', (e) => {
   if (!capturing) return;
   if (mouseMode === 'relative' && !lockedToImg()) return;   // the lock-acquiring click sends no button
-  send({ t: 'mb', button: e.button, down: false });
+  _flushNow(); send({ t: 'mb', button: e.button, down: false });
 });
 img.addEventListener('contextmenu', (e) => e.preventDefault());
 img.addEventListener('wheel', (e) => {
   if (!capturing) return;
   e.preventDefault();
-  send({ t: 'mw', dy: e.deltaY > 0 ? -1 : 1 });
+  _flushNow(); send({ t: 'mw', dy: e.deltaY > 0 ? -1 : 1 });
 }, { passive: false });
 
 // ---- toolbar actions ----

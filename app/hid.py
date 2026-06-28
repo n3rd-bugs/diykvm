@@ -123,9 +123,21 @@ class HIDController:
         self._write("mouse", self._abs_report())
 
     def move_rel(self, dx: int, dy: int):
-        """Relative move (touch/trackpad): nudges the cursor from its current position."""
-        self._write("mouse", self._rel_report(max(-127, min(127, int(dx))),
-                                               max(-127, min(127, int(dy)))))
+        """Relative move (touch/trackpad): nudges the cursor from its current position.
+
+        The relative report carries one signed byte per axis (-127..127). Coalesced or high-DPI moves
+        can exceed that, so split a large delta into <=127 steps rather than clamp it (which would lose
+        motion and make a fast pointer trail). The total is bounded so one call can't stall the writer.
+        """
+        dx = max(-2000, min(2000, int(dx)))
+        dy = max(-2000, min(2000, int(dy)))
+        if not dx and not dy:
+            self._write("mouse", self._rel_report())
+            return
+        while dx or dy:
+            sx = max(-127, min(127, dx)); dx -= sx
+            sy = max(-127, min(127, dy)); dy -= sy
+            self._write("mouse", self._rel_report(sx, sy))
 
     def button(self, index: int, down: bool):
         # Sent via the RELATIVE report (dx=dy=0) so a click never moves the cursor.

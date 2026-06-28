@@ -7,19 +7,28 @@
 #                 rel = [0x03][btns][dx][dy][wheel]              (5 bytes)
 # Each HID is IN-endpoint-only (no_out_endpoint=1) so two HID functions + mass storage stay within
 # the Pi dwc2 endpoint/FIFO budget -- this is how PiKVM avoids the multi-HID re-enumeration loop.
+# Optional (usb.usb_serial=true): also present a CDC-ACM serial port to the target (-> /dev/ttyGS0).
 set -e
 G=/sys/kernel/config/usb_gadget/kvm
 
 modprobe libcomposite
 
+# Optional CDC-ACM serial: the target sees a USB COM port; the Pi gets /dev/ttyGS0.
+ACM=false
+if command -v kvm-conf-get >/dev/null 2>&1; then
+  # Accept any BOOL spelling the config helper allows (1/true/yes/on), case-insensitively.
+  case "$(kvm-conf-get usb usb_serial false | tr '[:upper:]' '[:lower:]')" in 1|true|yes|on) ACM=true ;; esac
+fi
+
 # --- teardown if it already exists ---
 if [ -d "$G" ]; then
   echo "" > "$G/UDC" 2>/dev/null || true
-  for l in "$G"/configs/c.1/hid.usb0 "$G"/configs/c.1/hid.usb1 "$G"/configs/c.1/mass_storage.usb0; do [ -L "$l" ] && rm -f "$l"; done
+  for l in "$G"/configs/c.1/hid.usb0 "$G"/configs/c.1/hid.usb1 "$G"/configs/c.1/mass_storage.usb0 "$G"/configs/c.1/acm.usb0; do if [ -L "$l" ]; then rm -f "$l"; fi; done
   [ -d "$G/configs/c.1/strings/0x409" ] && rmdir "$G/configs/c.1/strings/0x409"
   [ -d "$G/configs/c.1" ] && rmdir "$G/configs/c.1"
   [ -d "$G/functions/hid.usb0" ] && rmdir "$G/functions/hid.usb0"
   [ -d "$G/functions/hid.usb1" ] && rmdir "$G/functions/hid.usb1"
+  if [ -d "$G/functions/acm.usb0" ]; then rmdir "$G/functions/acm.usb0" || true; fi
   [ -d "$G/functions/mass_storage.usb0" ] && { echo "" > "$G/functions/mass_storage.usb0/lun.0/file" 2>/dev/null; rmdir "$G/functions/mass_storage.usb0" 2>/dev/null; }
   [ -d "$G/strings/0x409" ] && rmdir "$G/strings/0x409"
   rmdir "$G"
@@ -28,7 +37,7 @@ fi
 # --- create gadget ---
 mkdir -p "$G"
 echo 0x1d6b > "$G/idVendor"          # Linux Foundation
-echo 0x0108 > "$G/idProduct"         # boot-kbd + mouse split (bumped to force fresh host enumeration)
+if [ "$ACM" = "true" ]; then echo 0x0109 > "$G/idProduct"; else echo 0x0108 > "$G/idProduct"; fi  # PID tracks the interface set
 echo 0x0100 > "$G/bcdDevice"
 echo 0x0200 > "$G/bcdUSB"
 echo 0x00   > "$G/bDeviceClass"      # composite; class per-interface
@@ -65,6 +74,9 @@ echo 0 > "$G/functions/mass_storage.usb0/lun.0/ro"
 echo 0 > "$G/functions/mass_storage.usb0/lun.0/cdrom"
 [ -f "$IMG" ] && echo "$IMG" > "$G/functions/mass_storage.usb0/lun.0/file"
 
+# acm.usb0: optional CDC-ACM serial -> target sees a USB COM port; the Pi gets /dev/ttyGS0.
+if [ "$ACM" = "true" ]; then mkdir -p "$G/functions/acm.usb0"; fi
+
 # Config + link the functions (link order sets /dev/hidg numbering: kbd=hidg0, mouse=hidg1)
 mkdir -p "$G/configs/c.1/strings/0x409"
 echo "Keyboard + Mouse + Mass Storage" > "$G/configs/c.1/strings/0x409/configuration"
@@ -72,6 +84,7 @@ echo 250 > "$G/configs/c.1/MaxPower"
 ln -s "$G/functions/hid.usb0"          "$G/configs/c.1/"
 ln -s "$G/functions/hid.usb1"          "$G/configs/c.1/"
 ln -s "$G/functions/mass_storage.usb0" "$G/configs/c.1/"
+if [ "$ACM" = "true" ]; then ln -s "$G/functions/acm.usb0" "$G/configs/c.1/"; fi
 
 # Bind to the USB Device Controller (wait for it — dwc2 may not be ready at early boot)
 UDC=""
@@ -91,5 +104,11 @@ if getent group diykvm >/dev/null 2>&1; then
   for d in /dev/hidg*; do [ -e "$d" ] && chgrp diykvm "$d" 2>/dev/null && chmod 0660 "$d" 2>/dev/null; done
 fi
 
-echo "GADGET_UP udc=$UDC"
-ls -l /dev/hidg* 2>/dev/null
+# Optional gadget serial: let the web service (dialout group) open the target-facing COM port.
+if [ "$ACM" = "true" ]; then
+  for _ in $(seq 1 25); do [ -e /dev/ttyGS0 ] && break; sleep 0.1; done
+  if [ -e /dev/ttyGS0 ]; then chgrp dialout /dev/ttyGS0 2>/dev/null || true; chmod 0660 /dev/ttyGS0 2>/dev/null || true; fi
+fi
+
+echo "GADGET_UP udc=$UDC acm=$ACM"
+ls -l /dev/hidg* /dev/ttyGS* 2>/dev/null || true

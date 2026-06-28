@@ -69,6 +69,9 @@ msd = MSD(image=MSD_IMAGE)
 power = PowerController()
 kvmswitch = KvmSwitch()
 _serial_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="serial")
+# Single worker so HID reports stay strictly ordered, and so the blocking os.write() to /dev/hidg*
+# (which waits for the target to poll the USB endpoint) never runs on the async event loop.
+_hid_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hid")
 
 
 # ----------------------------- origin / auth -----------------------------
@@ -186,6 +189,14 @@ def api_guide(_: bool = Depends(require_auth)):
     return FileResponse(os.path.join(HERE, "static", "api-guide.html"))
 
 
+@app.get("/pingtest")
+def pingtest_page(request: Request):
+    # Diagnostic: live browser<->Pi round-trip latency over the same /ws transport the mouse uses.
+    if not request.session.get("user"):
+        return RedirectResponse("/login", status_code=303)
+    return FileResponse(os.path.join(HERE, "static", "pingtest.html"))
+
+
 # Machine-readable API descriptor for agents (public, no secrets — aids discovery before auth).
 API_INFO = {
     "name": "DIY PiKVM",
@@ -206,7 +217,8 @@ API_INFO = {
          "desc": "Keyboard & mouse. Send JSON: {t:'kd'|'ku',code} key down/up (JS KeyboardEvent.code); "
                  "{t:'mm',x,y} absolute move (0..1); {t:'mr',dx,dy} relative move; "
                  "{t:'mb',button,down} button (0=left,1=middle,2=right); {t:'mw',dy} wheel; "
-                 "{t:'reset'} release everything."},
+                 "{t:'reset'} release everything; {t:'ping',ts} -> server replies {t:'pong',ts} "
+                 "(echoes ts) to measure round-trip latency over this socket."},
         {"method": "GET", "path": "/snapshot", "auth": True, "desc": "JPEG of the target screen now."},
         {"method": "GET", "path": "/stream", "auth": True, "desc": "Live MJPEG stream."},
         {"method": "GET", "path": "/api/msd/status", "auth": True, "desc": "Virtual USB drive status."},
@@ -234,6 +246,7 @@ API_INFO = {
         {"method": "GET", "path": "/api/config", "auth": True, "desc": "Read settings (sections/fields with current values)."},
         {"method": "POST", "path": "/api/config", "auth": True, "body": "{section:{key:value}}", "desc": "Update settings (validated server-side)."},
         {"method": "POST", "path": "/api/config/restart-streamer", "auth": True, "desc": "Restart the video streamer to apply [video] changes."},
+        {"method": "GET", "path": "/pingtest", "auth": True, "desc": "Browser page: live browser<->Pi WebSocket round-trip latency meter (uses the /ws ping/pong)."},
     ],
 }
 
@@ -294,31 +307,75 @@ async def ws(sock: WebSocket):
         await sock.close(code=1008)
         return
     await sock.accept()
+    loop = asyncio.get_event_loop()
+    # Server-side mouse coalescing. The receive loop only records the LATEST intent (absolute position,
+    # or summed relative delta) and never blocks on a HID write; a flusher pushes it to the gadget at a
+    # steady rate that self-paces to the target's USB poll capacity. This decouples a fast / high-DPI
+    # client from the HID write rate, so the pointer reflects where you are now instead of trailing a
+    # growing backlog, and a burst can never stall the event loop (which would delay every connection).
+    pend = {"abs": None, "dx": 0, "dy": 0}
+    stop = asyncio.Event()
+
+    async def flush_mouse():
+        ax, dx, dy = pend["abs"], pend["dx"], pend["dy"]
+        pend["abs"] = None; pend["dx"] = 0; pend["dy"] = 0
+        if ax is not None:
+            await loop.run_in_executor(_hid_pool, hid.move_abs, ax[0], ax[1])
+        if dx or dy:
+            await loop.run_in_executor(_hid_pool, hid.move_rel, dx, dy)
+
+    async def flusher():
+        try:
+            while not stop.is_set():
+                await asyncio.sleep(0.008)         # ~125 Hz target; self-paces to the USB write rate
+                await flush_mouse()
+        except asyncio.CancelledError:
+            pass
+
+    ftask = asyncio.create_task(flusher())
     try:
         while True:
             msg = await sock.receive_json()
             try:
                 t = msg.get("t")
-                if t == "kd":
-                    hid.key(str(msg["code"]), True)
-                elif t == "ku":
-                    hid.key(str(msg["code"]), False)
-                elif t == "mm":
-                    hid.move_abs(float(msg["x"]), float(msg["y"]))
+                if t == "mm":
+                    pend["abs"] = (float(msg["x"]), float(msg["y"]))
                 elif t == "mr":
-                    hid.move_rel(int(msg["dx"]), int(msg["dy"]))
+                    pend["dx"] += int(msg["dx"]); pend["dy"] += int(msg["dy"])
+                elif t == "kd":
+                    await flush_mouse(); await loop.run_in_executor(_hid_pool, hid.key, str(msg["code"]), True)
+                elif t == "ku":
+                    await flush_mouse(); await loop.run_in_executor(_hid_pool, hid.key, str(msg["code"]), False)
                 elif t == "mb":
-                    hid.button(int(msg["button"]), bool(msg["down"]))
+                    await flush_mouse()           # flush pending moves first so a click lands in place
+                    await loop.run_in_executor(_hid_pool, hid.button, int(msg["button"]), bool(msg["down"]))
                 elif t == "mw":
-                    hid.wheel(int(msg["dy"]))
+                    await flush_mouse()           # flush pending moves first so the scroll lands in place
+                    await loop.run_in_executor(_hid_pool, hid.wheel, int(msg["dy"]))
                 elif t == "reset":
-                    hid.release_all()
+                    pend["abs"] = None; pend["dx"] = 0; pend["dy"] = 0
+                    await loop.run_in_executor(_hid_pool, hid.release_all)
+                elif t == "ping":
+                    # Latency probe: echo the client's timestamp so it can measure RTT over this exact
+                    # WebSocket (the same transport mouse/keyboard input uses).
+                    await sock.send_json({"t": "pong", "ts": msg.get("ts")})
             except (KeyError, ValueError, TypeError):
                 continue                 # ignore one malformed message; keep the channel open
     except WebSocketDisconnect:
-        hid.release_all()
+        pass
     except Exception:
-        hid.release_all()
+        pass
+    finally:
+        stop.set()
+        ftask.cancel()
+        try:
+            await ftask
+        except Exception:
+            pass
+        try:
+            await loop.run_in_executor(_hid_pool, hid.release_all)
+        except Exception:
+            pass
 
 
 # ----------------------------- mass storage -----------------------------
@@ -540,11 +597,12 @@ CONFIG_FIELDS = [
          {"key": "ustreamer_host", "label": "uStreamer host", "type": "text", "default": "127.0.0.1"},
          {"key": "ustreamer_port", "label": "uStreamer port", "type": "number", "default": "8080"},
      ]},
-    {"section": "usb", "title": "Virtual USB drive",
+    {"section": "usb", "title": "Virtual USB drive & serial",
      "note": "Applied after: sudo systemctl restart kvm-gadget (briefly re-enumerates USB).",
      "fields": [
          {"key": "image_path", "label": "Drive image path", "type": "text", "default": "/opt/kvm/images/drive.img"},
          {"key": "image_size", "label": "Image size (e.g. 1G, 512M)", "type": "text", "default": "1G"},
+         {"key": "usb_serial", "label": "Present a USB serial (COM) port to the target", "type": "bool", "default": "false"},
      ]},
     {"section": "serial", "title": "Serial console",
      "note": "Default baud for the console UI.",
@@ -571,6 +629,11 @@ CONFIG_FIELDS = [
          {"key": "pulse_ms", "label": "Button press (ms)", "type": "number", "default": "300"},
          {"key": "ports", "label": "Buttons — Label:pin, comma-separated (e.g. PC1:5, PC2:6)",
           "type": "text", "default": ""},
+     ]},
+    {"section": "ui", "title": "Web UI",
+     "note": "Keyboard shortcut that releases input capture in the browser (returns control to your local machine).",
+     "fields": [
+         {"key": "capture_exit", "label": "Release-capture shortcut", "type": "keycombo", "default": "Ctrl+Space"},
      ]},
 ]
 

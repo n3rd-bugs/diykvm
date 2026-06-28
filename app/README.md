@@ -6,10 +6,12 @@ For install/usage see the top‑level [README](../README.md); the agent API is a
 
 ## Modules
 - `server.py` — FastAPI: pages, auth (session + API key, Origin‑checked, rate‑limited), video
-  proxy (`/stream`, `/snapshot`), input WebSocket `/ws`, mass‑storage REST `/api/msd/*`, binary‑clean
-  serial WebSocket `/ws/serial`, target power `/api/power`, external KVM switch `/api/kvmswitch`, config
-  read/write `/api/config` (+ the `/config` page), and a public machine‑readable API descriptor `/api`.
-  Reads `/etc/kvm/kvm.conf` (host/port/TLS, ustreamer URL, image path).
+  proxy (`/stream`, `/snapshot`), input WebSocket `/ws` (HID writes run off the event loop and mouse
+  motion is **coalesced** server‑side, so a fast/high‑DPI mouse can't back up or stall the loop),
+  mass‑storage REST `/api/msd/*`, binary‑clean serial WebSocket `/ws/serial`, target power `/api/power`,
+  external KVM switch `/api/kvmswitch`, config read/write `/api/config` (+ the `/config` page), a public
+  machine‑readable API descriptor `/api`, and a `/pingtest` latency meter (`/ws` `ping`/`pong`).
+  Reads `/etc/kvm/kvm.conf` (host/port/TLS, ustreamer URL, image path, USB serial, capture shortcut).
 - `power.py` — latched per-target power over GPIO: drives a relay line on/off (`pinctrl`) to connect or
   cut each target's power, and reads the line back for state.
 - `kvmswitch.py` — external KVM switch over GPIO: pulses a configured line per target (`gpioset`) to
@@ -22,8 +24,11 @@ For install/usage see the top‑level [README](../README.md); the agent API is a
   target via configfs `lun.0/file` (ISOs read‑only as a CD‑ROM), or loop‑mounts the EFI ESP for file
   editing. All transitions are lock‑serialized so the Pi and target never mount it at once.
 - `auth.py` — `config.json` (pbkdf2 password hash, API key, session secret); `setup_auth.py` resets it.
-- `serialbridge.py` — serial‑port enumeration (the WS handler only opens enumerated ports).
-- `static/` — `index.html` (single‑page UI), `config.html` (settings page), `login.html`, `api-guide.html`.
+- `serialbridge.py` — serial‑port enumeration, including the optional **gadget serial** `/dev/ttyGS0`
+  (the CDC‑ACM COM port the Pi presents to the target when `usb.usb_serial` is set); the WS handler only
+  opens enumerated ports.
+- `static/` — `index.html` (single‑page UI), `config.html` (settings page), `login.html`, `api-guide.html`,
+  `pingtest.html` (browser↔Pi latency meter).
 
 ## Input WebSocket (`/ws`, JSON client → server)
 Authenticate via the session cookie (browser) or `?token=<api_key>` (agent).
@@ -32,10 +37,14 @@ Authenticate via the session cookie (browser) or `?token=<api_key>` (agent).
 |---|---|
 | `{"t":"kd","code":"KeyA"}` / `{"t":"ku",...}` | key down / up (`KeyboardEvent.code`) |
 | `{"t":"mm","x":0.5,"y":0.5}` | absolute move, normalized 0..1 over the target's primary display |
-| `{"t":"mr","dx":10,"dy":-4}` | relative move (trackpad), −127..127 |
+| `{"t":"mr","dx":10,"dy":-4}` | relative move (trackpad); large deltas are split across reports |
 | `{"t":"mb","button":0,"down":true}` | button — 0=left, 1=middle, 2=right (JS `MouseEvent.button`) |
 | `{"t":"mw","dy":1}` | wheel (±1) |
 | `{"t":"reset"}` | release all keys/buttons |
+| `{"t":"ping","ts":N}` | server replies `{"t":"pong","ts":N}` — round‑trip latency probe (see `/pingtest`) |
+
+Mouse `mm`/`mr` are **coalesced server‑side**: the latest position / summed delta is flushed to the
+gadget at ~125 Hz, so a fast/high‑DPI client can't outrun the USB write rate or stall the event loop.
 
 ## Notes
 - The web service runs **unprivileged** (user `diykvm`): it writes `/dev/hidg*` via the `diykvm`

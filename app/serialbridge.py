@@ -30,4 +30,8 @@ def list_serial_ports() -> list:
             seen.setdefault(real, {"device": real, "desc": "", "hwid": ""})
             if dev != real:
                 seen[real]["by_id"] = dev
+    # Gadget serial (the CDC-ACM COM port we present to the target): the operator/agent on this side
+    # talks to the target over it. pyserial doesn't enumerate it, so add it explicitly.
+    for dev in glob.glob("/dev/ttyGS*"):
+        seen[dev] = {"device": dev, "desc": "USB gadget serial (to target)", "hwid": ""}
     return sorted(seen.values(), key=lambda d: d["device"])

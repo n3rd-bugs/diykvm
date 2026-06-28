@@ -86,6 +86,26 @@ async function load() {
         if (f.type === 'bool') {
           inp.type = 'checkbox';
           inp.checked = String(f.value).toLowerCase() === 'true' || f.value === '1' || f.value === 'on' || f.value === 'yes';
+        } else if (f.type === 'keycombo') {
+          inp.type = 'text'; inp.readOnly = true; inp.value = f.value == null ? '' : f.value;
+          inp.placeholder = 'click, then press your shortcut';
+          inp.title = 'Click and press the keys (e.g. Ctrl+Space). Backspace/Delete clears it.';
+          inp.style.cursor = 'pointer';
+          inp.addEventListener('focus', () => { inp.dataset.prev = inp.value; inp.value = 'press keys…'; });
+          inp.addEventListener('blur', () => { if (inp.value === 'press keys…') inp.value = inp.dataset.prev || ''; });
+          inp.addEventListener('keydown', (ev) => {
+            ev.preventDefault();
+            const k = ev.code;
+            if (k === 'Backspace' || k === 'Delete') { inp.value = ''; inp.blur(); return; }
+            if (/^(Control|Alt|Shift|Meta|OS)(Left|Right)?$/.test(k)) return;   // wait for a non-modifier key
+            const parts = [];
+            if (ev.ctrlKey) parts.push('Ctrl');
+            if (ev.altKey) parts.push('Alt');
+            if (ev.shiftKey) parts.push('Shift');
+            if (ev.metaKey) parts.push('Meta');
+            parts.push(k);
+            inp.value = parts.join('+'); inp.blur();
+          });
         } else {
           inp.type = (f.type === 'number') ? 'number' : 'text';
           inp.value = f.value == null ? '' : f.value;

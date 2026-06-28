@@ -3,3 +3,7 @@
 # which the service is not in. Put USB serial in the conventional "dialout" group so the diykvm
 # service (a member of dialout) can open the serial console. Runs late (99-) to win over those rules.
 SUBSYSTEM=="tty", SUBSYSTEMS=="usb", GROUP="dialout", MODE="0660"
+# The Pi's own CDC-ACM gadget serial (/dev/ttyGS*, presented to the target) is not on the usb host
+# subsystem, so the rule above doesn't match it; grant it by name so its permissions are authoritative
+# (the gadget-up script's chgrp is then only a best-effort fast-path, mirroring the hidg model).
+SUBSYSTEM=="tty", KERNEL=="ttyGS[0-9]*", GROUP="dialout", MODE="0660"
