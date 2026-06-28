@@ -1,8 +1,9 @@
 #!/bin/sh
 # Create the virtual USB drive image (GPT + FAT32 EFI System Partition) if absent.
 set -e
-IMG="$(kvm-conf-get usb image_path /opt/kvm/images/drive.img)"
-SIZE="$(kvm-conf-get usb image_size 1G)"
+# Absolute path: this runs from the package postinst, whose PATH excludes /usr/local/sbin.
+IMG="$(/usr/local/sbin/kvm-conf-get usb image_path /opt/kvm/images/drive.img)"
+SIZE="$(/usr/local/sbin/kvm-conf-get usb image_size 1G)"
 [ -f "$IMG" ] && { echo "diykvm: $IMG already exists"; exit 0; }
 
 mkdir -p "$(dirname "$IMG")"

@@ -29,7 +29,12 @@ case "$1" in
 
     # 3. credentials + dirs (generate a random admin password on first install)
     mkdir -p /opt/kvm/images /etc/kvm/tls
-    chmod 700 /etc/kvm/tls
+    # The web service runs as 'diykvm' and must read the TLS cert/key when HTTPS is enabled, so make the
+    # dir group-traversable by diykvm (not world) and fix any existing cert/key perms to match.
+    chown root:diykvm /etc/kvm/tls 2>/dev/null || true
+    chmod 0750 /etc/kvm/tls
+    if [ -f /etc/kvm/tls/key.pem ];  then chown root:diykvm /etc/kvm/tls/key.pem  2>/dev/null || true; chmod 0640 /etc/kvm/tls/key.pem; fi
+    if [ -f /etc/kvm/tls/cert.pem ]; then chown root:diykvm /etc/kvm/tls/cert.pem 2>/dev/null || true; chmod 0644 /etc/kvm/tls/cert.pem; fi
     # /opt/kvm/images stays ROOT-owned: the unprivileged app reads it but writes images only through
     # kvm-msd-helper, so the directory the helper trusts can never be tampered with (no symlink races).
     if [ ! -f /opt/kvm/config.json ]; then

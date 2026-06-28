@@ -51,7 +51,7 @@ single‑page web UI plus an HTTP/WebSocket API.
 Install the Debian package on Raspberry Pi OS (Bookworm):
 
 ```sh
-sudo apt install ./diykvm_0.4.0_all.deb
+sudo apt install ./diykvm_0.4.1_all.deb
 sudo reboot            # first install enables USB gadget mode (dtoverlay=dwc2,dr_mode=peripheral)
 ```
 
@@ -88,6 +88,8 @@ sudo systemctl restart kvm-web ustreamer kvm-gadget
 ```sh
 sudo openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
   -keyout /etc/kvm/tls/key.pem -out /etc/kvm/tls/cert.pem -subj "/CN=$(hostname)"
+sudo chown root:diykvm /etc/kvm/tls/key.pem /etc/kvm/tls/cert.pem   # the web service (diykvm) must read them
+sudo chmod 640 /etc/kvm/tls/key.pem
 sudo sed -i 's/^tls = false/tls = true/' /etc/kvm/kvm.conf
 sudo systemctl restart kvm-web
 ```
