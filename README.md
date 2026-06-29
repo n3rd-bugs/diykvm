@@ -23,8 +23,11 @@ single‑page web UI plus an HTTP/WebSocket API.
   (ISOs as a read‑only CD‑ROM), or use the built‑in editable GPT/FAT32 **EFI System Partition** and manage
   its files from the browser. Attach/detach safely (the Pi and target never mount it at once).
 - **Serial console** — talk to a serial port from the browser (line or raw‑key mode); **binary‑clean**
-  end to end (raw bytes both directions) for agents/automation. Use a USB/RS‑232 adapter, **or** have the
-  Pi present its **own USB serial (CDC‑ACM) COM port** to the target over the same cable — no extra wiring.
+  end to end. Selectable **flow control** (RTS/CTS or XON/XOFF) and DTR; the port is **buffered** server‑side
+  while detached (replayed once on reconnect, then dropped — no duplication), with multiple simultaneous
+  viewers and explicit open/close. Use a
+  USB/RS‑232 adapter, **or** have the Pi present its **own USB serial (CDC‑ACM) COM port** to the target over
+  the same cable — no extra wiring.
 - **Target power** — connect or cut power to two or more targets from the browser, each via a Raspberry
   Pi **GPIO** wired to a relay (latched on/off per target; **push‑pull or open‑drain** output).
 - **External KVM switch** — drive a hardware KVM switch (display + USB) across two or more targets with
@@ -33,6 +36,9 @@ single‑page web UI plus an HTTP/WebSocket API.
   browser; every value is validated server‑side before it's written.
 - **Keep‑awake** — optional periodic mouse nudges so the target's display doesn't sleep.
 - **Latency tool** — a `/pingtest` page shows live browser↔Pi round‑trip time over the input WebSocket.
+- **Screen OCR** — read the target's screen as structured JSON (`GET /api/ocr`): text **line‑by‑line** and
+  grouped into **layout blocks**, each with a bounding box and confidence. Local (Tesseract), on‑demand —
+  handy for scripting and agents.
 - **Auth** — login (session cookie) for humans, API key for agents/automation.
 - **Agent API** — a machine-readable endpoint list at `/api` (JSON, public for discovery) plus a human
   guide at `/api-guide`; drive everything programmatically.
@@ -48,10 +54,11 @@ single‑page web UI plus an HTTP/WebSocket API.
 
 ## Install
 
-Install the Debian package on Raspberry Pi OS (Bookworm):
+Install the Debian package on Raspberry Pi OS (Bookworm, **64‑bit** — the OCR dependency Pillow has no
+prebuilt 32‑bit/armhf wheel, so a 32‑bit OS would need build tools to compile it):
 
 ```sh
-sudo apt install ./diykvm_0.4.1_all.deb
+sudo apt install ./diykvm_0.5.0_all.deb
 sudo reboot            # first install enables USB gadget mode (dtoverlay=dwc2,dr_mode=peripheral)
 ```
 
@@ -80,7 +87,7 @@ sudo systemctl restart kvm-web ustreamer kvm-gadget
 | `video` | `device`, `resolution`, `fps` | `/dev/video0`, `1920x1080`, `30` | capture + stream |
 | `usb` | `image_path`, `image_size` | `/opt/kvm/images/drive.img`, `1G` | virtual drive |
 | `usb` | `usb_serial` | `false` | also present a USB serial (CDC‑ACM) COM port to the target (Pi side `/dev/ttyGS0`) |
-| `serial` | `default_baud` | `115200` | serial console default |
+| `serial` | `default_baud`, `default_flow`, `autostart`, `reconnect` | `115200`, `none`, `/dev/ttyGS0`, `true` | serial console: UI defaults (flow; raw/8N1/DTR/buffered) + `autostart` ports drained from boot (no drops) + `reconnect` auto‑reopens a dropped port (survives the target re‑enumerating, no console churn) |
 | `ui` | `capture_exit` | `Ctrl+Space` | shortcut to release input capture (blank = on‑screen button only) |
 
 ### Enabling HTTPS

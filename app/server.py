@@ -19,7 +19,6 @@ from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
-import serial
 from fastapi import (FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File,
                      Query, HTTPException, Request, Depends, Form, Response, Body)
 from fastapi.responses import FileResponse, StreamingResponse, RedirectResponse, JSONResponse
@@ -31,6 +30,8 @@ from msd import MSD, MSDError
 from power import PowerController, PowerError
 from kvmswitch import KvmSwitch, SwitchError
 from serialbridge import list_serial_ports, COMMON_BAUDS
+from serialport import SerialManager, SerialError, FLOW_MODES
+import ocr
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -72,6 +73,9 @@ _serial_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="serial")
 # Single worker so HID reports stay strictly ordered, and so the blocking os.write() to /dev/hidg*
 # (which waits for the target to poll the USB endpoint) never runs on the async event loop.
 _hid_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hid")
+# One owner per serial device: drains continuously into a ring buffer and fans out to many WS clients.
+SERIAL = SerialManager(_serial_pool)
+_ocr_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ocr")   # OCR is CPU-heavy; keep it off-loop
 
 
 # ----------------------------- origin / auth -----------------------------
@@ -200,9 +204,21 @@ def pingtest_page(request: Request):
 # Machine-readable API descriptor for agents (public, no secrets — aids discovery before auth).
 API_INFO = {
     "name": "DIY PiKVM",
-    "description": "KVM-over-IP: drive the target's keyboard & mouse, watch its screen, serve virtual "
-                   "USB boot media, bridge a serial console, switch GPIO power and an external KVM "
-                   "switch. LAN-only.",
+    "description": "KVM-over-IP for a target machine, drivable by humans and agents. Capabilities: "
+                   "keyboard & mouse over USB HID -- a BIOS/UEFI-capable boot keyboard, and an absolute or "
+                   "relative mouse whose motion is coalesced server-side so high-DPI/high-polling devices "
+                   "stay smooth; the input WebSocket also echoes ping->pong for round-trip latency. "
+                   "Screen as MJPEG (snapshot or live stream), proxied behind auth. Virtual USB boot media: "
+                   "upload whole disk images/ISOs and attach them, or edit a built-in GPT/FAT32 EFI drive "
+                   "from the browser. Serial console that is binary-clean, buffered (ring-buffer scrollback, "
+                   "no RX lost while detached, replayed once on connect then dropped so reconnecting doesn't "
+                   "duplicate; configured ports auto-drain from boot), multi-client, with "
+                   "selectable flow control (none/RTS-CTS/"
+                   "XON-XOFF), DTR control and explicit open/close lifecycle -- over a USB/RS-232 adapter "
+                   "OR the Pi's own CDC-ACM COM port presented to the target. Target power via latched GPIO "
+                   "relays and an external hardware KVM switch. A browser<->Pi latency meter. Settings are "
+                   "read/written via a validated config API. Auth by session cookie (humans) or API key "
+                   "(agents); WebSockets and unsafe requests are Origin-checked; LAN-only.",
     "human_guide": "/api-guide",
     "auth": {
         "type": "api_key",
@@ -221,6 +237,10 @@ API_INFO = {
                  "(echoes ts) to measure round-trip latency over this socket."},
         {"method": "GET", "path": "/snapshot", "auth": True, "desc": "JPEG of the target screen now."},
         {"method": "GET", "path": "/stream", "auth": True, "desc": "Live MJPEG stream."},
+        {"method": "GET", "path": "/api/ocr", "auth": True, "query": "lang, psm, min_conf, region (x,y,w,h), scale, words",
+         "desc": "OCR the current screen -> {image:{w,h}, text, lines[], blocks[]}. Each line/block has text, a "
+                 "bbox [x,y,w,h] in image pixels and a confidence; lines are in reading order and blocks group "
+                 "them as laid out on screen (columns/panels stay separate). On-demand, local (Tesseract)."},
         {"method": "GET", "path": "/api/msd/status", "auth": True, "desc": "Virtual USB drive status."},
         {"method": "POST", "path": "/api/msd/detach", "auth": True, "desc": "Eject from target; mount the EFI drive on the Pi to edit files."},
         {"method": "POST", "path": "/api/msd/attach", "auth": True, "desc": "Hand the EFI drive back to the target."},
@@ -234,11 +254,17 @@ API_INFO = {
         {"method": "POST", "path": "/api/msd/images/attach", "auth": True, "query": "name", "desc": "Attach an image to the target (ISOs as a read-only CD-ROM)."},
         {"method": "POST", "path": "/api/msd/eject", "auth": True, "desc": "Remove the medium from the target."},
         {"method": "DELETE", "path": "/api/msd/images", "auth": True, "query": "name", "desc": "Delete a boot image."},
-        {"method": "GET", "path": "/api/serial/ports", "auth": True, "desc": "List serial ports and common baud rates."},
-        {"method": "WS", "path": "/ws/serial", "auth": True, "query": "device, baud, token",
-         "desc": "Serial console, binary-clean. Serial RX arrives as WebSocket BINARY frames (raw bytes); "
-                 "to transmit, send BINARY frames (written verbatim) or TEXT frames (UTF-8). Status/info "
-                 "lines (connected/closed) arrive as TEXT frames, so distinguish them by frame type."},
+        {"method": "GET", "path": "/api/serial/ports", "auth": True, "desc": "List serial ports (including the gadget /dev/ttyGS0 when usb.usb_serial is on) and common baud rates."},
+        {"method": "GET", "path": "/api/serial/status", "auth": True, "desc": "Open ports with settings, buffered byte count and client count; plus the supported flow_modes."},
+        {"method": "POST", "path": "/api/serial/open", "auth": True, "body": "{device, baud, flow:none|rtscts|xonxoff, dtr, rts, reconnect, reopen}",
+         "desc": "Open a port (raw, 8N1, echo off, DTR asserted) and keep it draining even with no client (bytes held as a backlog while detached). reconnect=true auto-reopens it if the target disconnects/re-enumerates. Idempotent."},
+        {"method": "POST", "path": "/api/serial/close", "auth": True, "body": "{device}", "desc": "Close a serial port and stop buffering."},
+        {"method": "WS", "path": "/ws/serial", "auth": True, "query": "device, baud, flow, dtr, rts, reconnect, token",
+         "desc": "Serial console, binary-clean. Subscribes to the shared port (auto-opens it with the given "
+                 "settings if needed), replays the backlog accumulated while detached (then dropped, so "
+                 "reconnecting doesn't duplicate), then streams live. Serial RX arrives as WebSocket BINARY "
+                 "frames (raw bytes); transmit BINARY frames (verbatim) or TEXT frames (UTF-8). Status lines "
+                 "are TEXT frames. Disconnecting leaves the port open; release it with POST /api/serial/close."},
         {"method": "GET", "path": "/api/power/state", "auth": True, "desc": "Per-target power relay state: {targets:[{label, on}]}."},
         {"method": "POST", "path": "/api/power", "auth": True, "body": "{index, on}", "desc": "Connect (on=true) or cut (on=false) a target's power (latched relay)."},
         {"method": "GET", "path": "/api/kvmswitch/state", "auth": True, "desc": "External KVM-switch buttons: {ports:[{label}]}."},
@@ -298,6 +324,56 @@ async def snapshot(_: bool = Depends(require_auth)):
     except Exception:
         raise HTTPException(status_code=502, detail="stream source unavailable")
     return Response(r.content, media_type=r.headers.get("content-type", "image/jpeg"))
+
+
+@app.get("/api/ocr")
+async def api_ocr(_: bool = Depends(require_auth),
+                  lang: str = "eng", psm: int | None = None, min_conf: float = 0.0,
+                  region: str | None = None, scale: float = 2.0, words: bool = False):
+    """OCR the current screen -> JSON: lines in reading order + layout blocks, each with bbox & confidence."""
+    if not ocr.available():
+        raise HTTPException(status_code=503, detail="OCR unavailable (install tesseract-ocr + pytesseract + Pillow)")
+    if not lang or len(lang) > 32 or not all(c.isalnum() or c in "_+" for c in lang):
+        lang = "eng"
+    ps = None
+    if psm is not None:
+        try:
+            ps = max(0, min(13, int(psm)))
+        except (TypeError, ValueError):
+            ps = None
+    try:
+        mc = max(0.0, min(100.0, float(min_conf)))
+    except (TypeError, ValueError):
+        mc = 0.0
+    try:
+        sc = max(1.0, min(3.0, float(scale)))      # cap upscaling: scale=3 on 1080p is already ~18MP/frame
+    except (TypeError, ValueError):
+        sc = 2.0
+    reg = None
+    if region:
+        try:
+            parts = [int(p) for p in region.split(",")]
+            if len(parts) == 4 and all(p >= 0 for p in parts) and parts[2] > 0 and parts[3] > 0:
+                reg = tuple(parts)
+        except (TypeError, ValueError):
+            reg = None
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"{USTREAMER}/snapshot")
+    except Exception:
+        raise HTTPException(status_code=502, detail="stream source unavailable")
+    if r.status_code != 200 or not r.headers.get("content-type", "").startswith("image/"):
+        raise HTTPException(status_code=502, detail="stream source returned no image")
+    jpeg = r.content
+    loop = asyncio.get_event_loop()
+    try:
+        return await loop.run_in_executor(_ocr_pool, lambda: ocr.ocr_image(
+            jpeg, lang=lang, psm=ps, min_conf=mc, region=reg, scale=sc, words=bool(words)))
+    except ocr.OCRUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        print("[ocr] failed: %r" % (e,), flush=True)      # log internals server-side, don't leak to caller
+        raise HTTPException(status_code=500, detail="ocr failed")
 
 
 # ----------------------------- input (HID) -----------------------------
@@ -477,6 +553,56 @@ def _valid_serial_device(device: str):
     return None
 
 
+def _flag(v, default=True):
+    if v is None:
+        return default
+    return str(v).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _serial_params(qp):
+    """Parse baud/flow/dtr/rts/reconnect from query params or a JSON body; fall back to configured defaults."""
+    try:
+        baud = int(qp.get("baud", _conf("serial", "default_baud", "115200")))
+    except (TypeError, ValueError):
+        baud = 115200
+    if baud not in COMMON_BAUDS:
+        baud = 115200
+    flow = (qp.get("flow", _conf("serial", "default_flow", "none")) or "none").strip().lower()
+    if flow not in FLOW_MODES:                       # accept the case-insensitive forms the conf-helper allows
+        flow = "none"
+    rc = qp.get("reconnect")
+    reconnect = _conf_bool("serial", "reconnect", "true") if rc is None else _flag(rc, True)
+    return baud, flow, _flag(qp.get("dtr"), True), _flag(qp.get("rts"), True), reconnect
+
+
+@app.get("/api/serial/status")
+def serial_status(_: bool = Depends(require_auth)):
+    return {"ports": SERIAL.status(), "flow_modes": list(FLOW_MODES)}
+
+
+@app.post("/api/serial/open")
+async def serial_open(payload: dict = Body(default={}), _: bool = Depends(require_auth)):
+    body = payload if isinstance(payload, dict) else {}
+    device = _valid_serial_device(body.get("device", ""))
+    if device is None:
+        raise HTTPException(status_code=400, detail="unknown serial device")
+    baud, flow, dtr, rts, rc = _serial_params(body)
+    try:
+        p = await SERIAL.open(device, baud, flow, dtr, rts, reconnect=rc, reopen=bool(body.get("reopen")))
+    except SerialError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return {"device": device, "baud": p.baud, "flow": p.flow, "dtr": p.dtr, "rts": p.rts, "open": p.alive}
+
+
+@app.post("/api/serial/close")
+async def serial_close(payload: dict = Body(default={}), _: bool = Depends(require_auth)):
+    body = payload if isinstance(payload, dict) else {}
+    device = _valid_serial_device(body.get("device", ""))
+    if device is None:
+        raise HTTPException(status_code=400, detail="unknown serial device")
+    return {"device": device, "closed": await SERIAL.close(device)}
+
+
 @app.websocket("/ws/serial")
 async def ws_serial(sock: WebSocket):
     if not ws_authed(sock):
@@ -488,39 +614,59 @@ async def ws_serial(sock: WebSocket):
         await sock.send_text("\r\n[refused: unknown serial device]\r\n")
         await sock.close()
         return
-    try:
-        baud = int(sock.query_params.get("baud", "115200"))
-    except ValueError:
-        baud = 115200
-    if baud not in COMMON_BAUDS:
-        baud = 115200
-    try:
-        ser = serial.Serial(device, baudrate=baud, timeout=0.1)
-    except Exception as e:
-        await sock.send_text(f"\r\n[open failed: {e}]\r\n")
-        await sock.close()
+    baud, flow, dtr, rts, rc = _serial_params(sock.query_params)
+    # Subscribe to the shared port owner; open it with the requested settings if it isn't already. The
+    # port keeps draining into its ring buffer after this client leaves -- it is released only via
+    # POST /api/serial/close. This is what makes RX buffered, multi-client and free of the
+    # two-readers-on-one-tty error.
+    port = SERIAL.get(device)
+    if port is None:
+        try:
+            port = await SERIAL.open(device, baud, flow, dtr, rts, reconnect=rc)
+        except SerialError as e:
+            await sock.send_text(f"\r\n[open failed: {e}]\r\n")
+            await sock.close()
+            return
+    await sock.send_text(f"\r\n[connected {device} @ {port.baud} flow={port.flow} "
+                         f"dtr={int(port.dtr)} rts={int(port.rts)}]\r\n")
+    q, backlog = port.subscribe()
+    if not port.alive:                 # closed in the race window between open/get and subscribe()
+        port.unsubscribe(q)            # the drain's finally already fired; we'd never get the sentinel
+        try:
+            await sock.send_text("\r\n[port closed]\r\n")
+        finally:
+            await sock.close()
         return
-    await sock.send_text(f"\r\n[connected {device} @ {baud} baud]\r\n")
-    loop = asyncio.get_event_loop()
     stop = asyncio.Event()
 
-    # Binary-clean both ways: serial RX is sent as WebSocket BINARY frames (raw bytes, lossless), and
-    # TX accepts BINARY frames (written verbatim) or TEXT frames (UTF-8 encoded — convenient for typing).
-    # Status/info lines above/below are TEXT frames, so clients tell them apart from serial data by type.
-    async def reader():
-        while not stop.is_set():
-            data = await loop.run_in_executor(_serial_pool, ser.read, 4096)
-            if data and not stop.is_set():
-                try:
-                    await sock.send_bytes(data)
-                except Exception:
-                    break
+    # Send only the backlog that arrived while NO client was attached, then stream live. Bytes already
+    # delivered to a live client are not retained, so reconnecting never replays what you've already seen.
+    # Serial bytes are BINARY frames (lossless); status/info lines are TEXT frames.
+    if backlog:
+        try:
+            await sock.send_bytes(backlog)
+        except Exception:
+            pass
 
-    async def writer():
-        while True:
+    async def reader():           # port ring buffer -> this websocket
+        while not stop.is_set():
+            data = await q.get()
+            if data is None:      # the port was closed underneath us
+                try:
+                    await sock.send_text("\r\n[port closed]\r\n")
+                except Exception:
+                    pass
+                break
+            try:
+                await sock.send_bytes(data)
+            except Exception:
+                break
+        stop.set()
+
+    async def writer():           # this websocket -> port
+        while not stop.is_set():
             m = await sock.receive()
             if m.get("type") == "websocket.disconnect":
-                stop.set()                  # also stop the reader so the serial port is released
                 break
             data = m.get("bytes")
             if data is None:
@@ -528,18 +674,71 @@ async def ws_serial(sock: WebSocket):
                 if txt is None:
                     continue
                 data = txt.encode("utf-8", "replace")
-            await loop.run_in_executor(_serial_pool, ser.write, data)
+            try:
+                await port.write(data)
+            except Exception:
+                try:
+                    await sock.send_text("\r\n[write failed]\r\n")
+                except Exception:
+                    pass
+        stop.set()
 
+    rt = asyncio.create_task(reader())
+    wt = asyncio.create_task(writer())
     try:
-        await asyncio.gather(reader(), writer())
-    except (WebSocketDisconnect, Exception):
-        pass
+        await asyncio.wait({rt, wt}, return_when=asyncio.FIRST_COMPLETED)
     finally:
         stop.set()
-        try:
-            ser.close()
-        except Exception:
-            pass
+        for t in (rt, wt):
+            t.cancel()
+        for t in (rt, wt):
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        port.unsubscribe(q)       # leave the port OPEN + buffering for other clients / lifecycle control
+
+
+# --- socat-style persistent reader: keep configured ports open & draining so RX is never dropped ---
+_serial_autostart_task = None
+
+
+def _autostart_devices():
+    # Default to the gadget COM port so its RX is never dropped whenever usb_serial is on (harmless when
+    # /dev/ttyGS0 is absent -- the loop just skips it). Set [serial] autostart = "" to disable.
+    return [d.strip() for d in _conf("serial", "autostart", "/dev/ttyGS0").split(",") if d.strip()]
+
+
+async def _serial_autostart():
+    """Keep each configured port open and continuously drained into its ring buffer, independent of any
+    client. On a CDC-ACM gadget RX only flows while the tty is open, so without this the target's output
+    is dropped until someone connects. Also (re)opens a port that appears later (e.g. /dev/ttyGS0 once the
+    gadget binds) or that dropped (USB re-enumerate)."""
+    while True:
+        for dev in _autostart_devices():
+            try:
+                if SERIAL.get(dev) is None:                 # not currently open/draining
+                    rdev = _valid_serial_device(dev)        # exists + is an enumerated serial port?
+                    if rdev:
+                        baud, flow, dtr, rts, rc = _serial_params({})
+                        await SERIAL.open(rdev, baud, flow, dtr, rts, reconnect=rc)
+            except Exception:
+                pass                                        # transient (e.g. opened by something else); retry next tick
+        await asyncio.sleep(5)
+
+
+@app.on_event("startup")
+async def _serial_startup():
+    global _serial_autostart_task
+    if _autostart_devices():
+        _serial_autostart_task = asyncio.create_task(_serial_autostart())
+
+
+@app.on_event("shutdown")
+async def _serial_shutdown():
+    if _serial_autostart_task:
+        _serial_autostart_task.cancel()
+    await SERIAL.close_all()
 
 
 # ----------------------------- target power (GPIO) -----------------------------
@@ -605,9 +804,12 @@ CONFIG_FIELDS = [
          {"key": "usb_serial", "label": "Present a USB serial (COM) port to the target", "type": "bool", "default": "false"},
      ]},
     {"section": "serial", "title": "Serial console",
-     "note": "Default baud for the console UI.",
+     "note": "Defaults for the console UI; the per-session controls override these. Ports open raw, 8N1, echo off, DTR asserted.",
      "fields": [
          {"key": "default_baud", "label": "Default baud", "type": "number", "default": "115200"},
+         {"key": "default_flow", "label": "Default flow control (none / rtscts / xonxoff)", "type": "text", "default": "none"},
+         {"key": "autostart", "label": "Always-drain ports (comma-separated, e.g. /dev/ttyGS0) — kept open & buffered so data is never dropped; blank to disable", "type": "text", "default": "/dev/ttyGS0"},
+         {"key": "reconnect", "label": "Auto-reopen a port if it disconnects (survive the target re-enumerating; no console churn)", "type": "bool", "default": "true"},
      ]},
     {"section": "power", "title": "Target power (GPIO relays)",
      "note": "Applied immediately. Each target's GPIO drives a relay that connects or cuts its power "
@@ -688,7 +890,9 @@ def config_restart_streamer(_: bool = Depends(require_auth)):
 
 if __name__ == "__main__":
     import uvicorn
-    kw = dict(host=WEB_HOST, port=WEB_PORT)
+    # Bound graceful shutdown so a restart doesn't hang waiting on an open WebSocket (input/serial); after
+    # this many seconds uvicorn force-closes connections. Clients just reconnect.
+    kw = dict(host=WEB_HOST, port=WEB_PORT, timeout_graceful_shutdown=5)
     if TLS and os.path.exists(TLS_CERT) and os.path.exists(TLS_KEY):
         kw["ssl_certfile"], kw["ssl_keyfile"] = TLS_CERT, TLS_KEY
     uvicorn.run(app, **kw)

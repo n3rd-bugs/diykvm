@@ -29,12 +29,17 @@ INT = r"\d{1,6}"
 HOST = r"([A-Za-z0-9_]([A-Za-z0-9_.\-]{0,252})?)?"   # hostname / IP / blank; never option-like
 PATH = r"/[A-Za-z0-9_./\-]{1,255}"            # absolute, no spaces or shell metacharacters
 DEV = r"/dev/[A-Za-z0-9_./\-]{1,250}"
+# A serial tty device or by-id symlink -- the namespaces the serial feature actually supports. Keeping the
+# allowlist itself this tight (not just runtime gating) means an unexpected /dev path can never be written.
+_SERDEV = r"/dev/(tty(USB|ACM|AMA|GS|S)\d{1,3}|serial/by-id/[A-Za-z0-9_.\-]{1,200})"
+DEVLIST = r"(%s(\s*,\s*%s)*)?" % (_SERDEV, _SERDEV)   # comma-separated serial devices, or blank
 RES = r"\d{2,5}x\d{2,5}"
 SIZE = r"\d{1,5}[MG]?"
 CHIP = r"gpiochip\d{1,2}"
 ORIGINS = r"[A-Za-z0-9_.\-:, ]{0,512}"        # comma-separated host[:port], or blank
 PORTS = r"[A-Za-z0-9 _:,.\-]{0,256}"          # comma-separated Label:pin pairs, or blank
 COMBO = r"(?:(?:(?:Ctrl|Alt|Shift|Meta)\+){0,4}[A-Za-z0-9]{1,20})?"   # key combo (e.g. Ctrl+Space), or blank
+FLOW = r"(none|rtscts|xonxoff)"               # serial flow control mode
 
 SCHEMA = {
     "web": {"host": HOST, "port": PORT, "tls": BOOL,
@@ -42,7 +47,7 @@ SCHEMA = {
     "video": {"device": DEV, "resolution": RES, "fps": INT,
               "ustreamer_host": HOST, "ustreamer_port": PORT},
     "usb": {"image_path": PATH, "image_size": SIZE, "usb_serial": BOOL},
-    "serial": {"default_baud": BAUD},
+    "serial": {"default_baud": BAUD, "default_flow": FLOW, "autostart": DEVLIST, "reconnect": BOOL},
     "power": {"enabled": BOOL, "active_low": BOOL, "open_drain": BOOL, "targets": PORTS},
     "kvmswitch": {"enabled": BOOL, "chip": CHIP, "active_low": BOOL, "pulse_ms": INT, "ports": PORTS},
     "ui": {"capture_exit": COMBO},

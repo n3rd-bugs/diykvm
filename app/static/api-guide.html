@@ -68,11 +68,22 @@ async def type_hello(pi, key):
         await ws.send(json.dumps({"t":"mm","x":0.5,"y":0.5}))   # cursor to screen center
 asyncio.run(type_hello("192.168.1.120","&lt;KEY&gt;"))</code></pre>
 
-<h2>3. Screen <span class="pill">GET /snapshot</span> <span class="pill">GET /stream</span></h2>
+<h2>3. Screen <span class="pill">GET /snapshot</span> <span class="pill">GET /stream</span> <span class="pill">GET /api/ocr</span></h2>
 <table>
 <tr><td><code>GET /snapshot</code></td><td>single JPEG of the target screen right now</td></tr>
 <tr><td><code>GET /stream</code></td><td>live MJPEG (<code>multipart/x-mixed-replace</code>)</td></tr>
+<tr><td><code>GET /api/ocr</code></td><td><b>Read the screen as text.</b> OCRs the current frame (local Tesseract) and returns
+    <code>{image:{w,h}, text, lines[], blocks[]}</code>. Every <code>line</code> has <code>text</code>, a
+    <code>bbox:[x,y,w,h]</code> in image pixels and a <code>conf</code>; <code>lines</code> are in reading order,
+    and <code>blocks</code> group them into layout chunks as they appear on screen (columns/panels stay separate).
+    Query: <code>lang</code> (default eng), <code>psm</code>, <code>min_conf</code>, <code>region=x,y,w,h</code>,
+    <code>scale</code>, <code>words=1</code> (per-word boxes). On-demand; ~1&ndash;4&nbsp;s per 1080p frame.</td></tr>
 </table>
+<pre><code>import requests
+d = requests.get("http://&lt;pi&gt;:8000/api/ocr", headers={"X-API-Key":"&lt;KEY&gt;"},
+                 params={"min_conf": 60}).json()
+for ln in d["lines"]:                       # text in reading order, with positions
+    print(ln["bbox"], round(ln["conf"]), ln["text"])</code></pre>
 <pre><code>curl -s -H "X-API-Key: &lt;KEY&gt;" http://&lt;pi&gt;:8000/snapshot -o screen.jpg</code></pre>
 
 <h2>4. Virtual USB drive / EFI boot media <span class="pill">/api/msd/*</span></h2>
@@ -109,15 +120,29 @@ curl -s -X POST -H "X-API-Key: &lt;KEY&gt;" -F file=@ubuntu.iso \
      http://&lt;pi&gt;:8000/api/msd/images/upload
 curl -s -X POST -H "X-API-Key: &lt;KEY&gt;" "http://&lt;pi&gt;:8000/api/msd/images/attach?name=ubuntu.iso"</code></pre>
 
-<h2>5. Serial console <span class="pill">/api/serial/ports</span> <span class="pill">WS /ws/serial</span></h2>
+<h2>5. Serial console <span class="pill">/api/serial/open</span> <span class="pill">/api/serial/close</span> <span class="pill">WS /ws/serial</span></h2>
+<p>Each port has <b>one owner</b> on the server: it is drained <b>continuously</b> and fanned out to any
+number of WebSocket clients (no "multiple access on port" error). While no client is attached the bytes are
+held in a bounded <b>backlog</b>; a connecting client receives that backlog once and it is then <b>dropped</b>,
+and bytes delivered to a live client are never retained — so <b>reconnecting does not duplicate</b> what you
+already saw. Ports open <b>raw, 8N1, echo off, DTR asserted</b>, with selectable flow control, and stay open
+after a client leaves (release with <code>/api/serial/close</code>). With <code>[serial] reconnect</code> on
+(default), a port that drops &mdash; e.g. the target <b>re-enumerates</b> its COM port over and over &mdash;
+<b>silently re-opens</b> with backoff, keeping clients attached and the buffer intact, so the churn never
+reaches the console. Ports in <code>[serial] autostart</code>
+(default <code>/dev/ttyGS0</code>) are opened and drained automatically from boot — a socat-style persistent
+reader — so the target's output is captured even before anyone connects and is never dropped.</p>
 <table>
 <tr><td><code>GET /api/serial/ports</code></td><td>list serial ports: <code>{ports:[{device,desc,hwid}]}</code>.
     Includes <code>/dev/ttyGS0</code> ("USB gadget serial") when the Pi presents a CDC-ACM COM port to the
-    target (set <code>usb.usb_serial</code>) — open it like any other port to talk to the target over USB.</td></tr>
-<tr><td><code>WS /ws/serial?device=/dev/ttyUSB0&amp;baud=115200&amp;token=&lt;KEY&gt;</code></td>
-    <td><b>Binary-clean.</b> Serial RX arrives as WebSocket <b>BINARY</b> frames (raw bytes). To transmit, send
-    <b>BINARY</b> frames (written verbatim) or <b>TEXT</b> frames (UTF-8). Status lines (connected/closed)
-    arrive as <b>TEXT</b> frames — tell them apart from serial data by frame type.</td></tr>
+    target (set <code>usb.usb_serial</code>).</td></tr>
+<tr><td><code>GET /api/serial/status</code></td><td>open ports + settings, buffered byte count and client count, plus the supported <code>flow_modes</code>.</td></tr>
+<tr><td><code>POST /api/serial/open</code></td><td><code>{device, baud, flow:none|rtscts|xonxoff, dtr, rts, reopen}</code> — open the port and keep it draining into the ring buffer even with no client. Idempotent.</td></tr>
+<tr><td><code>POST /api/serial/close</code></td><td><code>{device}</code> — close the port and stop buffering.</td></tr>
+<tr><td><code>WS /ws/serial?device=/dev/ttyGS0&amp;baud=115200&amp;flow=none&amp;dtr=1&amp;token=&lt;KEY&gt;</code></td>
+    <td><b>Binary-clean.</b> Subscribes to the port (auto-opens it with these settings if needed), replays the
+    buffered scrollback, then streams live. RX arrives as WebSocket <b>BINARY</b> frames (raw bytes); transmit
+    <b>BINARY</b> frames (verbatim) or <b>TEXT</b> frames (UTF-8). Status lines arrive as <b>TEXT</b> frames.</td></tr>
 </table>
 <pre><code>import asyncio, websockets
 async def console(pi, key, dev):

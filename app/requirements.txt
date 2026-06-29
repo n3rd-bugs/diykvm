@@ -4,3 +4,5 @@ python-multipart
 itsdangerous
 httpx
 pyserial
+pytesseract
+Pillow

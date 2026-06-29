@@ -224,7 +224,14 @@
     <div class="srow">
       <select id="serport" title="serial port"></select>
       <select id="serbaud" title="baud rate"></select>
+      <select id="serflow" title="flow control">
+        <option value="none">Flow: none</option>
+        <option value="rtscts">Flow: RTS/CTS</option>
+        <option value="xonxoff">Flow: XON/XOFF</option>
+      </select>
+      <label class="chk" title="assert DTR for read/write"><input type="checkbox" id="serdtr" checked> DTR</label>
       <button id="serconn">Connect</button>
+      <button id="serclose" title="close the port and stop buffering">Close port</button>
       <button id="serrefresh" title="rescan ports">↻</button>
       <label class="chk"><input type="checkbox" id="serraw"> raw keys</label>
       <button id="serclear">Clear</button>
@@ -775,11 +782,20 @@ const serin = document.getElementById('serin');
 const serstatus = document.getElementById('serstatus');
 const serconn = document.getElementById('serconn');
 const serraw = document.getElementById('serraw');
+const serflow = document.getElementById('serflow');
+const serdtr = document.getElementById('serdtr');
 let serWs = null;
 
 [9600,19200,38400,57600,115200,230400,460800,921600].forEach(b => {
   const o=document.createElement('option'); o.value=b; o.textContent=b; if(b===115200) o.selected=true; serbaud.appendChild(o);
 });
+// remember the operator's serial prefs across reloads
+{ const v=localStorage.getItem('kvm_serBaud'); if(v) serbaud.value=v;
+  const f=localStorage.getItem('kvm_serFlow'); if(f) serflow.value=f;
+  const d=localStorage.getItem('kvm_serDtr'); if(d!==null) serdtr.checked=(d==='1'); }
+serbaud.onchange = () => localStorage.setItem('kvm_serBaud', serbaud.value);
+serflow.onchange = () => localStorage.setItem('kvm_serFlow', serflow.value);
+serdtr.onchange  = () => localStorage.setItem('kvm_serDtr', serdtr.checked?'1':'0');
 async function serLoadPorts(){
   try {
     const d = await api('/api/serial/ports');
@@ -794,6 +810,13 @@ document.getElementById('serialbtn').onclick = () => {
 };
 document.getElementById('serrefresh').onclick = serLoadPorts;
 document.getElementById('serclear').onclick = () => serout.textContent='';
+document.getElementById('serclose').onclick = async () => {
+  const dev = serport.value; if(!dev){ serstatus.textContent='no port selected'; return; }
+  if(serWs){ serWs.close(); }
+  try { await api('/api/serial/close', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({device:dev})});
+        serstatus.textContent='port closed (buffering stopped)'; }
+  catch(e){ serstatus.textContent=e.message; }
+};
 function serAppend(t){ serout.textContent += t; serout.scrollTop = serout.scrollHeight;
   if(serout.textContent.length>200000) serout.textContent = serout.textContent.slice(-150000); }
 const serSend = (s) => { if(serWs && serWs.readyState===1) serWs.send(s); };
@@ -801,7 +824,7 @@ const serSend = (s) => { if(serWs && serWs.readyState===1) serWs.send(s); };
 serconn.onclick = () => {
   if(serWs){ serWs.close(); return; }
   const dev = serport.value; if(!dev){ serstatus.textContent='no port selected'; return; }
-  serWs = new WebSocket(wsURL(`/ws/serial?device=${encodeURIComponent(dev)}&baud=${serbaud.value}`));
+  serWs = new WebSocket(wsURL(`/ws/serial?device=${encodeURIComponent(dev)}&baud=${serbaud.value}&flow=${serflow.value}&dtr=${serdtr.checked?1:0}`));
   serWs.binaryType = 'arraybuffer';                 // serial RX arrives as raw binary frames
   const dec = new TextDecoder('utf-8', { fatal: false });
   serWs.onopen    = () => { serconn.textContent='Disconnect'; serconn.classList.add('on'); serstatus.textContent='connected'; (serraw.checked?serout:serin).focus(); };

@@ -23,10 +23,18 @@ For install/usage see the top‑level [README](../README.md); the agent API is a
   ISOs, list, select, delete) plus the built‑in editable EFI drive. Attaches the chosen image to the
   target via configfs `lun.0/file` (ISOs read‑only as a CD‑ROM), or loop‑mounts the EFI ESP for file
   editing. All transitions are lock‑serialized so the Pi and target never mount it at once.
+- `ocr.py` — on‑demand **screen OCR**: snapshot → Tesseract (`pytesseract` + Pillow, with grayscale/upscale/
+  autocontrast) → JSON of lines (reading order) and layout blocks, each with a bounding box + confidence
+  (`GET /api/ocr`). Local, CPU‑only; deps optional at import (degrades to 503 if missing).
 - `auth.py` — `config.json` (pbkdf2 password hash, API key, session secret); `setup_auth.py` resets it.
 - `serialbridge.py` — serial‑port enumeration, including the optional **gadget serial** `/dev/ttyGS0`
-  (the CDC‑ACM COM port the Pi presents to the target when `usb.usb_serial` is set); the WS handler only
-  opens enumerated ports.
+  (the CDC‑ACM COM port the Pi presents to the target when `usb.usb_serial` is set); only enumerated ports
+  may be opened.
+- `serialport.py` — persistent serial **port manager**: one owner per device drains it **continuously** and
+  fans bytes out to any number of WS clients (no "multiple access on port" error). While detached it keeps a
+  bounded **backlog** that a connecting client receives once and is then dropped — and bytes delivered live
+  are never retained — so reconnecting never duplicates. Opens **raw, 8N1, echo off, DTR asserted** with
+  selectable **RTS/CTS or XON/XOFF** flow control; explicit **open/close** lifecycle decoupled from clients.
 - `static/` — `index.html` (single‑page UI), `config.html` (settings page), `login.html`, `api-guide.html`,
   `pingtest.html` (browser↔Pi latency meter).
 
