@@ -7,6 +7,11 @@ QUEUE ?= 256
 KDIR  := /lib/modules/$(KVER)/build
 obj-m := u_serial.o
 
+# The `u_serial.c u_serial.h:` rule below is one recipe for two targets; DKMS builds with `make -j`, which
+# would otherwise run fetch-source.sh twice concurrently and the 2nd patch races/fails. Serialize our targets
+# (this does NOT affect the parallelism of the kernel sub-make in `all`).
+.NOTPARALLEL:
+
 all: u_serial.c u_serial.h
 	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
 

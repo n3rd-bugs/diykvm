@@ -1,3 +1,57 @@
+# Kernel-module tweaks
+
+An optional DKMS module (`diykvm-userial`) for the USB gadget serial. Build it on the Pi (`dkms`,
+`linux-headers-$(uname -r)`, `curl`); it falls back to the stock `u_serial` if it can't build, and
+`dkms remove` restores stock.
+
+It patches `u_serial` two ways: a
+**[re-enumeration self-heal](#gadget-serial-out-endpoint-dies-out-after-a-re-enumeration)**
+(`survive_reenum` + `rearm_ms`) so the serial OUT endpoint doesn't "die out" after a USB re-enumerate, and a
+**[deeper RX/TX request queue](#gadget-serial-out-queue-depth-u_serial-queue_size)** (`queue_size`). The
+self-heal **is the fix for the "endpoint dies out" stall** (verified on a Pi 4B, kernel 6.12.25).
+
+> An earlier `dwc2` "disable USB2 LPM" module was investigated and **dropped**: the BCM2711 dwc2 core has no
+> LPM in hardware (`GHWCFG3` bit15=0, so `params.lpm`=0), so disabling LPM is a no-op — the real trigger is
+> **re-enumeration**, handled by the self-heal above.
+
+---
+
+# Gadget serial OUT-endpoint "dies out" after a re-enumeration
+
+**Symptom (the original "DWC death").** While a bulk-OUT endpoint is under load and the gadget
+**re-enumerates** (USB reset / UDC rebind — which happens on this device), the OUT endpoint is left
+**un-rearmed**: its request queue drains to empty and is never refilled, so the endpoint NAKs every transfer
+and the interface goes dead. It recovers only on a port **close+reopen** (what the `kvm-web` serial
+auto-reopen does) — or, for mass storage, a full re-enumerate. Confirmed on a Pi 4B (6.12.25): forcing a
+re-enumerate during a serial bulk-OUT burst froze `ttyGS0` RX and wedged the CDC OUT endpoint (`ep2out`
+`DOEPCTL.EPENA=0`) until reopen.
+
+**Root cause.** On disconnect, `u_serial`'s `gserial_disconnect()` calls `tty_hangup()`, which zeroes
+`port.count`; on reconnect, `gserial_connect()` re-arms the OUT queue **only if `port.count`** is non-zero, so
+an open port that was hung up never re-arms. (This is *not* LPM — LPM is disabled on this silicon.)
+
+**The fix — `u_serial` re-enumeration self-heal (DKMS).** The `diykvm-userial` module (below) adds two knobs:
+
+| Module param | Default | What it does |
+|---|---|---|
+| `survive_reenum` | `1` | Skip the `tty_hangup` on a transient gadget disconnect, so an **open** `ttyGS` port keeps its `port.count` across a re-enumerate and `gserial_connect()` re-arms it transparently. |
+| `rearm_ms` | `250` | A watchdog that, every `rearm_ms`, kicks each open+connected port's `push` work (`gs_rx_push → gs_start_rx`) to **top up the OUT queue** — a cause-agnostic backstop if the immediate re-arm raced the re-enumerate. `0` disables it. Read-only (`0444`): set at module load (a modprobe option), not at runtime. |
+
+Verify (on the Pi):
+```sh
+cat /sys/module/u_serial/parameters/survive_reenum   # Y
+cat /sys/module/u_serial/parameters/rearm_ms         # 250
+# Drive a serial bulk-OUT burst to the target COM port while forcing re-enumerates
+# (kvm-gadget-helper reenumerate): RX keeps flowing across each re-enumerate instead of freezing.
+```
+
+> **Note — mass storage (`ep1out`).** The same family of failure hits the mass-storage OUT endpoint under a
+> re-enumerate (there it can surface as `dwc2_hsotg_ep_stop_xfr: timeout GOUTNAKEFF`). `f_mass_storage` has no
+> tty/`port.count`, so this `u_serial` fix does not cover it; that path still relies on a re-enumerate to
+> recover. See the report for next steps.
+
+---
+
 # Gadget serial OUT queue depth (`u_serial` QUEUE_SIZE)
 
 Optional kernel-module tweak for the gadget CDC-ACM serial. Raises how many bulk-OUT (target→Pi) USB

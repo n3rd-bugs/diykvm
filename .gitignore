@@ -21,3 +21,6 @@ dist/
 
 # host-side test captures (binary)
 host-test/*.jpg
+
+# Local reports
+reports/

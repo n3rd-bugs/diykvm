@@ -74,7 +74,8 @@ sudo /opt/kvm/venv/bin/python /opt/kvm/app/setup_auth.py <user> <password>
 sudo systemctl restart kvm-web
 ```
 
-Then open **http://&lt;pi-ip&gt;:8000/** and sign in.
+Then open **https://&lt;pi-ip&gt;:8000/** and sign in (HTTPS is on by default with a self‑signed cert — accept
+the browser warning once; see [HTTPS](#https-on-by-default)).
 
 ## Configuration
 
@@ -87,7 +88,7 @@ sudo systemctl restart kvm-web ustreamer kvm-gadget
 | Section | Key | Default | Meaning |
 |---|---|---|---|
 | `web` | `host`, `port` | `0.0.0.0`, `8000` | web UI / API bind |
-| `web` | `tls`, `tls_cert`, `tls_key` | `false` | serve HTTPS (and `wss://` for input) |
+| `web` | `tls`, `tls_cert`, `tls_key` | `true` | serve HTTPS (and `wss://` for input); on by default with a self‑signed cert |
 | `web` | `allowed_origins` | _(blank)_ | extra browser origins permitted to connect |
 | `video` | `device`, `resolution`, `fps` | `/dev/video0`, `1920x1080`, `30` | capture + stream |
 | `usb` | `image_path`, `image_size` | `/opt/kvm/images/drive.img`, `1G` | virtual drive |
@@ -95,16 +96,27 @@ sudo systemctl restart kvm-web ustreamer kvm-gadget
 | `serial` | `default_baud`, `default_flow`, `autostart`, `reconnect` | `115200`, `none`, _(blank)_, `true` | serial console: UI defaults (flow; raw/8N1/DTR/buffered); `autostart` auto‑opens listed ports from boot (blank = the other end opens on demand via `POST /api/serial/open`); `reconnect` auto‑reopens a dropped port. `POST /api/serial/reenumerate` re‑enumerates the gadget so the target gets a fresh COM port |
 | `ui` | `capture_exit` | `Ctrl+Space` | shortcut to release input capture (blank = on‑screen button only) |
 
-### Enabling HTTPS
+### HTTPS (on by default)
+
+The installer enables HTTPS (`tls = true`) and generates a **self‑signed** cert at `/etc/kvm/tls/`, so you
+reach the UI at **`https://<pi-ip>:8000/`** (accept the browser's self‑signed warning once). HTTPS is the
+default because browsers auto‑upgrade `http://` to `https://` (HTTPS‑First / a cached HSTS pin) and treat
+`http` vs `https` as different sites for cookies (*schemeful same‑site*) — over plain HTTP that breaks the
+session so login bounces back to the sign‑in page.
+
+Drop in your own cert/key any time (replace `/etc/kvm/tls/{cert,key}.pem`, keep them readable by group
+`diykvm`), then `sudo systemctl restart kvm-web`. To regenerate the self‑signed cert by hand:
 
 ```sh
 sudo openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-  -keyout /etc/kvm/tls/key.pem -out /etc/kvm/tls/cert.pem -subj "/CN=$(hostname)"
+  -keyout /etc/kvm/tls/key.pem -out /etc/kvm/tls/cert.pem \
+  -subj "/CN=$(hostname)" -addext "subjectAltName=DNS:$(hostname),IP:$(hostname -I | awk '{print $1}')"
 sudo chown root:diykvm /etc/kvm/tls/key.pem /etc/kvm/tls/cert.pem   # the web service (diykvm) must read them
 sudo chmod 640 /etc/kvm/tls/key.pem
-sudo sed -i 's/^tls = false/tls = true/' /etc/kvm/kvm.conf
 sudo systemctl restart kvm-web
 ```
+
+To run plain HTTP instead (e.g. behind a TLS‑terminating proxy), set `tls = false` in `/etc/kvm/kvm.conf`.
 
 ## EFI boot media
 
@@ -119,7 +131,7 @@ sudo systemctl restart kvm-web
 Agents authenticate with the API key (exchange credentials once):
 
 ```sh
-curl -s -X POST http://<pi>:8000/api/login -d username=admin -d password=PASS   # -> {"api_key": "..."}
+curl -sk -X POST https://<pi>:8000/api/login -d username=admin -d password=PASS  # -k: self-signed cert; -> {"api_key": "..."}
 ```
 
 Then send `X-API-Key: <key>` (HTTP) or `?token=<key>` (WebSocket). Full reference, with copy‑paste
@@ -127,7 +139,7 @@ examples for input, screen capture, the virtual drive and serial, is at **`/api-
 
 ## Security
 
-LAN‑only by design. Authentication (session cookie, `SameSite=strict`, or API key) is required for
+LAN‑only by design. Authentication (session cookie, `SameSite=lax`, or API key) is required for
 every endpoint; WebSockets and unsafe requests are **Origin‑checked** (blocks cross‑site hijacking);
 logins are **rate‑limited**; the serial console only opens **enumerated** ports; the video stream is
 proxied behind auth. The web app itself runs **unprivileged** (user `diykvm`) — only the two

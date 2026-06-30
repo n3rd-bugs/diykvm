@@ -59,6 +59,10 @@ WEB_PORT = int(_conf("web", "port", "8000"))
 TLS = _conf_bool("web", "tls", "false")
 TLS_CERT = _conf("web", "tls_cert", "/etc/kvm/tls/cert.pem")
 TLS_KEY = _conf("web", "tls_key", "/etc/kvm/tls/key.pem")
+# HTTPS is actually served only when TLS is on AND the cert+key exist (see __main__). Bind the cookie Secure
+# flag to that, not to the config flag alone: tls=true with a missing/failed cert serves plain HTTP, and a
+# Secure cookie over HTTP is dropped by the browser -> login bounces back forever.
+TLS_ACTIVE = TLS and os.path.exists(TLS_CERT) and os.path.exists(TLS_KEY)
 USTREAMER = "http://%s:%s" % (_conf("video", "ustreamer_host", "127.0.0.1"),
                               _conf("video", "ustreamer_port", "8080"))
 MSD_IMAGE = _conf("usb", "image_path", "/opt/kvm/images/drive.img")
@@ -68,7 +72,7 @@ EXTRA_ORIGINS = {o.strip() for o in _conf("web", "allowed_origins", "").split(",
 cfg = auth.load_config()
 app = FastAPI(title="DIY PiKVM")
 app.add_middleware(SessionMiddleware, secret_key=cfg["secret_key"], max_age=86400,
-                   same_site="strict", https_only=TLS)
+                   same_site="lax", https_only=TLS_ACTIVE)
 hid = HIDController()
 msd = MSD(image=MSD_IMAGE)
 power = PowerController()
@@ -1075,7 +1079,9 @@ if __name__ == "__main__":
     import uvicorn
     # Bound graceful shutdown so a restart doesn't hang waiting on an open WebSocket (input/serial); after
     # this many seconds uvicorn force-closes connections. Clients just reconnect.
-    kw = dict(host=WEB_HOST, port=WEB_PORT, timeout_graceful_shutdown=5)
-    if TLS and os.path.exists(TLS_CERT) and os.path.exists(TLS_KEY):
+    # access_log=False: WS endpoints take the API key as ?token=..., which uvicorn's access log would write
+    # to journald in cleartext. Auth failures/HTTP errors still surface via app logging.
+    kw = dict(host=WEB_HOST, port=WEB_PORT, timeout_graceful_shutdown=5, access_log=False)
+    if TLS_ACTIVE:
         kw["ssl_certfile"], kw["ssl_keyfile"] = TLS_CERT, TLS_KEY
     uvicorn.run(app, **kw)
