@@ -40,6 +40,10 @@ single‑page web UI plus an HTTP/WebSocket API.
 - **Screen OCR** — read the target's screen as structured JSON (`GET /api/ocr`): text **line‑by‑line** and
   grouped into **layout blocks**, each with a bounding box and confidence. Local (Tesseract), on‑demand —
   handy for scripting and agents.
+- **Event stream** — a WebSocket (`/ws/events`) and snapshot (`GET /api/events/state`) that report device
+  state in real time: **USB‑gadget state** (whether the target has the gadget *configured* vs *not attached* —
+  so tooling sees the target lose/regain the keyboard, mouse, drive and COM port), HID open, serial
+  ports/reconnects, and re‑enumerate actions. Fold the stream into a live state object — no polling.
 - **Auth** — login (session cookie) for humans, API key for agents/automation.
 - **Agent API** — a machine-readable endpoint list at `/api` (JSON, public for discovery) plus a human
   guide at `/api-guide`; drive everything programmatically.

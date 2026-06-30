@@ -32,6 +32,7 @@ from power import PowerController, PowerError
 from kvmswitch import KvmSwitch, SwitchError
 from serialbridge import list_serial_ports, COMMON_BAUDS
 from serialport import SerialManager, SerialError, FLOW_MODES
+from events import EventBus
 import ocr
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -79,6 +80,7 @@ _hid_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hid")
 # One owner per serial device: drains continuously into a ring buffer and fans out to many WS clients.
 SERIAL = SerialManager(_serial_pool)
 _ocr_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ocr")   # OCR is CPU-heavy; keep it off-loop
+EVENTS = EventBus()                  # state-change events fanned out to /ws/events subscribers
 
 
 # ----------------------------- origin / auth -----------------------------
@@ -270,6 +272,10 @@ API_INFO = {
                  "reconnecting doesn't duplicate), then streams live. Serial RX arrives as WebSocket BINARY "
                  "frames (raw bytes); transmit BINARY frames (verbatim) or TEXT frames (UTF-8). Status lines "
                  "are TEXT frames. Disconnecting leaves the port open; release it with POST /api/serial/close."},
+        {"method": "GET", "path": "/api/events/state", "auth": True,
+         "desc": "Point-in-time state snapshot: {usb:{udc,bound,state}, hid:{keyboard,mouse}, serial:[...], msd, power, kvmswitch}."},
+        {"method": "WS", "path": "/ws/events", "auth": True, "query": "replay (0-256), token",
+         "desc": "Live state-event stream as JSON (one event per message). On connect: {type:'snapshot',...} with full state, then events {seq,ts,type,...}: 'usb' (gadget/target enumeration -- state 'configured'/'not attached', so tooling sees the target losing/regaining HID), 'hid' (keyboard/mouse device open), 'serial' (ports: open/clients/reconnects), 'reenumerate'. ?replay=N replays the last N events from before connecting."},
         {"method": "GET", "path": "/api/power/state", "auth": True, "desc": "Per-target power relay state: {targets:[{label, on}]}."},
         {"method": "POST", "path": "/api/power", "auth": True, "body": "{index, on}", "desc": "Connect (on=true) or cut (on=false) a target's power (latched relay)."},
         {"method": "GET", "path": "/api/kvmswitch/state", "auth": True, "desc": "External KVM-switch buttons: {ports:[{label}]}."},
@@ -632,9 +638,143 @@ def serial_reenumerate(_: bool = Depends(require_auth)):
         hid_ok = hid.reopen()
         if not hid_ok:
             print("[reenumerate] HID re-open incomplete; will recover on next input", flush=True)
+        EVENTS.publish("reenumerate", ok=True, hid_reopened=hid_ok, detail=(r.stdout or "").strip())
         return {"reenumerated": True, "hid_reopened": hid_ok, "detail": (r.stdout or "").strip()}
     finally:
         _reenum_lock.release()
+
+
+# ----------------------------- events (state stream) -----------------------------
+_UDC_DIR = "/sys/class/udc"
+_GADGET_UDC = "/sys/kernel/config/usb_gadget/kvm/UDC"
+_events_poller_task = None
+
+
+def _usb_state():
+    """Gadget/USB state from the kernel: which UDC the gadget is bound to, and the controller's USB state
+    -- 'configured' once the target has enumerated the gadget, 'not attached' when the target is gone or has
+    no USB/HID driver (e.g. a dead OS), etc. This is the signal that exposes the target re-enumerating or
+    losing the gadget (HID/serial go dead while it is not 'configured')."""
+    try:
+        with open(_GADGET_UDC) as f:
+            udc = f.read().strip()
+    except OSError:
+        udc = ""
+    state = "unbound"
+    if udc:
+        try:
+            with open("%s/%s/state" % (_UDC_DIR, udc)) as f:
+                state = f.read().strip()
+        except OSError:
+            state = "unknown"
+    return {"udc": udc or None, "bound": bool(udc), "state": state}
+
+
+def _hid_state():
+    return hid.devices_open()
+
+
+def _events_snapshot():
+    """A full point-in-time state snapshot -- the same shape a client can build by folding the event stream."""
+    snap = {"usb": _usb_state(), "hid": _hid_state(), "serial": SERIAL.status()}
+    for key, fn in (("msd", msd.status), ("power", power.status), ("kvmswitch", kvmswitch.status)):
+        try:
+            snap[key] = fn()
+        except Exception:
+            pass
+    return snap
+
+
+def _serial_key(ports):
+    # Diff serial on the stable fields, ignoring the ever-changing 'buffered' byte count (data flowing would
+    # otherwise emit an event every poll). open/clients/reconnects/reconnecting/error DO signal real changes.
+    return [{k: p.get(k) for k in ("device", "baud", "flow", "open", "clients",
+                                   "reconnect", "reconnects", "reconnecting", "error")} for p in ports]
+
+
+async def _events_poller():
+    """Publish an event per domain that changed. Catches state that changes WITHOUT an API call -- the target
+    enumerating/dropping the gadget (usb), HID re-opening, serial reconnects -- so /ws/events reflects
+    reality, not just operator actions."""
+    last = {}
+    errs = 0
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            usb = _usb_state()
+            if usb != last.get("usb"):
+                prev = (last.get("usb") or {}).get("state")
+                EVENTS.publish("usb", **usb); last["usb"] = usb
+                # When the target (re)configures the gadget (a fresh enumeration, e.g. it just booted an
+                # OS/BIOS with HID), reopen HID so the keyboard/mouse come back immediately instead of
+                # dropping the first keystroke. Only on the transition -- no churn if it stays unopenable.
+                if usb.get("state") == "configured" and prev != "configured" and not hid.is_open():
+                    await loop.run_in_executor(_hid_pool, lambda: hid.reopen(retries=4, delay=0.2))
+            h = _hid_state()
+            if h != last.get("hid"):
+                EVENTS.publish("hid", **h); last["hid"] = h
+            ports = SERIAL.status()
+            key = _serial_key(ports)
+            if key != last.get("serial"):
+                EVENTS.publish("serial", ports=ports); last["serial"] = key
+            errs = 0
+        except Exception as e:
+            errs += 1
+            if errs == 1 or errs % 120 == 0:     # log the first error + occasionally; don't flood a wedged poll
+                print("[events] poller error: %r" % (e,), flush=True)
+        await asyncio.sleep(0.5)
+
+
+@app.get("/api/events/state")
+def events_state(_: bool = Depends(require_auth)):
+    """Point-in-time snapshot of all tracked state (USB/gadget, HID, serial, drive, power, switch)."""
+    return _events_snapshot()
+
+
+@app.websocket("/ws/events")
+async def ws_events(sock: WebSocket):
+    """Stream state-change events as JSON. On connect: a {type:'snapshot', ...} with full current state,
+    then live events -- usb (gadget/target enumeration), hid (keyboard/mouse open), serial (ports,
+    reconnects), reenumerate, and operator actions. ?replay=N replays up to N events from just before
+    connecting. Auth via ?token=<API key> (or session cookie)."""
+    if not ws_authed(sock):
+        await sock.close(code=1008)
+        return
+    await sock.accept()
+    try:
+        replay = max(0, min(256, int(sock.query_params.get("replay", "0"))))
+    except (TypeError, ValueError):
+        replay = 0
+    q, recent = EVENTS.subscribe(replay=replay)
+    loop = asyncio.get_event_loop()
+
+    async def send_loop():
+        # Build the snapshot OFF the loop: power.status()/msd.status() fork subprocesses / hit the fs and
+        # would otherwise freeze the whole event loop (and every other client + input) on each connect.
+        snap = await loop.run_in_executor(None, _events_snapshot)
+        await sock.send_json({"seq": EVENTS.seq, "ts": round(time.time(), 3), "type": "snapshot", **snap})
+        for ev in recent:
+            await sock.send_json(ev)
+        while True:
+            await sock.send_json(await q.get())
+
+    async def recv_drain():            # clients aren't expected to send; this just detects a disconnect
+        while True:
+            await sock.receive_text()
+
+    st = asyncio.create_task(send_loop())
+    rt = asyncio.create_task(recv_drain())
+    try:
+        await asyncio.wait({st, rt}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for t in (st, rt):
+            t.cancel()
+        for t in (st, rt):           # await the cancellations so exceptions aren't left unretrieved
+            try:
+                await t
+            except Exception:
+                pass
+        EVENTS.unsubscribe(q)
 
 
 @app.websocket("/ws/serial")
@@ -763,15 +903,19 @@ async def _serial_autostart():
 
 @app.on_event("startup")
 async def _serial_startup():
-    global _serial_autostart_task
+    global _serial_autostart_task, _events_poller_task
+    EVENTS.bind(asyncio.get_event_loop())     # let publish() be safe from worker threads (sync routes)
     if _autostart_devices():
         _serial_autostart_task = asyncio.create_task(_serial_autostart())
+    _events_poller_task = asyncio.create_task(_events_poller())
 
 
 @app.on_event("shutdown")
 async def _serial_shutdown():
     if _serial_autostart_task:
         _serial_autostart_task.cancel()
+    if _events_poller_task:
+        _events_poller_task.cancel()
     await SERIAL.close_all()
 
 

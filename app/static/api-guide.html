@@ -157,7 +157,48 @@ async def console(pi, key, dev):
             else: print("[status]", msg)               # text frame = status/info
 asyncio.run(console("192.168.1.120","&lt;KEY&gt;","/dev/ttyUSB0"))</code></pre>
 
-<h2>6. Power, KVM switch &amp; configuration <span class="pill">/api/power</span> <span class="pill">/api/kvmswitch</span> <span class="pill">/api/config</span></h2>
+<h2>6. Events / state stream <span class="pill">WS /ws/events</span> <span class="pill">GET /api/events/state</span></h2>
+<p>Track device state in real time without polling each API. <code>GET /api/events/state</code> returns a full
+snapshot; <code>WS /ws/events</code> streams it live: on connect it sends one <code>{type:"snapshot",…}</code>
+with the full state, then one message per change. Every event is a flat JSON object
+<code>{seq, ts, type, …}</code>. <code>?replay=N</code> also replays the last N events from just before you
+connected.</p>
+<table>
+<tr><th>type</th><th>fields / meaning</th></tr>
+<tr><td><code>snapshot</code></td><td>full state <code>{usb, hid, serial, msd, power, kvmswitch}</code> (sent once, on connect)</td></tr>
+<tr><td><code>usb</code></td><td><code>{udc, bound, state}</code> — the gadget/USB state. <code>state</code> is <code>configured</code> once the target has enumerated the gadget, <code>not attached</code> when the target is gone or has no USB/HID driver (e.g. a dead OS), <code>unbound</code> while re-enumerating. <b>This is how tooling sees the target lose/regain the keyboard, mouse, drive and COM port.</b></td></tr>
+<tr><td><code>hid</code></td><td><code>{keyboard, mouse}</code> — whether the Pi currently has each HID device open (i.e. input can reach the target)</td></tr>
+<tr><td><code>serial</code></td><td><code>{ports:[{device, open, clients, reconnect, reconnects, reconnecting, error, …}]}</code>; <code>reconnects</code> ticks each time a port self-heals after the target re-enumerated its COM</td></tr>
+<tr><td><code>reenumerate</code></td><td><code>{ok, hid_reopened, detail}</code> — emitted when someone calls <code>POST /api/serial/reenumerate</code></td></tr>
+</table>
+<p>Browser — fold the stream into a live state object:</p>
+<pre><code>const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';        // match how the page was served
+const ws = new WebSocket(`${proto}${location.host}/ws/events?token=${KEY}`);  // browsers may also use the session cookie
+const state = {};
+ws.onmessage = (e) =&gt; {
+  const ev = JSON.parse(e.data);
+  if (ev.type === "snapshot") Object.assign(state, ev);
+  else state[ev.type] = ev;                         // newest event per domain = current state
+  if (ev.type === "usb") console.log("target USB:", ev.state);          // configured / not attached / unbound
+  if (ev.type === "hid") console.log("HID kbd:", ev.keyboard, "mouse:", ev.mouse);
+};</code></pre>
+<p>Python — collect state and react (e.g. wait until the target actually has the keyboard):</p>
+<pre><code>import asyncio, json, ssl, websockets        # pip install websockets
+async def watch(host, key):
+    # HTTPS deployment: wss:// + a TLS context (self-signed -> no verify). Plain HTTP: use ws:// and ssl=None.
+    ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+    state = {}
+    async with websockets.connect(f"wss://{host}:8000/ws/events?token={key}", ssl=ctx) as ws:
+        async for msg in ws:
+            ev = json.loads(msg)
+            if ev["type"] == "snapshot": state.update(ev)
+            else: state[ev["type"]] = ev
+            if ev["type"] == "usb":
+                print("target USB:", ev["state"], "| HID open:", state.get("hid"))
+asyncio.run(watch("192.168.1.120", "&lt;KEY&gt;"))</code></pre>
+<p class="muted">One-shot snapshot without a socket: <code>curl -s -H "X-API-Key: &lt;KEY&gt;" https://&lt;pi&gt;:8000/api/events/state</code>.</p>
+
+<h2>7. Power, KVM switch &amp; configuration <span class="pill">/api/power</span> <span class="pill">/api/kvmswitch</span> <span class="pill">/api/config</span></h2>
 <p>Configure the GPIO targets on the <code>/config</code> page first. <b>Target power</b> — each target's
 GPIO drives a relay that connects or cuts its power (latched on/off):</p>
 <table>
@@ -183,7 +224,7 @@ curl -s -X POST -H "X-API-Key: &lt;KEY&gt;" -H "Content-Type: application/json" 
 curl -s -X POST -H "X-API-Key: &lt;KEY&gt;" -H "Content-Type: application/json" \
      -d '{"index":0}' http://&lt;pi&gt;:8000/api/kvmswitch</code></pre>
 
-<h2>7. Notes</h2>
+<h2>8. Notes</h2>
 <ul>
 <li>The mouse maps to the target's <b>primary</b> display (absolute) — use relative <code>mr</code> for multi-monitor targets.</li>
 <li>The emulated keyboard is a USB <b>boot keyboard</b>, so it works in the target's <b>BIOS/UEFI</b> setup and boot menus — not just the running OS.</li>

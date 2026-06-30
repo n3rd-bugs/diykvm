@@ -160,6 +160,15 @@ class HIDController:
         self._write("mouse", self._rel_report(wheel=dy))
         self._write("mouse", self._rel_report(wheel=0))   # auto-release the wheel axis
 
+    # ---- state (lock-guarded; safe to call from the event loop while the pool thread writes) ----
+    def is_open(self) -> bool:
+        with self._lock:
+            return self._fds["kbd"] is not None and self._fds["mouse"] is not None
+
+    def devices_open(self) -> dict:
+        with self._lock:
+            return {"keyboard": self._fds["kbd"] is not None, "mouse": self._fds["mouse"] is not None}
+
     # ---- safety ----
     def release_all(self):
         self._mods = 0
