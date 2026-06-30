@@ -48,5 +48,11 @@ install -m0644 "$PKG/files/etc/kvm/kvm.conf" "$STAGE/etc/kvm/kvm.conf"
 install -m0440 "$PKG/files/etc/sudoers.d/diykvm" "$STAGE/etc/sudoers.d/diykvm"
 install -m0644 "$PKG/files/usr/share/doc/diykvm/copyright" "$STAGE/usr/share/doc/diykvm/copyright"
 
+# optional DKMS module: tunable gadget-serial RX/TX queue depth (postinst builds it best-effort)
+DKMSDIR="$PKG/files/usr/src/diykvm-userial-1.0"
+install -d "$STAGE/usr/src/diykvm-userial-1.0"
+install -m0644 "$DKMSDIR/dkms.conf" "$DKMSDIR/Makefile" "$DKMSDIR/patch_queue.py" "$STAGE/usr/src/diykvm-userial-1.0/"
+install -m0755 "$DKMSDIR/fetch-source.sh" "$STAGE/usr/src/diykvm-userial-1.0/"
+
 dpkg-deb --root-owner-group --build "$STAGE" "$OUT"
 echo "built: $OUT"

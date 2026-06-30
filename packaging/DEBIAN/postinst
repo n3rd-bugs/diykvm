@@ -58,7 +58,23 @@ case "$1" in
     # 5. virtual drive image
     /usr/local/sbin/kvm-mkimage || echo "diykvm: create the drive image later with: sudo kvm-mkimage"
 
-    # 6. services
+    # 6. optional: deeper gadget-serial RX/TX request queue (u_serial QUEUE_SIZE -> 256) via DKMS, so a
+    #    bursty bulk-OUT from the target doesn't NAK-stall. Best-effort: needs dkms + matching kernel headers
+    #    + curl (fetches the u_serial source for this kernel). If anything is missing or the build fails, the
+    #    stock u_serial is used -- serial still works, just at the default depth (16). Effective after reboot.
+    if command -v dkms >/dev/null 2>&1 && [ -e "/lib/modules/$(uname -r)/build/Makefile" ]; then
+      dkms add -m diykvm-userial -v 1.0 >/dev/null 2>&1 || true
+      if dkms build -m diykvm-userial -v 1.0 >/dev/null 2>&1 \
+         && dkms install --force -m diykvm-userial -v 1.0 >/dev/null 2>&1; then
+        echo "diykvm: gadget-serial queue module built (queue_size=256; effective after reboot)"
+      else
+        echo "diykvm: gadget-serial queue module not built (needs internet + linux-headers-$(uname -r)); serial uses the stock depth" >&2
+      fi
+    else
+      echo "diykvm: install 'dkms' + linux-headers to enable the deeper gadget-serial queue; serial uses the stock depth" >&2
+    fi
+
+    # 7. services
     udevadm control --reload-rules >/dev/null 2>&1 || true
     systemctl daemon-reload
     systemctl enable kvm-gadget.service ustreamer.service kvm-web.service >/dev/null 2>&1 || true

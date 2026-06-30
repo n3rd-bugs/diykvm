@@ -3,6 +3,10 @@ set -e
 case "$1" in
   remove|deconfigure)
     systemctl disable --now kvm-web.service ustreamer.service kvm-gadget.service >/dev/null 2>&1 || true
+    # restore the stock u_serial (DKMS removes our updates/dkms override). Only on real removal, not upgrade.
+    if [ "$1" = remove ] && command -v dkms >/dev/null 2>&1; then
+      dkms remove -m diykvm-userial -v 1.0 --all >/dev/null 2>&1 || true
+    fi
     ;;
 esac
 exit 0
