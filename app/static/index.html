@@ -232,6 +232,7 @@
       <label class="chk" title="assert DTR for read/write"><input type="checkbox" id="serdtr" checked> DTR</label>
       <button id="serconn">Connect</button>
       <button id="serclose" title="close the port and stop buffering">Close port</button>
+      <button id="serreenum" title="re-enumerate the USB gadget so the target re-detects a fresh COM port (also briefly re-creates keyboard/mouse/drive)">Re-enumerate</button>
       <button id="serrefresh" title="rescan ports">↻</button>
       <label class="chk"><input type="checkbox" id="serraw"> raw keys</label>
       <button id="serclear">Clear</button>
@@ -816,6 +817,13 @@ document.getElementById('serclose').onclick = async () => {
   try { await api('/api/serial/close', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({device:dev})});
         serstatus.textContent='port closed (buffering stopped)'; }
   catch(e){ serstatus.textContent=e.message; }
+};
+document.getElementById('serreenum').onclick = async () => {
+  if(!confirm('Re-enumerate the USB gadget to the target?\n\nThe target re-detects a fresh COM port — and, because USB enumerates per device, the keyboard, mouse and virtual drive briefly re-appear too (~1s).')) return;
+  serstatus.textContent='re-enumerating…';
+  try { const r = await api('/api/serial/reenumerate', {method:'POST'});
+        serstatus.textContent = 're-enumerated' + (r && r.detail ? (' ('+r.detail+')') : ''); }
+  catch(e){ serstatus.textContent = e.message; }
 };
 function serAppend(t){ serout.textContent += t; serout.scrollTop = serout.scrollHeight;
   if(serout.textContent.length>200000) serout.textContent = serout.textContent.slice(-150000); }

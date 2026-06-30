@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Privileged USB-gadget helper for diykvm.
+
+The web app runs unprivileged and cannot touch the configfs gadget (root-owned). This helper performs the
+one fixed privileged gadget action the app exposes on request: re-enumerate the composite USB gadget by
+unbinding and re-binding its UDC, so the target re-detects the device. Because USB enumerates per DEVICE
+(not per function), this presents a fresh CDC-ACM COM port AND briefly re-creates the keyboard, mouse and
+mass-storage interface. The Pi-side /dev/ttyGS0 and /dev/hidg* get their group permissions back from udev
+on re-creation, and an open serial port self-heals via the web app's reconnect logic.
+
+    sudo kvm-gadget-helper reenumerate   # unbind + re-bind the UDC (re-enumerate the device to the target)
+    sudo kvm-gadget-helper status        # report gadget presence + current/available UDC (no change)
+
+It takes no other arguments and performs no other action. Because this briefly drops ALL USB on a live
+target, it is made as crash-safe as possible:
+  * single-flight -- an flock means two re-enumerates can never interleave on the UDC (a second caller is
+    rejected with exit code 3, not queued, so the unbound window is never compounded);
+  * the re-bind is retried and treats an already-effective bind (EBUSY) as success; and
+  * if a direct re-bind still fails it rebuilds the whole gadget via systemctl, checks the result, and
+    binds the rebuilt gadget itself if needed -- so the target is never silently left without USB.
+"""
+import errno
+import fcntl
+import os
+import subprocess
+import sys
+import time
+
+G = "/sys/kernel/config/usb_gadget/kvm"
+UDC_FILE = os.path.join(G, "UDC")
+UDC_DIR = "/sys/class/udc"
+LOCK = "/run/kvm/gadget.lock"
+SYSTEMCTL = "/bin/systemctl" if os.path.exists("/bin/systemctl") else "/usr/bin/systemctl"
+EXIT_BUSY = 3          # another re-enumerate is already running (the endpoint maps this to HTTP 409)
+
+
+def die(msg):
+    sys.stderr.write("kvm-gadget-helper: " + msg + "\n")
+    sys.exit(1)
+
+
+def available_udcs():
+    try:
+        return sorted(os.listdir(UDC_DIR))
+    except OSError:
+        return []
+
+
+def current_udc():
+    try:
+        with open(UDC_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _write_udc(value):
+    with open(UDC_FILE, "w") as f:
+        f.write(value + "\n")
+
+
+def status():
+    present = os.path.isdir(G)
+    print("gadget=%s udc=%s available=%s" % (
+        "present" if present else "absent",
+        current_udc() or "-", ",".join(available_udcs()) or "-"))
+    sys.exit(0 if present else 1)
+
+
+def _rebind(udc):
+    """(Re-)bind the gadget to udc, treating an already-effective bind as success (a configfs UDC write can
+    return EBUSY while the previous binding releases, even though the bind ultimately lands). Returns the
+    last OSError if every attempt failed, else None."""
+    last = None
+    for _ in range(12):
+        if current_udc() == udc:
+            return None                    # the bind already took effect
+        try:
+            _write_udc(udc)
+            return None
+        except OSError as e:
+            last = e
+            if current_udc() == udc:       # EBUSY but the write actually landed -> success
+                return None
+            time.sleep(0.3)
+    return last
+
+
+def _do_reenumerate():
+    if not os.path.isdir(G) or not os.path.exists(UDC_FILE):
+        die("gadget not present (%s) -- is kvm-gadget running?" % G)
+    bound = current_udc()
+    udc = bound or (available_udcs()[0] if available_udcs() else "")
+    if not udc:
+        die("no UDC available (is dwc2 in peripheral mode?)")
+    if bound:
+        try:
+            _write_udc("")                 # unbind: the target sees the whole device disconnect
+        except OSError as e:
+            die("unbind failed: %s" % e)
+        time.sleep(0.4)                    # let the host register the disconnect before re-binding
+    if _rebind(udc) is None:               # re-bind: the target re-enumerates (fresh COM + HID + storage)
+        print("reenumerated udc=%s" % udc)
+        return
+    # Direct re-bind failed -> rebuild the whole gadget so the target is never left without USB.
+    try:
+        r = subprocess.run([SYSTEMCTL, "restart", "kvm-gadget"], capture_output=True, text=True, timeout=40)
+    except (subprocess.TimeoutExpired, OSError):
+        r = None
+    # kvm-gadget-up.sh re-binds on its own; wait for it, and bind directly if it rebuilt but stayed unbound.
+    for _ in range(15):
+        if current_udc():
+            print("reenumerated via kvm-gadget restart")
+            return
+        if os.path.exists(UDC_FILE) and available_udcs():
+            try:
+                _write_udc(available_udcs()[0])
+            except OSError:
+                pass
+        time.sleep(0.3)
+    rc = "timeout" if r is None else r.returncode
+    err = "" if r is None else (r.stderr or "").strip()[:200]
+    die("re-bind failed and restart did not recover (rc=%s err=%r) -- gadget may be UNBOUND; "
+        "recover with: sudo systemctl restart kvm-gadget" % (rc, err))
+
+
+def reenumerate():
+    # Single-flight: two concurrent bounces would interleave on the UDC and lengthen the window in which the
+    # target has NO usb. Reject a second caller (exit 3) rather than queue it. The lock is held across the
+    # restart fallback too. /run/kvm is the service RuntimeDirectory (root-writable).
+    try:
+        os.makedirs("/run/kvm", exist_ok=True)
+    except OSError:
+        pass
+    try:
+        lockf = open(LOCK, "w")
+    except OSError as e:
+        die("cannot open lock %s: %s" % (LOCK, e))
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        if getattr(e, "errno", None) in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+            sys.stderr.write("kvm-gadget-helper: reenumerate already in progress\n")
+            sys.exit(EXIT_BUSY)
+        die("cannot lock %s: %s" % (LOCK, e))
+    try:
+        _do_reenumerate()
+    finally:
+        try:
+            fcntl.flock(lockf, fcntl.LOCK_UN)
+            lockf.close()
+        except OSError:
+            pass
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in ("reenumerate", "status"):
+        die("usage: kvm-gadget-helper {reenumerate|status}")
+    (status if sys.argv[1] == "status" else reenumerate)()
+
+
+if __name__ == "__main__":
+    main()

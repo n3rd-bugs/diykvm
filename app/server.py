@@ -14,6 +14,7 @@ import os
 import time
 import asyncio
 import subprocess
+import threading
 import configparser
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
@@ -38,6 +39,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # ----------------------------- config -----------------------------
 CONF_PATH = os.environ.get("KVM_CONF", "/etc/kvm/kvm.conf")
 CONF_HELPER = "/usr/local/sbin/kvm-conf-helper"
+GADGET_HELPER = "/usr/local/sbin/kvm-gadget-helper"
+_reenum_lock = threading.Lock()      # app-level single-flight for the gadget re-enumerate (it bounces all USB)
 _cp = configparser.ConfigParser()
 _cp.read(CONF_PATH)
 
@@ -259,6 +262,8 @@ API_INFO = {
         {"method": "POST", "path": "/api/serial/open", "auth": True, "body": "{device, baud, flow:none|rtscts|xonxoff, dtr, rts, reconnect, reopen}",
          "desc": "Open a port (raw, 8N1, echo off, DTR asserted) and keep it draining even with no client (bytes held as a backlog while detached). reconnect=true auto-reopens it if the target disconnects/re-enumerates. Idempotent."},
         {"method": "POST", "path": "/api/serial/close", "auth": True, "body": "{device}", "desc": "Close a serial port and stop buffering."},
+        {"method": "POST", "path": "/api/serial/reenumerate", "auth": True,
+         "desc": "Re-enumerate the USB gadget (unbind + re-bind its UDC) so the target re-detects the device and gets a fresh CDC-ACM COM port. Lets the other end request a fresh port on demand. Because USB enumerates per device, the keyboard, mouse and mass-storage interface also briefly re-appear (~1s); an open Pi-side serial port self-heals."},
         {"method": "WS", "path": "/ws/serial", "auth": True, "query": "device, baud, flow, dtr, rts, reconnect, token",
          "desc": "Serial console, binary-clean. Subscribes to the shared port (auto-opens it with the given "
                  "settings if needed), replays the backlog accumulated while detached (then dropped, so "
@@ -603,6 +608,30 @@ async def serial_close(payload: dict = Body(default={}), _: bool = Depends(requi
     return {"device": device, "closed": await SERIAL.close(device)}
 
 
+@app.post("/api/serial/reenumerate")
+def serial_reenumerate(_: bool = Depends(require_auth)):
+    """Let the other end request a fresh COM port: re-enumerate the USB gadget (unbind + re-bind its UDC)
+    so the target re-detects the device. Because USB enumerates per device, this also briefly re-creates
+    the keyboard, mouse and mass-storage interface. A Pi-side serial port that is open self-heals if its
+    [serial] reconnect is on. Sync route: FastAPI runs it in a worker thread, off the event loop.
+    Single-flight (it bounces ALL USB): overlapping requests get 409, not a second, compounding bounce."""
+    if not _reenum_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="a re-enumerate is already in progress")
+    try:
+        try:
+            r = subprocess.run(["sudo", "-n", GADGET_HELPER, "reenumerate"],
+                               capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            raise HTTPException(status_code=502, detail="reenumerate timed out")
+        if r.returncode == 3:               # helper's own flock: another bounce is mid-flight
+            raise HTTPException(status_code=409, detail="a re-enumerate is already in progress")
+        if r.returncode != 0:
+            raise HTTPException(status_code=502, detail=(r.stderr or r.stdout or "reenumerate failed").strip())
+        return {"reenumerated": True, "detail": (r.stdout or "").strip()}
+    finally:
+        _reenum_lock.release()
+
+
 @app.websocket("/ws/serial")
 async def ws_serial(sock: WebSocket):
     if not ws_authed(sock):
@@ -704,9 +733,9 @@ _serial_autostart_task = None
 
 
 def _autostart_devices():
-    # Default to the gadget COM port so its RX is never dropped whenever usb_serial is on (harmless when
-    # /dev/ttyGS0 is absent -- the loop just skips it). Set [serial] autostart = "" to disable.
-    return [d.strip() for d in _conf("serial", "autostart", "/dev/ttyGS0").split(",") if d.strip()]
+    # Default OFF: the Pi does not auto-open any port. The other end requests it via POST /api/serial/open
+    # (or the operator via the UI). List ports in [serial] autostart only to have the Pi grab them on boot.
+    return [d.strip() for d in _conf("serial", "autostart", "").split(",") if d.strip()]
 
 
 async def _serial_autostart():
@@ -808,7 +837,7 @@ CONFIG_FIELDS = [
      "fields": [
          {"key": "default_baud", "label": "Default baud", "type": "number", "default": "115200"},
          {"key": "default_flow", "label": "Default flow control (none / rtscts / xonxoff)", "type": "text", "default": "none"},
-         {"key": "autostart", "label": "Always-drain ports (comma-separated, e.g. /dev/ttyGS0) — kept open & buffered so data is never dropped; blank to disable", "type": "text", "default": "/dev/ttyGS0"},
+         {"key": "autostart", "label": "Auto-open & drain these ports from boot (comma-separated, e.g. /dev/ttyGS0); blank (default) leaves the gadget COM closed until the other end opens it via /api/serial/open", "type": "text", "default": ""},
          {"key": "reconnect", "label": "Auto-reopen a port if it disconnects (survive the target re-enumerating; no console churn)", "type": "bool", "default": "true"},
      ]},
     {"section": "power", "title": "Target power (GPIO relays)",

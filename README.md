@@ -25,7 +25,8 @@ single‑page web UI plus an HTTP/WebSocket API.
 - **Serial console** — talk to a serial port from the browser (line or raw‑key mode); **binary‑clean**
   end to end. Selectable **flow control** (RTS/CTS or XON/XOFF) and DTR; the port is **buffered** server‑side
   while detached (replayed once on reconnect, then dropped — no duplication), with multiple simultaneous
-  viewers and explicit open/close. Use a
+  viewers and explicit open/close. The **other end drives it over the API** — request **open** on demand, or
+  **re‑enumerate** the USB to hand the target a fresh COM port (`POST /api/serial/reenumerate`). Use a
   USB/RS‑232 adapter, **or** have the Pi present its **own USB serial (CDC‑ACM) COM port** to the target over
   the same cable — no extra wiring.
 - **Target power** — connect or cut power to two or more targets from the browser, each via a Raspberry
@@ -58,7 +59,7 @@ Install the Debian package on Raspberry Pi OS (Bookworm, **64‑bit** — the OC
 prebuilt 32‑bit/armhf wheel, so a 32‑bit OS would need build tools to compile it):
 
 ```sh
-sudo apt install ./diykvm_0.5.0_all.deb
+sudo apt install ./diykvm_0.6.0_all.deb
 sudo reboot            # first install enables USB gadget mode (dtoverlay=dwc2,dr_mode=peripheral)
 ```
 
@@ -87,7 +88,7 @@ sudo systemctl restart kvm-web ustreamer kvm-gadget
 | `video` | `device`, `resolution`, `fps` | `/dev/video0`, `1920x1080`, `30` | capture + stream |
 | `usb` | `image_path`, `image_size` | `/opt/kvm/images/drive.img`, `1G` | virtual drive |
 | `usb` | `usb_serial` | `false` | also present a USB serial (CDC‑ACM) COM port to the target (Pi side `/dev/ttyGS0`) |
-| `serial` | `default_baud`, `default_flow`, `autostart`, `reconnect` | `115200`, `none`, `/dev/ttyGS0`, `true` | serial console: UI defaults (flow; raw/8N1/DTR/buffered) + `autostart` ports drained from boot (no drops) + `reconnect` auto‑reopens a dropped port (survives the target re‑enumerating, no console churn) |
+| `serial` | `default_baud`, `default_flow`, `autostart`, `reconnect` | `115200`, `none`, _(blank)_, `true` | serial console: UI defaults (flow; raw/8N1/DTR/buffered); `autostart` auto‑opens listed ports from boot (blank = the other end opens on demand via `POST /api/serial/open`); `reconnect` auto‑reopens a dropped port. `POST /api/serial/reenumerate` re‑enumerates the gadget so the target gets a fresh COM port |
 | `ui` | `capture_exit` | `Ctrl+Space` | shortcut to release input capture (blank = on‑screen button only) |
 
 ### Enabling HTTPS

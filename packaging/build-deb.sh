@@ -38,7 +38,8 @@ install -m0755 "$PKG/files/usr/local/sbin/kvm-conf-get" \
                "$PKG/files/usr/local/sbin/kvm-conf-helper" \
                "$PKG/files/usr/local/sbin/kvm-ustreamer" \
                "$PKG/files/usr/local/sbin/kvm-mkimage" \
-               "$PKG/files/usr/local/sbin/kvm-msd-helper" "$STAGE/usr/local/sbin/"
+               "$PKG/files/usr/local/sbin/kvm-msd-helper" \
+               "$PKG/files/usr/local/sbin/kvm-gadget-helper" "$STAGE/usr/local/sbin/"
 
 # udev rules, default config, and the sudoers drop-in (0440) for the privileged helper
 install -m0644 "$PKG/files/lib/udev/rules.d/99-kvm-hidg.rules" \

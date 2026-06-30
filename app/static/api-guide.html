@@ -129,16 +129,19 @@ already saw. Ports open <b>raw, 8N1, echo off, DTR asserted</b>, with selectable
 after a client leaves (release with <code>/api/serial/close</code>). With <code>[serial] reconnect</code> on
 (default), a port that drops &mdash; e.g. the target <b>re-enumerates</b> its COM port over and over &mdash;
 <b>silently re-opens</b> with backoff, keeping clients attached and the buffer intact, so the churn never
-reaches the console. Ports in <code>[serial] autostart</code>
-(default <code>/dev/ttyGS0</code>) are opened and drained automatically from boot — a socat-style persistent
-reader — so the target's output is captured even before anyone connects and is never dropped.</p>
+reaches the console. Control of the port is yours to drive over this API: by default <code>[serial]
+autostart</code> is <b>blank</b>, so the Pi does not open the gadget COM port on its own &mdash; the other end
+requests it with <code>POST /api/serial/open</code> when it wants the Pi to attach, and can present a
+<b>fresh COM port</b> at any time with <code>POST /api/serial/reenumerate</code>. (List a device in
+<code>[serial] autostart</code> instead if you want the Pi to grab and drain it from boot, socat-style.)</p>
 <table>
 <tr><td><code>GET /api/serial/ports</code></td><td>list serial ports: <code>{ports:[{device,desc,hwid}]}</code>.
     Includes <code>/dev/ttyGS0</code> ("USB gadget serial") when the Pi presents a CDC-ACM COM port to the
     target (set <code>usb.usb_serial</code>).</td></tr>
 <tr><td><code>GET /api/serial/status</code></td><td>open ports + settings, buffered byte count and client count, plus the supported <code>flow_modes</code>.</td></tr>
-<tr><td><code>POST /api/serial/open</code></td><td><code>{device, baud, flow:none|rtscts|xonxoff, dtr, rts, reopen}</code> — open the port and keep it draining into the ring buffer even with no client. Idempotent.</td></tr>
+<tr><td><code>POST /api/serial/open</code></td><td><code>{device, baud, flow:none|rtscts|xonxoff, dtr, rts, reconnect, reopen}</code> — open the port and keep it draining into the ring buffer even with no client. Idempotent. This is how the other end requests the Pi attach when <code>autostart</code> is off.</td></tr>
 <tr><td><code>POST /api/serial/close</code></td><td><code>{device}</code> — close the port and stop buffering.</td></tr>
+<tr><td><code>POST /api/serial/reenumerate</code></td><td>re-enumerate the USB gadget (unbind + re-bind its UDC) so the target re-detects the device and gets a <b>fresh CDC-ACM COM port</b> on demand. Because USB enumerates per device, the keyboard, mouse and mass-storage interface also briefly re-appear (~1&nbsp;s); an open Pi-side port self-heals.</td></tr>
 <tr><td><code>WS /ws/serial?device=/dev/ttyGS0&amp;baud=115200&amp;flow=none&amp;dtr=1&amp;token=&lt;KEY&gt;</code></td>
     <td><b>Binary-clean.</b> Subscribes to the port (auto-opens it with these settings if needed), replays the
     buffered scrollback, then streams live. RX arrives as WebSocket <b>BINARY</b> frames (raw bytes); transmit
