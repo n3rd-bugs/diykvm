@@ -290,7 +290,10 @@ function setCapture(on) {
   capBtn.classList.toggle('on', on);
   if (on) lockKbd(); else unlockKbd();
 }
-document.addEventListener('fullscreenchange', () => { if (capturing && document.fullscreenElement) lockKbd(); });
+// Fullscreen means "drive the target": entering capture input (and keyboard-lock so Esc/Tab/F-keys reach
+// the target instead of the browser) so keys forward immediately; leaving releases, so the operator's local
+// keyboard comes back. Covers every entry path (the Fullscreen button, F11, the OS).
+document.addEventListener('fullscreenchange', () => { setCapture(!!document.fullscreenElement); });
 capBtn.onclick = () => setCapture(!capturing);
 
 // ---- release-capture shortcut (configurable on the Config page; default Ctrl+Space) ----
@@ -320,7 +323,7 @@ function comboLabel() {
 }
 function updateHint() {
   const h = document.getElementById('hint');
-  if (h) h.textContent = 'Click the screen to capture keyboard & mouse · ' + comboLabel() + ' or the button to release';
+  if (h) h.textContent = 'Click the screen or go Fullscreen to capture keyboard & mouse · ' + comboLabel() + ' or the button to release';
 }
 updateHint();
 (async () => {
