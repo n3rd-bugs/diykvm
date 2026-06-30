@@ -52,6 +52,7 @@ class _Port:
         self.error = None
         self.reconnects = 0           # how many times we silently re-opened after a disconnect
         self._reconnecting = False    # currently in the re-open backoff loop (port temporarily down)
+        self._reopen_req = False      # external request to re-open (e.g. the USB host re-configured the gadget)
         # Serialize the handle-destroying ops (close / re-open swap) against an in-flight write() so we never
         # close or swap the pyserial fd from the loop thread while a pool thread is using it. Concurrent
         # read+write is safe (independent directions), so reads are NOT gated on this lock; read-vs-close is
@@ -94,6 +95,10 @@ class _Port:
     async def _drain(self):
         try:
             while not self._stop.is_set():
+                if self._reopen_req:                   # forced re-open: the USB host just (re)configured us.
+                    self._reopen_req = False            # close+reopen so the TX/write path binds to the live
+                    await self._reopen(reason="host reconfigured")   # host -- needed on the FIRST enumeration
+                    continue                            # (an open-before-configure leaves TX unbound)
                 try:
                     data = await self._loop.run_in_executor(self._pool, self.ser.read, 4096)
                 except Exception as e:                 # target re-enumerated / unplugged / read error
@@ -125,10 +130,10 @@ class _Port:
                 except asyncio.QueueFull:
                     pass
 
-    async def _reopen(self):
-        """Re-open the device after a disconnect, retrying with backoff until it works or we're stopped.
-        Subscribers stay attached and the buffer is preserved, so the target's re-enumeration is invisible
-        to them -- there is no per-flap disconnect/reconnect churn on the console."""
+    async def _reopen(self, reason="disconnect"):
+        """Re-open the device (after a disconnect, or when the USB host re-configured us), retrying with
+        backoff until it works or we're stopped. Subscribers stay attached and the buffer is preserved, so
+        the re-open is invisible to them -- no per-flap disconnect/reconnect churn on the console."""
         self._reconnecting = True
         async with self._iolock:                       # close the dead handle without racing a write()
             try:
@@ -152,7 +157,7 @@ class _Port:
             self.reconnects += 1
             self.error = None
             self._reconnecting = False
-            print("[serial] %s re-opened after disconnect (#%d)" % (self.device, self.reconnects), flush=True)
+            print("[serial] %s re-opened (%s, #%d)" % (self.device, reason, self.reconnects), flush=True)
             return
 
     @property
@@ -170,6 +175,12 @@ class _Port:
 
     def unsubscribe(self, q):
         self._subs.discard(q)
+
+    def request_reopen(self):
+        """Ask the drain to close+reopen the port at its next loop turn (within ~the read timeout). Used when
+        the USB host re-configures the gadget, so the TX/write path re-binds to the live host. Idempotent and
+        cheap; keeps subscribers + buffer."""
+        self._reopen_req = True
 
     async def write(self, data):
         async with self._iolock:                       # never write while close()/_reopen() is swapping the fd
@@ -192,17 +203,23 @@ class _Port:
                     pass
             except Exception:
                 pass
-        async with self._iolock:                       # serialize the final close vs any in-flight write()
-            try:
-                await self._loop.run_in_executor(self._pool, self.ser.close)
-            except Exception:
-                pass
+        # Bound the handle close: a wedged gadget-tty read (host gone / gadget mid-rebuild) can make
+        # ser.close() block, which would otherwise hang shutdown until systemd SIGKILLs the service. If it
+        # doesn't finish promptly, abandon the worker thread (we're tearing the port down anyway).
+        try:
+            await asyncio.wait_for(self._close_handle(), timeout=3.0)
+        except Exception:
+            pass
         if t is None:                                  # task never started: the drain's finally never ran
             for q in list(self._subs):
                 try:
                     q.put_nowait(None)
                 except asyncio.QueueFull:
                     pass
+
+    async def _close_handle(self):
+        async with self._iolock:                       # serialize the final close vs any in-flight write()
+            await self._loop.run_in_executor(self._pool, self.ser.close)
 
 
 class SerialManager:
@@ -254,6 +271,18 @@ class SerialManager:
                 "error": p.error,
             })
         return out
+
+    def reopen_gadget_ports(self):
+        """Force the Pi's own gadget COM port(s) (/dev/ttyGS*) to close+reopen, so their TX/write path binds
+        to a freshly-(re)configured USB host. Called on the target's USB 'configured' transition: a port that
+        was opened before the host configured the gadget never binds TX until it is reopened. Returns the
+        devices asked to reopen. USB/RS-232 adapters (ttyUSB*/ttyACM*) are unaffected, so they're left alone."""
+        done = []
+        for dev, p in list(self._ports.items()):
+            if dev.startswith("/dev/ttyGS") and p.alive:
+                p.request_reopen()
+                done.append(dev)
+        return done
 
     async def close_all(self):
         for dev in list(self._ports):

@@ -708,8 +708,13 @@ async def _events_poller():
                 # When the target (re)configures the gadget (a fresh enumeration, e.g. it just booted an
                 # OS/BIOS with HID), reopen HID so the keyboard/mouse come back immediately instead of
                 # dropping the first keystroke. Only on the transition -- no churn if it stays unopenable.
-                if usb.get("state") == "configured" and prev != "configured" and not hid.is_open():
-                    await loop.run_in_executor(_hid_pool, lambda: hid.reopen(retries=4, delay=0.2))
+                if usb.get("state") == "configured" and prev != "configured":
+                    # Target (re)configured the gadget. Rebind BOTH directions to the live host so a single
+                    # boot works (no re-enumeration needed): reopen HID if it isn't open, and reopen any open
+                    # /dev/ttyGS* so the serial TX/write path binds (an open-before-configure leaves TX dead).
+                    if not hid.is_open():
+                        await loop.run_in_executor(_hid_pool, lambda: hid.reopen(retries=4, delay=0.2))
+                    SERIAL.reopen_gadget_ports()
             h = _hid_state()
             if h != last.get("hid"):
                 EVENTS.publish("hid", **h); last["hid"] = h
