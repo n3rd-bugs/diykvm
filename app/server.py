@@ -627,7 +627,12 @@ def serial_reenumerate(_: bool = Depends(require_auth)):
             raise HTTPException(status_code=409, detail="a re-enumerate is already in progress")
         if r.returncode != 0:
             raise HTTPException(status_code=502, detail=(r.stderr or r.stdout or "reenumerate failed").strip())
-        return {"reenumerated": True, "detail": (r.stdout or "").strip()}
+        # The gadget was re-enumerated -> /dev/hidg* were recreated; reopen them now so the keyboard/mouse
+        # keep working instead of waiting for (and possibly dropping) the next input event.
+        hid_ok = hid.reopen()
+        if not hid_ok:
+            print("[reenumerate] HID re-open incomplete; will recover on next input", flush=True)
+        return {"reenumerated": True, "hid_reopened": hid_ok, "detail": (r.stdout or "").strip()}
     finally:
         _reenum_lock.release()
 

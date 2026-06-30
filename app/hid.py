@@ -8,6 +8,7 @@ Two gadget HID devices:
 """
 import os
 import threading
+import time
 
 HIDG_KBD = "/dev/hidg0"     # boot keyboard, 8-byte reports, no report id
 HIDG_MOUSE = "/dev/hidg1"   # mouse, report-id multiplexed
@@ -56,6 +57,11 @@ class HIDController:
         self._y = 0
         self._open("kbd")
         self._open("mouse")
+        if self._fds["kbd"] is None or self._fds["mouse"] is None:
+            missing = ", ".join(self._paths[k] for k in ("kbd", "mouse") if self._fds[k] is None)
+            # Not fatal: _write reopens lazily, and reopen() recovers after a gadget re-enumerate. Log it so a
+            # silently-dead HID (no input reaching the target) is diagnosable.
+            print("[hid] warning: could not open %s at startup (will retry on first write)" % missing, flush=True)
 
     def _open(self, which: str):
         try:
@@ -161,3 +167,31 @@ class HIDController:
         self._btn = 0
         self._write("kbd", self._kbd_report())
         self._write("mouse", self._rel_report())
+
+    def reopen(self, retries: int = 12, delay: float = 0.3) -> bool:
+        """Re-open both HID devices after the USB gadget was re-enumerated (the /dev/hidg* nodes are
+        recreated, so the old fds go stale). Clears any stuck keys/buttons, then retries the open while udev
+        re-creates the nodes and applies their group permissions. Returns True once both are open.
+
+        Without this, the keyboard/mouse only recover on the NEXT input event (the lazy reopen in _write),
+        which leaves a window where input is silently dropped after a re-enumerate."""
+        with self._lock:
+            self._mods = 0
+            self._keys = []
+            self._btn = 0
+            for which in ("kbd", "mouse"):
+                if self._fds[which] is not None:
+                    try:
+                        os.close(self._fds[which])
+                    except OSError:
+                        pass
+                    self._fds[which] = None
+        for _ in range(retries):
+            with self._lock:
+                for which in ("kbd", "mouse"):
+                    if self._fds[which] is None:
+                        self._open(which)
+                if self._fds["kbd"] is not None and self._fds["mouse"] is not None:
+                    return True
+            time.sleep(delay)        # wait (unlocked) for udev to recreate + chgrp the nodes
+        return False
