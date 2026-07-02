@@ -46,6 +46,21 @@ sub(A1, A1 + (
     "static bool survive_reenum = true;\n"
     "module_param(survive_reenum, bool, 0644);\n"
     "MODULE_PARM_DESC(survive_reenum, \"DIY-KVM: don't tty-hangup on gadget disconnect so an open port survives a re-enumerate (default 1)\");\n"
+    "/* DIY-KVM: IN/TX-side loss fix. gs_start_tx consumes up to maxpacket bytes from the write fifo into a\n"
+    " * request BEFORE usb_ep_queue; on a transient queue failure the stock code returns that request to the\n"
+    " * free pool, silently dropping its payload (observed as exact-512B gaps under sustained TX flood).\n"
+    " * Park the filled request instead and send it first on the next TX kick. tx_qfail/tx_retried expose\n"
+    " * live counters; tx_keep_on_fail=0 restores the stock (lossy) behaviour for A/B testing. */\n"
+    "static struct usb_request *gs_tx_pending[MAX_U_SERIAL_PORTS];\n"
+    "static bool tx_keep_on_fail = true;\n"
+    "module_param(tx_keep_on_fail, bool, 0644);\n"
+    "MODULE_PARM_DESC(tx_keep_on_fail, \"DIY-KVM: park+retry a TX request whose usb_ep_queue failed instead of dropping its data (default 1)\");\n"
+    "static unsigned long tx_qfail;\n"
+    "module_param(tx_qfail, ulong, 0444);\n"
+    "MODULE_PARM_DESC(tx_qfail, \"DIY-KVM: count of transient usb_ep_queue failures on the serial IN/TX path\");\n"
+    "static unsigned long tx_retried;\n"
+    "module_param(tx_retried, ulong, 0444);\n"
+    "MODULE_PARM_DESC(tx_retried, \"DIY-KVM: count of parked TX requests successfully retried\");\n"
 ), "ports[] decl")
 
 # 2. the watchdog function, just before userial_init().
@@ -69,6 +84,8 @@ sub(A2, (
     "\n"
     "\t\t\tspin_lock_irqsave(&port->port_lock, flags);\n"
     "\t\t\tactive = port->port_usb && port->port.count;\n"
+    "\t\t\tif (port->port_usb && gs_tx_pending[port->port_num])\n"
+    "\t\t\t\tgs_start_tx(port);\t/* retry a parked TX request (see gs_start_tx) */\n"
     "\t\t\tspin_unlock_irqrestore(&port->port_lock, flags);\n"
     "\t\t\tif (active)\n"
     "\t\t\t\tschedule_delayed_work(&port->push, 0);\n"
@@ -99,7 +116,89 @@ sub(A4, A4 + "\tcancel_delayed_work_sync(&gs_rearm_dwork);\n", "userial_cleanup"
 A5 = "\t\tif (port->port.tty)\n\t\t\ttty_hangup(port->port.tty);\n"
 sub(A5, "\t\tif (port->port.tty && !survive_reenum)\n\t\t\ttty_hangup(port->port.tty);\n", "gserial_disconnect hangup")
 
+# 6. gs_start_tx: also enter the send loop when a parked (queue-failed) request is waiting, even if the
+#    free pool is momentarily empty.
+A6 = "\twhile (!port->write_busy && !list_empty(pool)) {\n"
+sub(A6, "\twhile (!port->write_busy &&\n"
+        "\t       (gs_tx_pending[port->port_num] || !list_empty(pool))) {\n",
+    "gs_start_tx loop condition")
+
+# 7. gs_start_tx: send a parked request FIRST (its bytes were already consumed from the write fifo --
+#    re-filling from the fifo would silently skip them), otherwise fill a fresh request as stock does.
+A7 = (
+    "\t\treq = list_entry(pool->next, struct usb_request, list);\n"
+    "\t\tlen = gs_send_packet(port, req->buf, in->maxpacket);\n"
+    "\t\tif (len == 0) {\n"
+    "\t\t\twake_up_interruptible(&port->drain_wait);\n"
+    "\t\t\tbreak;\n"
+    "\t\t}\n"
+    "\t\tdo_tty_wake = true;\n"
+    "\t\tport->icount.tx += len;\n"
+    "\n"
+    "\t\treq->length = len;\n"
+    "\t\tlist_del(&req->list);\n"
+)
+sub(A7, (
+    "\t\tif (gs_tx_pending[port->port_num]) {\n"
+    "\t\t\t/* DIY-KVM: retry the parked request first -- its payload was already consumed\n"
+    "\t\t\t * from the write fifo and would otherwise be lost (see the queue-failure path). */\n"
+    "\t\t\treq = gs_tx_pending[port->port_num];\n"
+    "\t\t\tgs_tx_pending[port->port_num] = NULL;\n"
+    "\t\t\tlen = req->length;\n"
+    "\t\t\ttx_retried++;\n"
+    "\t\t\tdo_tty_wake = true;\n"
+    "\t\t} else {\n"
+    "\t\t\treq = list_entry(pool->next, struct usb_request, list);\n"
+    "\t\t\tlen = gs_send_packet(port, req->buf, in->maxpacket);\n"
+    "\t\t\tif (len == 0) {\n"
+    "\t\t\t\twake_up_interruptible(&port->drain_wait);\n"
+    "\t\t\t\tbreak;\n"
+    "\t\t\t}\n"
+    "\t\t\tdo_tty_wake = true;\n"
+    "\t\t\tport->icount.tx += len;\n"
+    "\n"
+    "\t\t\treq->length = len;\n"
+    "\t\t\tlist_del(&req->list);\n"
+    "\t\t}\n"
+), "gs_start_tx fill/retry")
+
+# 8. gs_start_tx: on usb_ep_queue failure, park the filled request (data preserved, retried by the next
+#    write/completion/watchdog kick) instead of returning it to the pool (which drops its payload).
+A8 = (
+    "\t\tif (status) {\n"
+    "\t\t\tpr_debug(\"%s: %s %s err %d\\n\",\n"
+    "\t\t\t\t\t__func__, \"queue\", in->name, status);\n"
+    "\t\t\tlist_add(&req->list, pool);\n"
+    "\t\t\tbreak;\n"
+    "\t\t}\n"
+)
+sub(A8, (
+    "\t\tif (status) {\n"
+    "\t\t\tpr_debug(\"%s: %s %s err %d\\n\",\n"
+    "\t\t\t\t\t__func__, \"queue\", in->name, status);\n"
+    "\t\t\t/* DIY-KVM: req->buf holds bytes already consumed from the write fifo; returning the\n"
+    "\t\t\t * request straight to the pool silently drops them (one maxpacket per transient\n"
+    "\t\t\t * failure). Park it for retry instead. */\n"
+    "\t\t\ttx_qfail++;\n"
+    "\t\t\tif (tx_keep_on_fail && !gs_tx_pending[port->port_num])\n"
+    "\t\t\t\tgs_tx_pending[port->port_num] = req;\n"
+    "\t\t\telse\n"
+    "\t\t\t\tlist_add(&req->list, pool);\n"
+    "\t\t\tbreak;\n"
+    "\t\t}\n"
+), "gs_start_tx queue-failure park")
+
+# 9. gserial_disconnect: return a parked request to the pool (under the same port_lock) right before the
+#    write_pool is freed, so it can't leak across a disconnect.
+A9 = "\tgs_free_requests(gser->in, &port->write_pool, NULL);\n"
+sub(A9, (
+    "\tif (gs_tx_pending[port->port_num]) {\t/* DIY-KVM: don't leak a parked TX request */\n"
+    "\t\tlist_add(&gs_tx_pending[port->port_num]->list, &port->write_pool);\n"
+    "\t\tgs_tx_pending[port->port_num] = NULL;\n"
+    "\t}\n"
+) + A9, "gserial_disconnect parked-req cleanup")
+
 if s == orig:
     sys.exit("patch_rearm: no changes applied")
 open(path, "w").write(s)
-print("patch_rearm: added OUT re-arm watchdog (module param rearm_ms, default 250)")
+print("patch_rearm: added OUT re-arm watchdog (rearm_ms), survive_reenum, and TX park-on-queue-failure (tx_keep_on_fail/tx_qfail/tx_retried)")

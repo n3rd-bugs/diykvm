@@ -4,7 +4,7 @@
 # WHY
 #   The in-tree u_serial hardcodes `#define QUEUE_SIZE 16`: only 16 bulk-OUT (host->device) USB requests are
 #   pre-queued, and gs_read_complete re-queues each one only after copying it to the tty. A back-to-back
-#   High-Speed bulk-OUT burst (e.g. a VMM trace handshake) consumes the pool faster than it can be re-queued,
+#   High-Speed bulk-OUT burst (e.g. a bursty host->device trace/log stream) consumes the pool faster than it
 #   so the OUT endpoint NAK-stalls after ~16-40 packets.
 #
 #   This is a SOFTWARE default, NOT a hardware limit. Each extra request is just one MaxPacket (512 B HS) of
