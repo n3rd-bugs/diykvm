@@ -268,8 +268,12 @@ API_INFO = {
         {"method": "POST", "path": "/api/serial/open", "auth": True, "body": "{device, baud, flow:none|rtscts|xonxoff, dtr, rts, reconnect, reopen}",
          "desc": "Open a port (raw, 8N1, echo off, DTR asserted) and keep it draining even with no client (bytes held as a backlog while detached). reconnect=true auto-reopens it if the target disconnects/re-enumerates. Idempotent."},
         {"method": "POST", "path": "/api/serial/close", "auth": True, "body": "{device}", "desc": "Close a serial port and stop buffering."},
+        {"method": "POST", "path": "/api/serial/clear", "auth": True, "body": "{device}",
+         "desc": "Discard a port's buffered RX scrollback (the detached backlog replayed to the next client). Returns {discarded: bytes dropped, open}. Leaves the port open."},
         {"method": "POST", "path": "/api/serial/reenumerate", "auth": True,
-         "desc": "Re-enumerate the USB gadget (unbind + re-bind its UDC) so the target re-detects the device and gets a fresh CDC-ACM COM port. Lets the other end request a fresh port on demand. Because USB enumerates per device, the keyboard, mouse and mass-storage interface also briefly re-appear (~1s); an open Pi-side serial port self-heals."},
+         "desc": "Re-enumerate the USB gadget (unbind + re-bind its UDC) so the target re-detects the device and gets a fresh CDC-ACM COM port. Lets the other end request a fresh port on demand. Because USB enumerates per device, the keyboard, mouse and mass-storage interface also briefly re-appear (~1s); an open Pi-side serial port self-heals. Quick bounce (~0.4s); for a wedged gadget use /api/gadget/recover."},
+        {"method": "POST", "path": "/api/gadget/recover", "auth": True,
+         "desc": "Recover a WEDGED USB gadget: unbind + re-bind the UDC while holding the disconnect ~2s, so a host stuck mid-enumeration (state 'not attached'/addressed-but-not-configured, e.g. after a re-enum storm or a config-change gadget rebuild) fully deregisters and re-enumerates clean -- a brief reenumerate won't unstick it. Bounces ALL USB ~2s; returns {recovered, hid_reopened, detail}."},
         {"method": "WS", "path": "/ws/serial", "auth": True, "query": "device, baud, flow, dtr, rts, reconnect, token",
          "desc": "Serial console, binary-clean. Subscribes to the shared port (auto-opens it with the given "
                  "settings if needed), replays the backlog accumulated while detached (then dropped, so "
@@ -279,7 +283,8 @@ API_INFO = {
         {"method": "GET", "path": "/api/events/state", "auth": True,
          "desc": "Point-in-time state snapshot: {usb:{udc,bound,state}, hid:{keyboard,mouse}, serial:[...], msd, power, kvmswitch}."},
         {"method": "WS", "path": "/ws/events", "auth": True, "query": "replay (0-256), token",
-         "desc": "Live state-event stream as JSON (one event per message). On connect: {type:'snapshot',...} with full state, then events {seq,ts,type,...}: 'usb' (gadget/target enumeration -- state 'configured'/'not attached', so tooling sees the target losing/regaining HID), 'hid' (keyboard/mouse device open), 'serial' (ports: open/clients/reconnects), 'reenumerate'. ?replay=N replays the last N events from before connecting."},
+         "desc": "Live state-event stream as JSON. On connect: {type:'snapshot',...} with full state, then events: 'usb' (gadget enumeration -- 'configured'/'not attached'), 'hid' (keyboard/mouse), 'serial' (ports: open/clients/reconnects), 'reenumerate'. ?replay=N replays recent events."},
+        {"method": "GET", "path": "/api/usb/debug", "auth": True, "desc": "USB endpoint diagnostics: UDC state + per-endpoint status from sysfs/debugfs (RXFIFO level, halt, stall counts). Useful for diagnosing OUT endpoint stalls on the CDC-ACM gadget."},
         {"method": "GET", "path": "/api/power/state", "auth": True, "desc": "Per-target power relay state: {targets:[{label, on}]}."},
         {"method": "POST", "path": "/api/power", "auth": True, "body": "{index, on}", "desc": "Connect (on=true) or cut (on=false) a target's power (latched relay)."},
         {"method": "GET", "path": "/api/kvmswitch/state", "auth": True, "desc": "External KVM-switch buttons: {ports:[{label}]}."},
@@ -618,34 +623,66 @@ async def serial_close(payload: dict = Body(default={}), _: bool = Depends(requi
     return {"device": device, "closed": await SERIAL.close(device)}
 
 
+@app.post("/api/serial/clear")
+async def serial_clear(payload: dict = Body(default={}), _: bool = Depends(require_auth)):
+    """Discard a port's buffered RX scrollback (the detached backlog that would be replayed to the next
+    client -- the `buffered` count in /api/serial/status). Returns the number of bytes discarded. The port
+    stays open; live WebSocket subscribers are untouched. async so the clear runs on the event loop,
+    serialized with the drain that fills the buffer."""
+    body = payload if isinstance(payload, dict) else {}
+    device = _valid_serial_device(body.get("device", ""))
+    if device is None:
+        raise HTTPException(status_code=400, detail="unknown serial device")
+    discarded = SERIAL.clear(device)        # None if the device isn't currently open (-> nothing buffered)
+    return {"device": device, "discarded": discarded or 0, "open": discarded is not None}
+
+
+def _bounce_gadget(verb, timeout):
+    """Run the privileged gadget bounce (`reenumerate` or `recover`) under the app-level single-flight lock,
+    reopen HID afterward (the /dev/hidg* are recreated), and publish a 'reenumerate' event. Sync/blocking:
+    the caller is a `def` route, so FastAPI runs it in a worker thread, off the event loop. Overlapping
+    bounces get 409 (they bounce ALL USB); a failure/timeout gets 502. Returns {hid_reopened, detail}."""
+    if not _reenum_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="a re-enumerate is already in progress")
+    try:
+        try:
+            r = subprocess.run(["sudo", "-n", GADGET_HELPER, verb],
+                               capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise HTTPException(status_code=502, detail="%s timed out" % verb)
+        if r.returncode == 3:               # helper's own flock: another bounce is mid-flight
+            raise HTTPException(status_code=409, detail="a re-enumerate is already in progress")
+        if r.returncode != 0:
+            raise HTTPException(status_code=502, detail=(r.stderr or r.stdout or (verb + " failed")).strip())
+        # The gadget was re-enumerated -> /dev/hidg* were recreated; reopen them now so the keyboard/mouse
+        # keep working instead of waiting for (and possibly dropping) the next input event.
+        hid_ok = hid.reopen()
+        if not hid_ok:
+            print("[%s] HID re-open incomplete; will recover on next input" % verb, flush=True)
+        detail = (r.stdout or "").strip()
+        EVENTS.publish("reenumerate", ok=True, hid_reopened=hid_ok, detail=detail)
+        return {"hid_reopened": hid_ok, "detail": detail}
+    finally:
+        _reenum_lock.release()
+
+
 @app.post("/api/serial/reenumerate")
 def serial_reenumerate(_: bool = Depends(require_auth)):
     """Let the other end request a fresh COM port: re-enumerate the USB gadget (unbind + re-bind its UDC)
     so the target re-detects the device. Because USB enumerates per device, this also briefly re-creates
     the keyboard, mouse and mass-storage interface. A Pi-side serial port that is open self-heals if its
-    [serial] reconnect is on. Sync route: FastAPI runs it in a worker thread, off the event loop.
-    Single-flight (it bounces ALL USB): overlapping requests get 409, not a second, compounding bounce."""
-    if not _reenum_lock.acquire(blocking=False):
-        raise HTTPException(status_code=409, detail="a re-enumerate is already in progress")
-    try:
-        try:
-            r = subprocess.run(["sudo", "-n", GADGET_HELPER, "reenumerate"],
-                               capture_output=True, text=True, timeout=60)
-        except subprocess.TimeoutExpired:
-            raise HTTPException(status_code=502, detail="reenumerate timed out")
-        if r.returncode == 3:               # helper's own flock: another bounce is mid-flight
-            raise HTTPException(status_code=409, detail="a re-enumerate is already in progress")
-        if r.returncode != 0:
-            raise HTTPException(status_code=502, detail=(r.stderr or r.stdout or "reenumerate failed").strip())
-        # The gadget was re-enumerated -> /dev/hidg* were recreated; reopen them now so the keyboard/mouse
-        # keep working instead of waiting for (and possibly dropping) the next input event.
-        hid_ok = hid.reopen()
-        if not hid_ok:
-            print("[reenumerate] HID re-open incomplete; will recover on next input", flush=True)
-        EVENTS.publish("reenumerate", ok=True, hid_reopened=hid_ok, detail=(r.stdout or "").strip())
-        return {"reenumerated": True, "hid_reopened": hid_ok, "detail": (r.stdout or "").strip()}
-    finally:
-        _reenum_lock.release()
+    [serial] reconnect is on. Quick bounce (~0.4s disconnect). For a gadget the host has wedged
+    (addressed-but-not-configured), use POST /api/gadget/recover instead."""
+    return {"reenumerated": True, **_bounce_gadget("reenumerate", timeout=60)}
+
+
+@app.post("/api/gadget/recover")
+def gadget_recover(_: bool = Depends(require_auth)):
+    """Recover a WEDGED USB gadget. Same unbind+rebind as reenumerate, but holds the disconnect ~2s so a host
+    that got stuck mid-enumeration (state 'not attached'/addressed-but-not-configured, e.g. after a re-enum
+    storm or a config-change gadget rebuild) fully DEREGISTERS the device and enumerates it clean -- a brief
+    bounce won't unstick that. Bounces ALL USB (~2s), then reopens HID. Single-flight with reenumerate."""
+    return {"recovered": True, **_bounce_gadget("recover", timeout=90)}
 
 
 # ----------------------------- events (state stream) -----------------------------
@@ -690,10 +727,10 @@ def _events_snapshot():
 
 
 def _serial_key(ports):
-    # Diff serial on the stable fields, ignoring the ever-changing 'buffered' byte count (data flowing would
-    # otherwise emit an event every poll). open/clients/reconnects/reconnecting/error DO signal real changes.
+    # Diff serial on stable fields only — not rx_bytes/last_rx (those change every packet) or buffered.
     return [{k: p.get(k) for k in ("device", "baud", "flow", "open", "clients",
-                                   "reconnect", "reconnects", "reconnecting", "error")} for p in ports]
+                                   "reconnect", "reconnects", "reconnecting",
+                                   "error")} for p in ports]
 
 
 async def _events_poller():
@@ -784,6 +821,75 @@ async def ws_events(sock: WebSocket):
             except Exception:
                 pass
         EVENTS.unsubscribe(q)
+
+
+# ----------------------------- USB endpoint diagnostics -----------------------------
+_UDC_DEBUGFS = "/sys/kernel/debug/fe980000.usb"
+_UDC_SYSFS = "/sys/class/udc"
+
+
+def _read_file(path: str, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+@app.get("/api/usb/debug")
+def usb_debug(_: bool = Depends(require_auth)):
+    """USB endpoint diagnostics: current UDC state + per-endpoint status from sysfs (and debugfs if mounted).
+    Exposes endpoint halt/stall/NAK state, RXFIFO occupancy, and DMA descriptor counts -- the key signals for
+    diagnosing a permanent OUT endpoint stall on the CDC-ACM gadget (see the dwc2_out_endpoint_stall spec)."""
+    result: dict = {}
+
+    # UDC state (always available via sysfs)
+    udcs = []
+    try:
+        for udc in sorted(os.listdir(_UDC_SYSFS)):
+            base = "%s/%s" % (_UDC_SYSFS, udc)
+            udcs.append({
+                "name": udc,
+                "state": _read_file("%s/state" % base),
+                "speed": _read_file("%s/current_speed" % base),
+                "max_speed": _read_file("%s/maximum_speed" % base),
+            })
+    except OSError:
+        pass
+    result["udcs"] = udcs
+
+    # Gadget endpoint list from configfs (always accessible)
+    eps = []
+    gadget = "/sys/kernel/config/usb_gadget/kvm"
+    try:
+        for fn in sorted(os.listdir("%s/functions" % gadget)):
+            eps.append({"function": fn})
+    except OSError:
+        pass
+    result["gadget_functions"] = eps
+
+    # Per-endpoint details from debugfs (requires root mount -- best-effort)
+    ep_debug = {}
+    try:
+        for entry in sorted(os.listdir(_UDC_DEBUGFS)):
+            if not (entry.startswith("ep") and ("in" in entry or "out" in entry)):
+                continue
+            ep_info = {}
+            ep_dir = "%s/%s" % (_UDC_DEBUGFS, entry)
+            if os.path.isdir(ep_dir):
+                for attr in ("status", "descriptor", "urb"):
+                    val = _read_file("%s/%s" % (ep_dir, attr))
+                    if val:
+                        ep_info[attr] = val
+            else:
+                ep_info["raw"] = _read_file(ep_dir)
+            if ep_info:
+                ep_debug[entry] = ep_info
+    except (OSError, PermissionError):
+        ep_debug["_note"] = "debugfs not accessible (mount /sys/kernel/debug or run as root)"
+    result["endpoints"] = ep_debug
+
+    return result
 
 
 @app.websocket("/ws/serial")

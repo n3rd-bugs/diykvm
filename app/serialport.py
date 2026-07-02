@@ -15,6 +15,7 @@ from any single client: a client disconnecting does NOT close the port; it keeps
 closed via the API (or the service restarts).
 """
 import asyncio
+import time
 
 import serial
 
@@ -53,6 +54,8 @@ class _Port:
         self.reconnects = 0           # how many times we silently re-opened after a disconnect
         self._reconnecting = False    # currently in the re-open backoff loop (port temporarily down)
         self._reopen_req = False      # external request to re-open (e.g. the USB host re-configured the gadget)
+        self.rx_bytes = 0             # total bytes received from the device since this port was opened
+        self.last_rx = 0.0            # monotonic time of the most recent non-zero read
         # Serialize the handle-destroying ops (close / re-open swap) against an in-flight write() so we never
         # close or swap the pyserial fd from the loop thread while a pool thread is using it. Concurrent
         # read+write is safe (independent directions), so reads are NOT gated on this lock; read-vs-close is
@@ -109,6 +112,9 @@ class _Port:
                     continue
                 if not data:
                     continue
+                # RX activity telemetry, surfaced as rx_bytes/last_rx in status().
+                self.rx_bytes += len(data)
+                self.last_rx = time.monotonic()
                 if self._subs:
                     # Live clients attached: deliver straight to them and DON'T retain a copy, so the same
                     # bytes are never replayed to a later / reconnecting client.
@@ -175,6 +181,15 @@ class _Port:
 
     def unsubscribe(self, q):
         self._subs.discard(q)
+
+    def clear_buffer(self):
+        """Drop the detached scrollback ring buffer -- the bytes that arrived while no client was attached
+        and would be replayed to the next subscriber (the `buffered` count in status()). Returns the number
+        of bytes dropped. Live subscribers' in-flight data and the lifetime rx_bytes counter are untouched.
+        Event-loop only: `_buf` is mutated by the drain on the loop, so this stays race-free without a lock."""
+        n = len(self._buf)
+        self._buf.clear()
+        return n
 
     def request_reopen(self):
         """Ask the drain to close+reopen the port at its next loop turn (within ~the read timeout). Used when
@@ -261,6 +276,15 @@ class SerialManager:
         await p.close()
         return True
 
+    def clear(self, device):
+        """Clear an open port's scrollback buffer. Returns the number of bytes dropped, or None if the
+        device is not currently open. Call from the event loop (the API handler) so it stays serialized
+        with the drain that fills the buffer."""
+        p = self.get(device)
+        if p is None:
+            return None
+        return p.clear_buffer()
+
     def status(self):
         out = []
         for dev, p in list(self._ports.items()):
@@ -268,18 +292,17 @@ class SerialManager:
                 "device": dev, "baud": p.baud, "flow": p.flow, "dtr": p.dtr, "rts": p.rts,
                 "open": p.alive, "buffered": len(p._buf), "clients": len(p._subs),
                 "reconnect": p._reconnect, "reconnects": p.reconnects, "reconnecting": p._reconnecting,
-                "error": p.error,
+                "rx_bytes": p.rx_bytes, "last_rx": round(p.last_rx, 3), "error": p.error,
             })
         return out
 
     def reopen_gadget_ports(self):
         """Force the Pi's own gadget COM port(s) (/dev/ttyGS*) to close+reopen, so their TX/write path binds
-        to a freshly-(re)configured USB host. Called on the target's USB 'configured' transition: a port that
-        was opened before the host configured the gadget never binds TX until it is reopened. Returns the
-        devices asked to reopen. USB/RS-232 adapters (ttyUSB*/ttyACM*) are unaffected, so they're left alone."""
+        to a freshly-(re)configured USB host. Called on the target's USB 'configured' transition.
+        USB/RS-232 adapters (ttyUSB*/ttyACM*) are unaffected."""
         done = []
         for dev, p in list(self._ports.items()):
-            if dev.startswith("/dev/ttyGS") and p.alive:
+            if dev.startswith("/dev/ttyGS") and p.alive and not p._reconnecting:
                 p.request_reopen()
                 done.append(dev)
         return done

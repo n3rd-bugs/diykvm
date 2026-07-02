@@ -8,7 +8,10 @@ unbinding and re-binding its UDC, so the target re-detects the device. Because U
 mass-storage interface. The Pi-side /dev/ttyGS0 and /dev/hidg* get their group permissions back from udev
 on re-creation, and an open serial port self-heals via the web app's reconnect logic.
 
-    sudo kvm-gadget-helper reenumerate   # unbind + re-bind the UDC (re-enumerate the device to the target)
+    sudo kvm-gadget-helper reenumerate   # quick unbind + re-bind the UDC (fresh COM port / re-enumerate)
+    sudo kvm-gadget-helper recover       # like reenumerate but holds the disconnect ~2s so the host fully
+                                         #   deregisters a WEDGED device (addressed-but-not-configured) and
+                                         #   re-enumerates it clean -- a brief bounce won't unstick that.
     sudo kvm-gadget-helper status        # report gadget presence + current/available UDC (no change)
 
 It takes no other arguments and performs no other action. Because this briefly drops ALL USB on a live
@@ -86,7 +89,7 @@ def _rebind(udc):
     return last
 
 
-def _do_reenumerate():
+def _do_reenumerate(hold=0.4):
     if not os.path.isdir(G) or not os.path.exists(UDC_FILE):
         die("gadget not present (%s) -- is kvm-gadget running?" % G)
     bound = current_udc()
@@ -98,7 +101,8 @@ def _do_reenumerate():
             _write_udc("")                 # unbind: the target sees the whole device disconnect
         except OSError as e:
             die("unbind failed: %s" % e)
-        time.sleep(0.4)                    # let the host register the disconnect before re-binding
+        time.sleep(hold)                   # hold the disconnect so the host registers it before re-binding
+                                           # (a longer hold is needed to unstick a wedged host -- see recover)
     if _rebind(udc) is None:               # re-bind: the target re-enumerates (fresh COM + HID + storage)
         print("reenumerated udc=%s" % udc)
         return
@@ -124,7 +128,7 @@ def _do_reenumerate():
         "recover with: sudo systemctl restart kvm-gadget" % (rc, err))
 
 
-def reenumerate():
+def reenumerate(hold=0.4):
     # Single-flight: two concurrent bounces would interleave on the UDC and lengthen the window in which the
     # target has NO usb. Reject a second caller (exit 3) rather than queue it. The lock is held across the
     # restart fallback too. /run/kvm is the service RuntimeDirectory (root-writable).
@@ -144,7 +148,7 @@ def reenumerate():
             sys.exit(EXIT_BUSY)
         die("cannot lock %s: %s" % (LOCK, e))
     try:
-        _do_reenumerate()
+        _do_reenumerate(hold)
     finally:
         try:
             fcntl.flock(lockf, fcntl.LOCK_UN)
@@ -154,9 +158,15 @@ def reenumerate():
 
 
 def main():
-    if len(sys.argv) != 2 or sys.argv[1] not in ("reenumerate", "status"):
-        die("usage: kvm-gadget-helper {reenumerate|status}")
-    (status if sys.argv[1] == "status" else reenumerate)()
+    arg = sys.argv[1] if len(sys.argv) == 2 else None
+    if arg == "status":
+        status()
+    elif arg == "reenumerate":
+        reenumerate()                      # quick bounce (0.4s hold): fresh COM port / re-enumerate on demand
+    elif arg == "recover":
+        reenumerate(hold=2.0)              # long disconnect (2s): unstick a host-wedged gadget (see docstring)
+    else:
+        die("usage: kvm-gadget-helper {reenumerate|recover|status}")
 
 
 if __name__ == "__main__":
