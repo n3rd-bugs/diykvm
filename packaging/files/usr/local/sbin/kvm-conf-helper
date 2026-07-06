@@ -41,6 +41,7 @@ PORTS = r"[A-Za-z0-9 _:,.\-]{0,256}"          # comma-separated Label:pin pairs,
 COMBO = r"(?:(?:(?:Ctrl|Alt|Shift|Meta)\+){0,4}[A-Za-z0-9]{1,20})?"   # key combo (e.g. Ctrl+Space), or blank
 FLOW = r"(none|rtscts|xonxoff)"               # serial flow control mode
 INQ = r"[A-Za-z0-9 ._\-]{0,28}"               # SCSI INQUIRY vendor/product (printable, no shell metas), or blank
+PMODE = r"(relay|button)"                     # power control style: latched relay | momentary power button
 
 SCHEMA = {
     "web": {"host": HOST, "port": PORT, "tls": BOOL,
@@ -50,7 +51,8 @@ SCHEMA = {
     "usb": {"image_path": PATH, "image_size": SIZE, "usb_serial": BOOL,
             "store_lun": BOOL, "store_size": SIZE, "store_inquiry": INQ},
     "serial": {"default_baud": BAUD, "default_flow": FLOW, "autostart": DEVLIST, "reconnect": BOOL},
-    "power": {"enabled": BOOL, "active_low": BOOL, "open_drain": BOOL, "targets": PORTS},
+    "power": {"enabled": BOOL, "mode": PMODE, "active_low": BOOL, "open_drain": BOOL,
+              "hold_on_sec": INT, "hold_off_sec": INT, "targets": PORTS},
     "kvmswitch": {"enabled": BOOL, "chip": CHIP, "active_low": BOOL, "pulse_ms": INT, "ports": PORTS},
     "ui": {"capture_exit": COMBO},
 }

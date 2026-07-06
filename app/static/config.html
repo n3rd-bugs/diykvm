@@ -20,7 +20,7 @@
   .note { color: #8794a3; font-size: 12px; margin: 2px 0 10px; }
   .field { display: flex; align-items: center; gap: 12px; padding: 5px 0; flex-wrap: wrap; }
   .field label { flex: 1 1 240px; min-width: 0; color: #cdd; }
-  .field input[type=text], .field input[type=number] {
+  .field input[type=text], .field input[type=number], .field select {
      flex: 1 1 200px; min-width: 0; background: #222; color: #eee; border: 1px solid #444;
      border-radius: 5px; padding: 7px 9px; font: inherit; }
   .field input[type=checkbox] { width: 18px; height: 18px; }
@@ -82,11 +82,22 @@ async function load() {
       for (const f of sec.fields) {
         const row = document.createElement('div'); row.className = 'field';
         const lab = document.createElement('label'); lab.textContent = f.label; lab.htmlFor = fieldId(sec.section, f.key);
-        const inp = document.createElement('input'); inp.id = fieldId(sec.section, f.key);
-        if (f.type === 'bool') {
+        let inp;
+        if (f.type === 'select') {
+          inp = document.createElement('select');
+          for (const o of (f.options || [])) {
+            const opt = document.createElement('option');
+            opt.value = (o && typeof o === 'object') ? o.value : o;
+            opt.textContent = (o && typeof o === 'object') ? (o.label != null ? o.label : o.value) : o;
+            inp.appendChild(opt);
+          }
+          inp.value = f.value == null ? '' : f.value;
+        } else if (f.type === 'bool') {
+          inp = document.createElement('input');
           inp.type = 'checkbox';
           inp.checked = String(f.value).toLowerCase() === 'true' || f.value === '1' || f.value === 'on' || f.value === 'yes';
         } else if (f.type === 'keycombo') {
+          inp = document.createElement('input');
           inp.type = 'text'; inp.readOnly = true; inp.value = f.value == null ? '' : f.value;
           inp.placeholder = 'click, then press your shortcut';
           inp.title = 'Click and press the keys (e.g. Ctrl+Space). Backspace/Delete clears it.';
@@ -107,9 +118,11 @@ async function load() {
             inp.value = parts.join('+'); inp.blur();
           });
         } else {
+          inp = document.createElement('input');
           inp.type = (f.type === 'number') ? 'number' : 'text';
           inp.value = f.value == null ? '' : f.value;
         }
+        inp.id = fieldId(sec.section, f.key);
         row.append(lab, inp); fs.appendChild(row);
       }
       form.appendChild(fs);

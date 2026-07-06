@@ -864,17 +864,21 @@ serout.addEventListener('keydown', (e) => {
 });
 serraw.onchange = () => { serin.disabled = serraw.checked; if(serraw.checked) serout.focus(); };
 
-// ---------------- target power (GPIO relays, latched on/off) ----------------
+// ---------------- target power (GPIO: latched relay, or momentary power button) ----------------
 const powerpanel = document.getElementById('powerpanel');
 const pwrtargets = document.getElementById('pwrtargets');
 const pwrmsg = document.getElementById('pwrmsg');
+let pwrHoldTimer = null;                                 // re-poll while a button-mode hold runs
 async function pwrRefresh() {
+  clearTimeout(pwrHoldTimer);
   pwrmsg.textContent = ''; pwrtargets.innerHTML = '';
   try {
     const s = await api('/api/power/state');
     if (!s.available) { pwrmsg.textContent = 'pinctrl/raspi-gpio not installed'; return; }
     if (!s.enabled) { pwrmsg.textContent = 'disabled — configure on the Config page'; return; }
     if (!s.targets.length) { pwrmsg.textContent = 'no targets configured'; return; }
+    const button = s.mode === 'button';
+    let anyHolding = false;
     s.targets.forEach((t, i) => {
       const div = document.createElement('div'); div.className = 'pt';
       const lbl = document.createElement('span'); lbl.className = 'lbl'; lbl.appendChild(document.createTextNode(t.label));
@@ -883,24 +887,50 @@ async function pwrRefresh() {
       dot.title = t.on === true ? 'powered' : t.on === false ? 'off' : 'unknown';
       const onB = document.createElement('button'); onB.className = 'on'; onB.textContent = 'On';
       const offB = document.createElement('button'); offB.className = 'off'; offB.textContent = 'Off';
-      onB.onclick = () => pwrSet(i, true, t.label);
-      offB.onclick = () => pwrSet(i, false, t.label);
+      onB.onclick = () => pwrSet(i, true, t.label, s);
+      offB.onclick = () => pwrSet(i, false, t.label, s);
       div.append(lbl, dot, onB, offB);
+      if (button && t.holding) {                         // a press/hold is in flight: lock + show countdown
+        anyHolding = true; onB.disabled = true; offB.disabled = true;
+        const h = document.createElement('span'); h.className = 'muted';
+        h.textContent = 'holding… ' + (t.holding_secs || 0) + 's';
+        div.appendChild(h);
+      }
+      if (button && t.fault) {                            // release failed -> line may be stuck asserted
+        const w = document.createElement('span'); w.style.color = '#f2918a';
+        w.textContent = '⚠ ' + t.fault;
+        div.appendChild(w);
+      }
       pwrtargets.appendChild(div);
     });
+    // Re-arm only if the panel is still open, so an in-flight refresh that resolves AFTER the panel was
+    // closed (its clearTimeout already ran) cannot restart the background poll loop. Self-terminates too.
+    if (anyHolding && powerpanel.classList.contains('show')) pwrHoldTimer = setTimeout(pwrRefresh, 1000);
   } catch (e) { pwrmsg.textContent = e.message; }
 }
-async function pwrSet(index, on, label) {
-  if (!on && !confirm('Cut power to ' + label + '? This is a hard power-off — unsaved work is lost.')) return;
-  pwrmsg.textContent = (on ? 'powering on ' : 'cutting power to ') + label + '…';
+async function pwrSet(index, on, label, s) {
+  const button = s.mode === 'button';
+  if (!on) {
+    const q = button
+      ? ('Hold the power button ' + (s.hold_off_sec || 30) + 's to force ' + label + ' off? This is a hard power-off — unsaved work is lost.')
+      : ('Cut power to ' + label + '? This is a hard power-off — unsaved work is lost.');
+    if (!confirm(q)) return;
+  }
+  pwrmsg.textContent = button
+    ? (on ? 'pressing power button on ' : 'holding power button to force off ') + label + '…'
+    : (on ? 'powering on ' : 'cutting power to ') + label + '…';
   try {
     await api('/api/power', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ index, on }) });
-    pwrmsg.textContent = label + (on ? ' powered on' : ' powered off'); await pwrRefresh();
+    pwrmsg.textContent = button
+      ? label + (on ? ' — power-on press sent' : ' — force-off hold started')
+      : label + (on ? ' powered on' : ' powered off');
+    await pwrRefresh();
   } catch (e) { pwrmsg.textContent = e.message; }
 }
 document.getElementById('powerbtn').onclick = () => {
   powerpanel.classList.toggle('show');
   if (powerpanel.classList.contains('show')) pwrRefresh();
+  else clearTimeout(pwrHoldTimer);                       // stop background polling when the panel closes
 };
 document.getElementById('pwrrefresh').onclick = pwrRefresh;
 

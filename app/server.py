@@ -289,8 +289,8 @@ API_INFO = {
         {"method": "GET", "path": "/api/store/region", "auth": True, "query": "lba, blocks",
          "desc": "Read raw blocks the host WROTE to the store LUN: blocks x 512 B from lba (page-cache, coherent after the host's FUA). X-Store-Blocks header = blocks actually returned."},
         {"method": "GET", "path": "/api/usb/debug", "auth": True, "desc": "USB endpoint diagnostics: UDC state + per-endpoint status from sysfs/debugfs (RXFIFO level, halt, stall counts). Useful for diagnosing OUT endpoint stalls on the CDC-ACM gadget."},
-        {"method": "GET", "path": "/api/power/state", "auth": True, "desc": "Per-target power relay state: {targets:[{label, on}]}."},
-        {"method": "POST", "path": "/api/power", "auth": True, "body": "{index, on}", "desc": "Connect (on=true) or cut (on=false) a target's power (latched relay)."},
+        {"method": "GET", "path": "/api/power/state", "auth": True, "desc": "Per-target power state: {mode:'relay'|'button', enabled, available, targets:[{label, on}]}. Button mode adds per-target {holding, holding_secs, fault} and top-level {hold_on_sec, hold_off_sec}."},
+        {"method": "POST", "path": "/api/power", "auth": True, "body": "{index, on}", "desc": "Set a target's power. Relay: connect (on=true) / cut (on=false) a latched line. Button: on=true presses the front-panel power button briefly (power on), on=false holds it for hold_off_sec (force off) — returns immediately while the hold runs; a second request for a target mid-hold gets 409."},
         {"method": "GET", "path": "/api/kvmswitch/state", "auth": True, "desc": "External KVM-switch buttons: {ports:[{label}]}."},
         {"method": "POST", "path": "/api/kvmswitch", "auth": True, "body": "{index}", "desc": "Press a select button (switch display + USB to that target)."},
         {"method": "GET", "path": "/api/config", "auth": True, "desc": "Read settings (sections/fields with current values)."},
@@ -1149,13 +1149,20 @@ CONFIG_FIELDS = [
          {"key": "autostart", "label": "Auto-open & drain these ports from boot (comma-separated, e.g. /dev/ttyGS0); blank (default) leaves the gadget COM closed until the other end opens it via /api/serial/open", "type": "text", "default": ""},
          {"key": "reconnect", "label": "Auto-reopen a port if it disconnects (survive the target re-enumerating; no console churn)", "type": "bool", "default": "true"},
      ]},
-    {"section": "power", "title": "Target power (GPIO relays)",
-     "note": "Applied immediately. Each target's GPIO drives a relay that connects or cuts its power "
-             "(latched on/off); list targets as Label:BCMpin pairs.",
+    {"section": "power", "title": "Target power (GPIO)",
+     "note": "Applied immediately. Each target's GPIO controls its power; list targets as Label:BCMpin "
+             "pairs. Relay mode holds a latched on/off level (real state read back). Power-button mode "
+             "drives a momentary front-panel power button: a short press powers on, a long hold forces "
+             "off — state is tracked in software and assumed OFF at startup (no button feedback).",
      "fields": [
          {"key": "enabled", "label": "Enable power control", "type": "bool", "default": "false"},
-         {"key": "active_low", "label": "Active-low relays (drive line low = power on)", "type": "bool", "default": "false"},
-         {"key": "open_drain", "label": "Open-drain output (on = sink to ground, off = release/high-Z, never drives high)", "type": "bool", "default": "false"},
+         {"key": "mode", "label": "Control mode", "type": "select", "default": "relay",
+          "options": [{"value": "relay", "label": "Relay — latched connect/cut (readable state)"},
+                      {"value": "button", "label": "Power button — momentary press & hold"}]},
+         {"key": "active_low", "label": "Active-low wiring (drive line low = active)", "type": "bool", "default": "false"},
+         {"key": "open_drain", "label": "Open-drain output (active = sink to ground, inactive = release/high-Z, never drives high)", "type": "bool", "default": "false"},
+         {"key": "hold_on_sec", "label": "Power-button: power-on press (seconds, button mode)", "type": "number", "default": "1"},
+         {"key": "hold_off_sec", "label": "Power-button: force-off hold (seconds, button mode)", "type": "number", "default": "30"},
          {"key": "targets", "label": "Targets — Label:pin, comma-separated (e.g. PC1:5, PC2:6)",
           "type": "text", "default": ""},
      ]},
