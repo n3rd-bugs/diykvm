@@ -35,10 +35,10 @@ STORE_INQ="$(command -v kvm-conf-get >/dev/null 2>&1 && kvm-conf-get usb store_i
 if [ -d "$G" ]; then
   echo "" > "$G/UDC" 2>/dev/null || true
   for l in "$G"/configs/c.1/hid.usb0 "$G"/configs/c.1/hid.usb1 "$G"/configs/c.1/mass_storage.usb0 "$G"/configs/c.1/acm.usb0; do if [ -L "$l" ]; then rm -f "$l"; fi; done
-  [ -d "$G/configs/c.1/strings/0x409" ] && rmdir "$G/configs/c.1/strings/0x409" 2>/dev/null || true
-  [ -d "$G/configs/c.1" ] && rmdir "$G/configs/c.1" 2>/dev/null || true
-  [ -d "$G/functions/hid.usb0" ] && rmdir "$G/functions/hid.usb0" 2>/dev/null || true
-  [ -d "$G/functions/hid.usb1" ] && rmdir "$G/functions/hid.usb1" 2>/dev/null || true
+  rmdir "$G/configs/c.1/strings/0x409" 2>/dev/null || true
+  rmdir "$G/configs/c.1" 2>/dev/null || true
+  rmdir "$G/functions/hid.usb0" 2>/dev/null || true
+  rmdir "$G/functions/hid.usb1" 2>/dev/null || true
   if [ -d "$G/functions/acm.usb0" ]; then rmdir "$G/functions/acm.usb0" || true; fi
   if [ -d "$G/functions/mass_storage.usb0" ]; then
     echo "" > "$G/functions/mass_storage.usb0/lun.0/file" 2>/dev/null || true
@@ -49,7 +49,7 @@ if [ -d "$G" ]; then
     fi
     rmdir "$G/functions/mass_storage.usb0" 2>/dev/null || true
   fi
-  [ -d "$G/strings/0x409" ] && rmdir "$G/strings/0x409" 2>/dev/null || true
+  rmdir "$G/strings/0x409" 2>/dev/null || true
   rmdir "$G" 2>/dev/null || true     # never let a teardown failure (e.g. a still-busy lun.1) abort the rebuild
 fi
 
