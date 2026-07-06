@@ -33,6 +33,7 @@ from kvmswitch import KvmSwitch, SwitchError
 from serialbridge import list_serial_ports, COMMON_BAUDS
 from serialport import SerialManager, SerialError, FLOW_MODES
 from events import EventBus
+import target_events
 import ocr
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -284,7 +285,7 @@ API_INFO = {
         {"method": "GET", "path": "/api/events/state", "auth": True,
          "desc": "Point-in-time state snapshot: {usb:{udc,bound,state}, hid:{keyboard,mouse}, serial:[...], msd, power, kvmswitch}."},
         {"method": "WS", "path": "/ws/events", "auth": True, "query": "replay (0-256), token",
-         "desc": "Live state-event stream as JSON. On connect: {type:'snapshot',...} with full state, then events: 'usb' (gadget enumeration -- 'configured'/'not attached'), 'hid' (keyboard/mouse), 'serial' (ports: open/clients/reconnects), 'reenumerate'. ?replay=N replays recent events."},
+         "desc": "Live event stream (JSON). On connect: {type:'snapshot',...} full state, then two kinds of events. COARSE full-state per domain (fold to rebuild state): 'usb','hid','serial','power','msd','reenumerate'. SEMANTIC target transitions (each has a 'message'): 'usb.enumerated'/'usb.enumerating'/'usb.suspended'/'usb.resumed'/'usb.detached', 'gadget.bound'/'gadget.unbound', 'power.on'/'power.off', 'serial.enumerated'/'serial.deenumerated'/'serial.opened'/'serial.closed'/'serial.reconnected'/'serial.error'/'serial.error_cleared', 'hid.online'/'hid.offline', 'drive.attached'/'drive.detached'/'drive.editing'. ?replay=N replays recent events."},
         {"method": "GET", "path": "/api/store/status", "auth": True, "desc": "Scratch block store: {present, path, block_size, size_bytes, blocks} (2nd mass-storage LUN the host writes to; enable with [usb] store_lun)."},
         {"method": "GET", "path": "/api/store/region", "auth": True, "query": "lba, blocks",
          "desc": "Read raw blocks the host WROTE to the store LUN: blocks x 512 B from lba (page-cache, coherent after the host's FUA). X-Store-Blocks header = blocks actually returned."},
@@ -692,7 +693,28 @@ def gadget_recover(_: bool = Depends(require_auth)):
 # ----------------------------- events (state stream) -----------------------------
 _UDC_DIR = "/sys/class/udc"
 _GADGET_UDC = "/sys/kernel/config/usb_gadget/kvm/UDC"
+_ACM_CONFIG = "/sys/kernel/config/usb_gadget/kvm/configs/c.1/acm.usb0"   # CDC-ACM linked into the active config
 _events_poller_task = None
+
+
+def _com_present(usb):
+    """True when a CDC-ACM COM port is actually presented to the target: the gadget is 'configured'
+    (host enumerated it) AND the acm function is linked into the active config."""
+    return usb.get("state") == "configured" and os.path.exists(_ACM_CONFIG)
+
+
+def _emit(ev):
+    """Publish one derived target_events dict {type, message, ...fields}."""
+    EVENTS.publish(ev["type"], **{k: v for k, v in ev.items() if k != "type"})
+
+
+def _power_key(pw):
+    # Diff power on stable fields only -- not the button-mode holding_secs countdown (ticks every poll).
+    if not isinstance(pw, dict):
+        return pw
+    return {**{k: pw.get(k) for k in ("enabled", "available", "mode")},
+            "targets": [{k: t.get(k) for k in ("label", "on", "holding", "fault")}
+                        for t in pw.get("targets", [])]}
 
 
 def _usb_state():
@@ -738,41 +760,84 @@ def _serial_key(ports):
 
 
 async def _events_poller():
-    """Publish an event per domain that changed. Catches state that changes WITHOUT an API call -- the target
-    enumerating/dropping the gadget (usb), HID re-opening, serial reconnects -- so /ws/events reflects
-    reality, not just operator actions."""
+    """Publish events for state that changes WITHOUT an API call -- the target enumerating/dropping the
+    gadget, powering on/off, the COM port appearing, HID coming online, a drive attaching, etc. For each
+    domain that changed we emit a coarse full-state event (usb/hid/serial/power/msd -- back-compat + lets a
+    client fold full state) AND the fine-grained semantic transitions from target_events (usb.enumerated,
+    power.on, serial.opened, ...). Fast, non-forking domains (usb/hid/serial) are sampled every 0.5s; the
+    forking/heavier ones (power reads pinctrl, drive hits the fs) are sampled ~every 2s off the loop."""
     last = {}
     errs = 0
+    tick = 0
     loop = asyncio.get_event_loop()
     while True:
         try:
+            # ---- fast domains (non-blocking): USB link, COM presence, HID, serial ports ----
             usb = _usb_state()
             if usb != last.get("usb"):
-                prev = (last.get("usb") or {}).get("state")
-                EVENTS.publish("usb", **usb); last["usb"] = usb
+                prev_usb = last.get("usb")
+                EVENTS.publish("usb", **usb)
+                for ev in target_events.usb_events(prev_usb, usb):
+                    _emit(ev)
+                last["usb"] = usb
                 # When the target (re)configures the gadget (a fresh enumeration, e.g. it just booted an
                 # OS/BIOS with HID), reopen HID so the keyboard/mouse come back immediately instead of
                 # dropping the first keystroke. Only on the transition -- no churn if it stays unopenable.
-                if usb.get("state") == "configured" and prev != "configured":
-                    # Target (re)configured the gadget. Rebind BOTH directions to the live host so a single
-                    # boot works (no re-enumeration needed): reopen HID if it isn't open, and reopen any open
-                    # /dev/ttyGS* so the serial TX/write path binds (an open-before-configure leaves TX dead).
+                if usb.get("state") == "configured" and (prev_usb or {}).get("state") != "configured":
+                    # Rebind BOTH directions to the live host so a single boot works (no re-enumeration):
+                    # reopen HID if closed, and reopen any open /dev/ttyGS* so the serial TX path binds.
                     if not hid.is_open():
                         await loop.run_in_executor(_hid_pool, lambda: hid.reopen(retries=4, delay=0.2))
                     SERIAL.reopen_gadget_ports()
+            com = _com_present(usb)
+            if com != last.get("com"):
+                for ev in target_events.com_events(last.get("com"), com):
+                    _emit(ev)
+                last["com"] = com
             h = _hid_state()
             if h != last.get("hid"):
-                EVENTS.publish("hid", **h); last["hid"] = h
+                EVENTS.publish("hid", **h)
+                for ev in target_events.hid_events(last.get("hid"), h):
+                    _emit(ev)
+                last["hid"] = h
             ports = SERIAL.status()
             key = _serial_key(ports)
             if key != last.get("serial"):
-                EVENTS.publish("serial", ports=ports); last["serial"] = key
+                EVENTS.publish("serial", ports=ports)
+                for ev in target_events.serial_events(last.get("serial_ports"), ports):
+                    _emit(ev)
+                last["serial"] = key
+                last["serial_ports"] = ports
+            # ---- forking/heavier domains (off the loop), ~every 2s: power (pinctrl), drive (fs) ----
+            if tick % 4 == 0:
+                pw = await loop.run_in_executor(None, _safe_status, power.status)
+                if pw is not None and _power_key(pw) != last.get("power"):
+                    EVENTS.publish("power", **pw)
+                    for ev in target_events.power_events((last.get("power_full") or {}).get("targets"),
+                                                         pw.get("targets")):
+                        _emit(ev)
+                    last["power"] = _power_key(pw); last["power_full"] = pw
+                dr = await loop.run_in_executor(None, _safe_status, msd.status)
+                if dr is not None and dr != last.get("drive"):
+                    EVENTS.publish("msd", **dr)
+                    for ev in target_events.drive_events(last.get("drive"), dr):
+                        _emit(ev)
+                    last["drive"] = dr
+            tick += 1
             errs = 0
         except Exception as e:
             errs += 1
             if errs == 1 or errs % 120 == 0:     # log the first error + occasionally; don't flood a wedged poll
                 print("[events] poller error: %r" % (e,), flush=True)
         await asyncio.sleep(0.5)
+
+
+def _safe_status(fn):
+    """Call a status fn (power/msd) that may fork/hit the fs; never let a transient failure kill the poll."""
+    try:
+        return fn()
+    except Exception:
+        return None
 
 
 @app.get("/api/events/state")
@@ -783,9 +848,15 @@ def events_state(_: bool = Depends(require_auth)):
 
 @app.websocket("/ws/events")
 async def ws_events(sock: WebSocket):
-    """Stream state-change events as JSON. On connect: a {type:'snapshot', ...} with full current state,
-    then live events -- usb (gadget/target enumeration), hid (keyboard/mouse open), serial (ports,
-    reconnects), reenumerate, and operator actions. ?replay=N replays up to N events from just before
+    """Stream events as JSON. On connect: a {type:'snapshot', ...} with full current state, then live
+    events of two kinds: COARSE full-state per domain ('usb','hid','serial','power','msd','reenumerate')
+    that a client folds to track state, and SEMANTIC target transitions -- each with a human 'message' --
+    covering everything observable about the target: it enumerating the gadget (usb.enumerated /
+    usb.enumerating / usb.suspended / usb.resumed / usb.detached, gadget.bound/unbound), powering up/down
+    (power.on / power.off), the COM port appearing and opening (serial.enumerated / serial.deenumerated /
+    serial.opened / serial.closed / serial.reconnected / serial.error[_cleared]), HID coming online
+    (hid.online / hid.offline) and the virtual drive attaching (drive.attached / detached / editing). See
+    target_events.EVENT_TYPES for the full list. ?replay=N replays up to N events from just before
     connecting. Auth via ?token=<API key> (or session cookie)."""
     if not ws_authed(sock):
         await sock.close(code=1008)
