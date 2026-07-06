@@ -66,6 +66,7 @@ TLS_ACTIVE = TLS and os.path.exists(TLS_CERT) and os.path.exists(TLS_KEY)
 USTREAMER = "http://%s:%s" % (_conf("video", "ustreamer_host", "127.0.0.1"),
                               _conf("video", "ustreamer_port", "8080"))
 MSD_IMAGE = _conf("usb", "image_path", "/opt/kvm/images/drive.img")
+STORE_IMG = "/opt/kvm/store.img"           # scratch RW LUN backing file (host -> Pi block store)
 # Extra browser origins allowed to open WebSockets / send unsafe requests (comma-separated host[:port]).
 EXTRA_ORIGINS = {o.strip() for o in _conf("web", "allowed_origins", "").split(",") if o.strip()}
 
@@ -284,6 +285,9 @@ API_INFO = {
          "desc": "Point-in-time state snapshot: {usb:{udc,bound,state}, hid:{keyboard,mouse}, serial:[...], msd, power, kvmswitch}."},
         {"method": "WS", "path": "/ws/events", "auth": True, "query": "replay (0-256), token",
          "desc": "Live state-event stream as JSON. On connect: {type:'snapshot',...} with full state, then events: 'usb' (gadget enumeration -- 'configured'/'not attached'), 'hid' (keyboard/mouse), 'serial' (ports: open/clients/reconnects), 'reenumerate'. ?replay=N replays recent events."},
+        {"method": "GET", "path": "/api/store/status", "auth": True, "desc": "Scratch block store: {present, path, block_size, size_bytes, blocks} (2nd mass-storage LUN the host writes to; enable with [usb] store_lun)."},
+        {"method": "GET", "path": "/api/store/region", "auth": True, "query": "lba, blocks",
+         "desc": "Read raw blocks the host WROTE to the store LUN: blocks x 512 B from lba (page-cache, coherent after the host's FUA). X-Store-Blocks header = blocks actually returned."},
         {"method": "GET", "path": "/api/usb/debug", "auth": True, "desc": "USB endpoint diagnostics: UDC state + per-endpoint status from sysfs/debugfs (RXFIFO level, halt, stall counts). Useful for diagnosing OUT endpoint stalls on the CDC-ACM gadget."},
         {"method": "GET", "path": "/api/power/state", "auth": True, "desc": "Per-target power relay state: {targets:[{label, on}]}."},
         {"method": "POST", "path": "/api/power", "auth": True, "body": "{index, on}", "desc": "Connect (on=true) or cut (on=false) a target's power (latched relay)."},
@@ -823,6 +827,44 @@ async def ws_events(sock: WebSocket):
         EVENTS.unsubscribe(q)
 
 
+# ----------------------------- scratch block store (host -> Pi bulk write / read-back) -----------------------------
+STORE_BLOCK = 512                      # SCSI / LBA sector size
+_STORE_MAX_BLOCKS = 8192               # cap a single read at 4 MB
+
+
+@app.get("/api/store/status")
+def store_status(_: bool = Depends(require_auth)):
+    """Scratch block store backing file: presence + geometry. When [usb] store_lun is on, the gadget's 2nd
+    mass-storage LUN is backed by this file; the connected host writes blocks to it, you read them back here."""
+    try:
+        sz = os.path.getsize(STORE_IMG)
+        present = True
+    except OSError:
+        sz, present = 0, False
+    return {"present": present, "path": STORE_IMG, "block_size": STORE_BLOCK,
+            "size_bytes": sz, "blocks": sz // STORE_BLOCK}
+
+
+@app.get("/api/store/region")
+def store_region(_: bool = Depends(require_auth), lba: int = 0, blocks: int = 1):
+    """Read raw blocks from the store backing file: `blocks` x 512 B starting at `lba`. Opens O_RDONLY
+    through the page cache (NOT O_DIRECT) so the read is coherent right after the host's FUA fsync. A read
+    past EOF returns the bytes available (see the X-Store-Blocks header)."""
+    blocks = max(1, min(_STORE_MAX_BLOCKS, blocks))     # FastAPI already coerced lba/blocks to int
+    try:
+        fd = os.open(STORE_IMG, os.O_RDONLY)
+    except OSError:
+        raise HTTPException(status_code=503, detail="store LUN backing file not present (enable [usb] store_lun)")
+    try:
+        total = os.fstat(fd).st_size // STORE_BLOCK
+        lba = max(0, min(lba, total))                   # clamp (also avoids os.pread off_t overflow on absurd
+        data = os.pread(fd, blocks * STORE_BLOCK, lba * STORE_BLOCK)   # lba); a read at/after EOF -> 0 bytes
+    finally:
+        os.close(fd)
+    return Response(content=data, media_type="application/octet-stream",
+                    headers={"X-Store-Lba": str(lba), "X-Store-Blocks": str(len(data) // STORE_BLOCK)})
+
+
 # ----------------------------- USB endpoint diagnostics -----------------------------
 _UDC_DEBUGFS = "/sys/kernel/debug/fe980000.usb"
 _UDC_SYSFS = "/sys/class/udc"
@@ -1095,6 +1137,9 @@ CONFIG_FIELDS = [
          {"key": "image_path", "label": "Drive image path", "type": "text", "default": "/opt/kvm/images/drive.img"},
          {"key": "image_size", "label": "Image size (e.g. 1G, 512M)", "type": "text", "default": "1G"},
          {"key": "usb_serial", "label": "Present a USB serial (COM) port to the target", "type": "bool", "default": "false"},
+         {"key": "store_lun", "label": "Present a 2nd mass-storage LUN (scratch RW block store) the host can write bulk data to (read back via /api/store)", "type": "bool", "default": "false"},
+         {"key": "store_size", "label": "Block store size (e.g. 64M, 256M, 1G)", "type": "text", "default": "64M"},
+         {"key": "store_inquiry", "label": "Block store SCSI INQUIRY vendor/product string (blank = kernel default; lets a specific host identify the LUN)", "type": "text", "default": ""},
      ]},
     {"section": "serial", "title": "Serial console",
      "note": "Defaults for the console UI; the per-session controls override these. Ports open raw, 8N1, echo off, DTR asserted.",

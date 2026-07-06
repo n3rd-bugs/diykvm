@@ -40,13 +40,15 @@ ORIGINS = r"[A-Za-z0-9_.\-:, ]{0,512}"        # comma-separated host[:port], or 
 PORTS = r"[A-Za-z0-9 _:,.\-]{0,256}"          # comma-separated Label:pin pairs, or blank
 COMBO = r"(?:(?:(?:Ctrl|Alt|Shift|Meta)\+){0,4}[A-Za-z0-9]{1,20})?"   # key combo (e.g. Ctrl+Space), or blank
 FLOW = r"(none|rtscts|xonxoff)"               # serial flow control mode
+INQ = r"[A-Za-z0-9 ._\-]{0,28}"               # SCSI INQUIRY vendor/product (printable, no shell metas), or blank
 
 SCHEMA = {
     "web": {"host": HOST, "port": PORT, "tls": BOOL,
             "tls_cert": PATH, "tls_key": PATH, "allowed_origins": ORIGINS},
     "video": {"device": DEV, "resolution": RES, "fps": INT,
               "ustreamer_host": HOST, "ustreamer_port": PORT},
-    "usb": {"image_path": PATH, "image_size": SIZE, "usb_serial": BOOL},
+    "usb": {"image_path": PATH, "image_size": SIZE, "usb_serial": BOOL,
+            "store_lun": BOOL, "store_size": SIZE, "store_inquiry": INQ},
     "serial": {"default_baud": BAUD, "default_flow": FLOW, "autostart": DEVLIST, "reconnect": BOOL},
     "power": {"enabled": BOOL, "active_low": BOOL, "open_drain": BOOL, "targets": PORTS},
     "kvmswitch": {"enabled": BOOL, "chip": CHIP, "active_low": BOOL, "pulse_ms": INT, "ports": PORTS},

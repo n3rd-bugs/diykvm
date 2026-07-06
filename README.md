@@ -74,7 +74,7 @@ sudo /opt/kvm/venv/bin/python /opt/kvm/app/setup_auth.py <user> <password>
 sudo systemctl restart kvm-web
 ```
 
-Then open **https://&lt;pi-ip&gt;:8000/** and sign in (HTTPS is on by default with a self‑signed cert — accept
+Then open **https://&lt;pi-ip&gt;:8000/** and sign in (HTTPS is on by default with a self-signed cert — accept
 the browser warning once; see [HTTPS](#https-on-by-default)).
 
 ## Configuration
@@ -93,19 +93,20 @@ sudo systemctl restart kvm-web ustreamer kvm-gadget
 | `video` | `device`, `resolution`, `fps` | `/dev/video0`, `1920x1080`, `30` | capture + stream |
 | `usb` | `image_path`, `image_size` | `/opt/kvm/images/drive.img`, `1G` | virtual drive |
 | `usb` | `usb_serial` | `false` | also present a USB serial (CDC‑ACM) COM port to the target (Pi side `/dev/ttyGS0`) |
+| `usb` | `store_lun`, `store_size`, `store_inquiry` | `false`, `64M`, _(blank)_ | also present a 2nd mass‑storage LUN (scratch RW block store) the host can WRITE(10) to and you read back via `GET /api/store/region` — a generic one‑way host→Pi bulk data store (logs, captures, firmware dumps …). `store_inquiry` sets the SCSI INQUIRY so a specific host identifies the LUN |
 | `serial` | `default_baud`, `default_flow`, `autostart`, `reconnect` | `115200`, `none`, _(blank)_, `true` | serial console: UI defaults (flow; raw/8N1/DTR/buffered); `autostart` auto‑opens listed ports from boot (blank = the other end opens on demand via `POST /api/serial/open`); `reconnect` auto‑reopens a dropped port. `POST /api/serial/reenumerate` re‑enumerates the gadget so the target gets a fresh COM port |
 | `ui` | `capture_exit` | `Ctrl+Space` | shortcut to release input capture (blank = on‑screen button only) |
 
 ### HTTPS (on by default)
 
-The installer enables HTTPS (`tls = true`) and generates a **self‑signed** cert at `/etc/kvm/tls/`, so you
-reach the UI at **`https://<pi-ip>:8000/`** (accept the browser's self‑signed warning once). HTTPS is the
-default because browsers auto‑upgrade `http://` to `https://` (HTTPS‑First / a cached HSTS pin) and treat
-`http` vs `https` as different sites for cookies (*schemeful same‑site*) — over plain HTTP that breaks the
-session so login bounces back to the sign‑in page.
+The installer enables HTTPS (`tls = true`) and generates a **self-signed** cert at `/etc/kvm/tls/`, so you
+reach the UI at **`https://<pi-ip>:8000/`** (accept the browser's self-signed warning once). HTTPS is the
+default because browsers auto-upgrade `http://` to `https://` (HTTPS-First / a cached HSTS pin) and treat
+`http` vs `https` as different sites for cookies (*schemeful same-site*) — over plain HTTP that breaks the
+session so login bounces back to the sign-in page.
 
 Drop in your own cert/key any time (replace `/etc/kvm/tls/{cert,key}.pem`, keep them readable by group
-`diykvm`), then `sudo systemctl restart kvm-web`. To regenerate the self‑signed cert by hand:
+`diykvm`), then `sudo systemctl restart kvm-web`. To regenerate the self-signed cert by hand:
 
 ```sh
 sudo openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
@@ -116,7 +117,7 @@ sudo chmod 640 /etc/kvm/tls/key.pem
 sudo systemctl restart kvm-web
 ```
 
-To run plain HTTP instead (e.g. behind a TLS‑terminating proxy), set `tls = false` in `/etc/kvm/kvm.conf`.
+To run plain HTTP instead (e.g. behind a TLS-terminating proxy), set `tls = false` in `/etc/kvm/kvm.conf`.
 
 ## EFI boot media
 

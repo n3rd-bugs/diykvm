@@ -20,18 +20,37 @@ if command -v kvm-conf-get >/dev/null 2>&1; then
   case "$(kvm-conf-get usb usb_serial false | tr '[:upper:]' '[:lower:]')" in 1|true|yes|on) ACM=true ;; esac
 fi
 
+# Optional 2nd mass-storage LUN: a scratch read-write block store the connected host can WRITE(10) to and
+# you read back via the web API (GET /api/store/region). Generic: logs, captures, bulk data offload, etc.
+# Size and an optional SCSI INQUIRY (so a specific host can identify the LUN) come from config.
+STORE=false
+if command -v kvm-conf-get >/dev/null 2>&1; then
+  case "$(kvm-conf-get usb store_lun false | tr '[:upper:]' '[:lower:]')" in 1|true|yes|on) STORE=true ;; esac
+fi
+STORE_IMG=/opt/kvm/store.img
+STORE_SIZE="$(command -v kvm-conf-get >/dev/null 2>&1 && kvm-conf-get usb store_size 64M || echo 64M)"
+STORE_INQ="$(command -v kvm-conf-get >/dev/null 2>&1 && kvm-conf-get usb store_inquiry '' || echo '')"
+
 # --- teardown if it already exists ---
 if [ -d "$G" ]; then
   echo "" > "$G/UDC" 2>/dev/null || true
   for l in "$G"/configs/c.1/hid.usb0 "$G"/configs/c.1/hid.usb1 "$G"/configs/c.1/mass_storage.usb0 "$G"/configs/c.1/acm.usb0; do if [ -L "$l" ]; then rm -f "$l"; fi; done
-  [ -d "$G/configs/c.1/strings/0x409" ] && rmdir "$G/configs/c.1/strings/0x409"
-  [ -d "$G/configs/c.1" ] && rmdir "$G/configs/c.1"
-  [ -d "$G/functions/hid.usb0" ] && rmdir "$G/functions/hid.usb0"
-  [ -d "$G/functions/hid.usb1" ] && rmdir "$G/functions/hid.usb1"
+  [ -d "$G/configs/c.1/strings/0x409" ] && rmdir "$G/configs/c.1/strings/0x409" 2>/dev/null || true
+  [ -d "$G/configs/c.1" ] && rmdir "$G/configs/c.1" 2>/dev/null || true
+  [ -d "$G/functions/hid.usb0" ] && rmdir "$G/functions/hid.usb0" 2>/dev/null || true
+  [ -d "$G/functions/hid.usb1" ] && rmdir "$G/functions/hid.usb1" 2>/dev/null || true
   if [ -d "$G/functions/acm.usb0" ]; then rmdir "$G/functions/acm.usb0" || true; fi
-  [ -d "$G/functions/mass_storage.usb0" ] && { echo "" > "$G/functions/mass_storage.usb0/lun.0/file" 2>/dev/null; rmdir "$G/functions/mass_storage.usb0" 2>/dev/null; }
-  [ -d "$G/strings/0x409" ] && rmdir "$G/strings/0x409"
-  rmdir "$G"
+  if [ -d "$G/functions/mass_storage.usb0" ]; then
+    echo "" > "$G/functions/mass_storage.usb0/lun.0/file" 2>/dev/null || true
+    # extra LUNs (e.g. lun.1 trace) must be removed before the function dir can rmdir
+    if [ -d "$G/functions/mass_storage.usb0/lun.1" ]; then
+      echo "" > "$G/functions/mass_storage.usb0/lun.1/file" 2>/dev/null || true
+      rmdir "$G/functions/mass_storage.usb0/lun.1" 2>/dev/null || true
+    fi
+    rmdir "$G/functions/mass_storage.usb0" 2>/dev/null || true
+  fi
+  [ -d "$G/strings/0x409" ] && rmdir "$G/strings/0x409" 2>/dev/null || true
+  rmdir "$G" 2>/dev/null || true     # never let a teardown failure (e.g. a still-busy lun.1) abort the rebuild
 fi
 
 # --- create gadget ---
@@ -73,6 +92,24 @@ echo 1 > "$G/functions/mass_storage.usb0/lun.0/removable"
 echo 0 > "$G/functions/mass_storage.usb0/lun.0/ro"
 echo 0 > "$G/functions/mass_storage.usb0/lun.0/cdrom"
 [ -f "$IMG" ] && echo "$IMG" > "$G/functions/mass_storage.usb0/lun.0/file"
+
+# lun.1: optional scratch RW block store. FUA is honored (nofua=0) so a host WRITE(10) with FUA fsyncs the
+# backing file -> a Pi page-cache read is coherent. An optional INQUIRY string from config lets a specific
+# host identify the LUN. Backed by STORE_IMG; accessible to the web service (group diykvm).
+if [ "$STORE" = "true" ]; then
+  # Fully guarded: a store-LUN problem must never abort gadget-up (the keyboard/mouse/boot LUN must come up).
+  [ -f "$STORE_IMG" ] || truncate -s "$STORE_SIZE" "$STORE_IMG" 2>/dev/null || truncate -s 64M "$STORE_IMG" 2>/dev/null || true
+  chgrp diykvm "$STORE_IMG" 2>/dev/null || true; chmod 0640 "$STORE_IMG" 2>/dev/null || true
+  L1="$G/functions/mass_storage.usb0/lun.1"
+  if [ -f "$STORE_IMG" ] && mkdir -p "$L1" 2>/dev/null; then
+    echo 1 > "$L1/removable" 2>/dev/null || true
+    echo 0 > "$L1/ro"        2>/dev/null || true
+    echo 0 > "$L1/cdrom"     2>/dev/null || true
+    echo 0 > "$L1/nofua"     2>/dev/null || true          # FUA -> fsync (REQUIRED for read coherency)
+    [ -n "$STORE_INQ" ] && { echo "$STORE_INQ" > "$L1/inquiry_string" 2>/dev/null || true; }   # blank -> kernel default
+    echo "$STORE_IMG" > "$L1/file" 2>/dev/null || true
+  fi
+fi
 
 # acm.usb0: optional CDC-ACM serial -> target sees a USB COM port; the Pi gets /dev/ttyGS0.
 if [ "$ACM" = "true" ]; then mkdir -p "$G/functions/acm.usb0"; fi
