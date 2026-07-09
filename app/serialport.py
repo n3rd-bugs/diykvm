@@ -143,9 +143,12 @@ class _Port:
         self._reconnecting = True
         async with self._iolock:                       # close the dead handle without racing a write()
             try:
-                await self._loop.run_in_executor(self._pool, self.ser.close)
+                # Bound the close: on a wedged gadget tty, ser.close() can block indefinitely, which would
+                # hold _iolock (and burn a pool worker) forever and freeze every reopen. wait_for stops us
+                # awaiting it past the timeout (the close may finish later in its thread; the fd is dead).
+                await asyncio.wait_for(self._loop.run_in_executor(self._pool, self.ser.close), timeout=5.0)
             except Exception:
-                pass
+                pass                                   # includes asyncio.TimeoutError (a subclass of Exception)
         delay = 0.3
         while not self._stop.is_set():
             try:

@@ -5,7 +5,11 @@ Wants=network-online.target
 Requires=kvm-gadget.service
 
 [Service]
-Type=simple
+# Type=notify + WatchdogSec: the app pings the systemd watchdog from its event loop (sd_notify
+# WATCHDOG=1). If the loop ever freezes, the pings stop and systemd kills+restarts the service --
+# recovering a HANG (process alive but stuck), which Restart=on-failure alone cannot detect.
+Type=notify
+WatchdogSec=30
 # Unprivileged service. It writes /dev/hidg* via the 'diykvm' group (udev rule), opens serial
 # ports via 'dialout', drives the power GPIO via 'gpio' (/dev/gpiochip*), and performs the
 # privileged virtual-drive / config transitions through "sudo kvm-*-helper" (see
@@ -20,6 +24,10 @@ EnvironmentFile=-/etc/kvm/kvm.env
 ExecStart=/opt/kvm/venv/bin/python /opt/kvm/app/server.py
 Restart=on-failure
 RestartSec=2
+# Track memory (so a leak is visible in `systemctl status`) and hard-cap it: if the service ever blows
+# past this, the cgroup OOM-kills only kvm-web (then Restart recovers it) instead of the whole Pi.
+MemoryAccounting=yes
+MemoryMax=512M
 
 [Install]
 WantedBy=multi-user.target

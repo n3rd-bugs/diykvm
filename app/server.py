@@ -13,6 +13,7 @@ import io
 import os
 import time
 import asyncio
+import socket
 import subprocess
 import threading
 import configparser
@@ -131,21 +132,36 @@ def ws_authed(sock: WebSocket) -> bool:
 
 
 # ----------------------------- login (rate-limited) -----------------------------
-_FAILS = {}                              # ip -> [count, locked_until]
+_FAILS = {}                              # ip -> (count, locked_until, last_seen)
 _MAX_FAILS = 5
 _LOCK_BASE = 5                           # seconds, doubled each fail past the threshold (cap 300)
+_FAILS_TTL = 3600                        # forget an IP's failure record after this many idle seconds
+_FAILS_MAX = 4096                        # hard cap on tracked IPs; over it, evict the least-recently-seen
+
+
+def _prune_fails(now):
+    # Keep _FAILS bounded: a stream of one-shot failures (scanners rotating source IPs) would otherwise
+    # grow it forever, since entries are only removed on a SUCCESSFUL login. Drop idle records; if still
+    # over the cap, evict the stalest.
+    for ip in [ip for ip, v in _FAILS.items() if now - v[2] > _FAILS_TTL]:
+        _FAILS.pop(ip, None)
+    if len(_FAILS) > _FAILS_MAX:
+        for ip, _ in sorted(_FAILS.items(), key=lambda kv: kv[1][2])[:len(_FAILS) - _FAILS_MAX]:
+            _FAILS.pop(ip, None)
 
 
 def _locked_for(ip):
-    c, until = _FAILS.get(ip, (0, 0))
-    return max(0, int(until - time.time()))
+    v = _FAILS.get(ip)
+    return max(0, int(v[1] - time.time())) if v else 0
 
 
 def _note_fail(ip):
-    c, _ = _FAILS.get(ip, (0, 0))
-    c += 1
-    until = time.time() + min(300, _LOCK_BASE * (2 ** (c - _MAX_FAILS))) if c >= _MAX_FAILS else 0
-    _FAILS[ip] = (c, until)
+    now = time.time()
+    c = _FAILS.get(ip, (0, 0, 0))[0] + 1
+    until = now + min(300, _LOCK_BASE * (2 ** (c - _MAX_FAILS))) if c >= _MAX_FAILS else 0
+    _FAILS[ip] = (c, until, now)
+    if len(_FAILS) > _FAILS_MAX:
+        _prune_fails(now)
 
 
 def _note_ok(ip):
@@ -172,7 +188,9 @@ def login_page():
 
 @app.post("/login")
 async def login(request: Request, username: str = Form(...), password: str = Form(...)):
-    if _do_login(request, username, password):
+    # _do_login runs pbkdf2 (200k iters) and a 0.5s failure sleep -- offload it so a login attempt (or a
+    # bot hammering /login) can never stall the event loop and freeze every other connection.
+    if await asyncio.to_thread(_do_login, request, username, password):
         request.session["user"] = username
         return RedirectResponse("/", status_code=303)
     return RedirectResponse("/login?e=1", status_code=303)
@@ -186,7 +204,7 @@ async def logout(request: Request):
 
 @app.post("/api/login")
 async def api_login(request: Request, username: str = Form(...), password: str = Form(...)):
-    if _do_login(request, username, password):
+    if await asyncio.to_thread(_do_login, request, username, password):   # off-loop: pbkdf2 + failure sleep
         return {"api_key": cfg["api_key"]}
     raise HTTPException(status_code=401, detail="invalid credentials")
 
@@ -888,14 +906,17 @@ async def ws_events(sock: WebSocket):
     try:
         await asyncio.wait({st, rt}, return_when=asyncio.FIRST_COMPLETED)
     finally:
+        # Release the subscriber FIRST so it always runs -- awaiting a cancelled task below re-raises
+        # CancelledError (a BaseException, NOT caught by `except Exception`), which would otherwise skip
+        # this and leak the queue in EVENTS._subs on every disconnect (unbounded memory + publish cost).
+        EVENTS.unsubscribe(q)
         for t in (st, rt):
             t.cancel()
         for t in (st, rt):           # await the cancellations so exceptions aren't left unretrieved
             try:
                 await t
-            except Exception:
+            except (asyncio.CancelledError, Exception):
                 pass
-        EVENTS.unsubscribe(q)
 
 
 # ----------------------------- scratch block store (host -> Pi bulk write / read-back) -----------------------------
@@ -1129,6 +1150,34 @@ async def _serial_autostart():
         await asyncio.sleep(5)
 
 
+def _sd_notify(state: str):
+    """Best-effort sd_notify(3) to systemd (READY=1 / WATCHDOG=1). No-op when not run under systemd."""
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr[0] == "@":                        # abstract-namespace socket
+        addr = "\0" + addr[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.connect(addr)
+            s.sendall(state.encode())
+    except OSError:
+        pass
+
+
+async def _watchdog_heartbeat():
+    """Ping the systemd watchdog from the event loop. If the loop ever FREEZES (the failure mode we just
+    fixed in HID/login), these pings stop and systemd kills+restarts the service after WatchdogSec --
+    recovering a hang that Restart=on-failure alone can't catch (the process is alive, just stuck)."""
+    usec = os.environ.get("WATCHDOG_USEC")
+    if not usec:
+        return
+    interval = max(1.0, int(usec) / 1e6 / 3.0)   # ping at ~1/3 the deadline
+    while True:
+        _sd_notify("WATCHDOG=1")
+        await asyncio.sleep(interval)
+
+
 @app.on_event("startup")
 async def _serial_startup():
     global _serial_autostart_task, _events_poller_task
@@ -1136,6 +1185,8 @@ async def _serial_startup():
     if _autostart_devices():
         _serial_autostart_task = asyncio.create_task(_serial_autostart())
     _events_poller_task = asyncio.create_task(_events_poller())
+    asyncio.create_task(_watchdog_heartbeat())
+    _sd_notify("READY=1")                      # Type=notify: signal startup complete (harmless otherwise)
 
 
 @app.on_event("shutdown")

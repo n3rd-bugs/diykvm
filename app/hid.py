@@ -7,6 +7,7 @@ Two gadget HID devices:
                  rel = [0x03, btns, dx, dy, wheel]             (5 bytes)
 """
 import os
+import select
 import threading
 import time
 
@@ -15,6 +16,12 @@ HIDG_MOUSE = "/dev/hidg1"   # mouse, report-id multiplexed
 MOUSE_ABS_ID = 0x02         # desktop: absolute positioning
 MOUSE_REL_ID = 0x03         # touch:   relative/trackpad
 ABS_MAX = 32767
+# Max time to wait for the target to accept a HID report before dropping it. A gadget write to /dev/hidg*
+# blocks until the target polls the interrupt-IN endpoint; a healthy target does so within ~1-10ms. If the
+# target has stopped polling (asleep/rebooting/hung), a BLOCKING write would hang forever holding the HID
+# lock -- and the event-loop poller reads HID state, so that froze the whole KVM. We open non-blocking and
+# bound the wait: past this, the report is dropped (input to a non-listening target is worthless anyway).
+WRITE_TIMEOUT = 0.2
 
 # JS KeyboardEvent.code -> modifier bit
 MODIFIERS = {
@@ -65,31 +72,46 @@ class HIDController:
 
     def _open(self, which: str):
         try:
-            self._fds[which] = os.open(self._paths[which], os.O_WRONLY)
+            # Non-blocking so a target that stops polling the HID endpoint can never wedge a write() (which
+            # would freeze the KVM -- see WRITE_TIMEOUT). _try_write bounds the wait with select().
+            self._fds[which] = os.open(self._paths[which], os.O_WRONLY | os.O_NONBLOCK)
         except OSError:
             self._fds[which] = None
 
+    def _try_write(self, fd: int, data: bytes) -> bool:
+        """Bounded non-blocking write of one HID report. Waits up to WRITE_TIMEOUT for the endpoint to
+        accept it, then writes. Returns True if the fd is still usable (report sent, or dropped because the
+        target isn't draining) and False if the fd errored and should be reopened. Never blocks unbounded."""
+        try:
+            _, wready, _ = select.select([], [fd], [], WRITE_TIMEOUT)
+            if not wready:
+                return True                # target not accepting reports now -> drop this one, keep the fd
+            os.write(fd, data)
+            return True
+        except BlockingIOError:
+            return True                    # endpoint momentarily full -> drop, fd is fine
+        except OSError:
+            return False                   # real error (e.g. gadget rebuilt) -> caller reopens
+
     def _write(self, which: str, data: bytes):
+        # Held only for the bounded write (<= WRITE_TIMEOUT), never indefinitely, so reopen() and the
+        # (now lock-free) status reads are never starved. The single _hid_pool worker serializes writes.
         with self._lock:
             if self._fds[which] is None:
                 self._open(which)
-            if self._fds[which] is None:
+            fd = self._fds[which]
+            if fd is None:
                 return
-            try:
-                os.write(self._fds[which], data)
-            except OSError:
+            if self._try_write(fd, data) is False:
                 # gadget may have been rebuilt; reopen once and retry
                 try:
-                    os.close(self._fds[which])
+                    os.close(fd)
                 except OSError:
                     pass
                 self._fds[which] = None
                 self._open(which)
                 if self._fds[which] is not None:
-                    try:
-                        os.write(self._fds[which], data)
-                    except OSError:
-                        pass
+                    self._try_write(self._fds[which], data)
 
     # ---- keyboard (8 bytes, NO report id) -> /dev/hidg0 ----
     def _kbd_report(self) -> bytes:
@@ -160,14 +182,18 @@ class HIDController:
         self._write("mouse", self._rel_report(wheel=dy))
         self._write("mouse", self._rel_report(wheel=0))   # auto-release the wheel axis
 
-    # ---- state (lock-guarded; safe to call from the event loop while the pool thread writes) ----
+    # ---- state (LOCK-FREE advisory reads; called from the event loop by the events poller) ----
+    # These deliberately do NOT take self._lock: a single dict read is atomic under the GIL, and a
+    # momentarily-stale bool is harmless for the status stream. Taking the lock here was the freeze bug --
+    # a write wedged on a non-polling target held the lock, and the poller acquiring it on the loop thread
+    # blocked the ENTIRE event loop. Bounded writes now cap the hold, but keep these lock-free regardless.
     def is_open(self) -> bool:
-        with self._lock:
-            return self._fds["kbd"] is not None and self._fds["mouse"] is not None
+        fds = self._fds
+        return fds["kbd"] is not None and fds["mouse"] is not None
 
     def devices_open(self) -> dict:
-        with self._lock:
-            return {"keyboard": self._fds["kbd"] is not None, "mouse": self._fds["mouse"] is not None}
+        fds = self._fds
+        return {"keyboard": fds["kbd"] is not None, "mouse": fds["mouse"] is not None}
 
     # ---- safety ----
     def release_all(self):

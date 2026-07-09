@@ -65,8 +65,12 @@ class MSD:
         p = self._lun_path()
         return os.path.basename(p) if p else None
 
-    @_locked
     def status(self) -> dict:
+        # NOT @_locked on purpose: this is a read-only advisory snapshot (lun.0/file is world-readable and
+        # the mount is a stat) called every poll by the events loop + on every /ws/events connect. Taking
+        # the RLock made it block for the ENTIRE duration of a multi-GB image upload (save_image_upload holds
+        # the lock across its whole streaming loop), stalling the poller/snapshot. A torn read here is
+        # harmless. The privileged attach/detach transitions stay serialized by their own @_locked.
         attached = self.is_attached()
         mounted = self.is_mounted()
         size = os.path.getsize(self.image) if os.path.exists(self.image) else 0
