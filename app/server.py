@@ -67,6 +67,9 @@ TLS_KEY = _conf("web", "tls_key", "/etc/kvm/tls/key.pem")
 TLS_ACTIVE = TLS and os.path.exists(TLS_CERT) and os.path.exists(TLS_KEY)
 USTREAMER = "http://%s:%s" % (_conf("video", "ustreamer_host", "127.0.0.1"),
                               _conf("video", "ustreamer_port", "8080"))
+# Which capture card kvm-ustreamer streams (multi-PC): the app writes the selected /dev/video* here and
+# restarts the streamer; kvm-ustreamer reads it, honoring only devices in the [video] devices allowlist.
+VIDEO_SOURCE_FILE = "/run/kvm/video-source"
 MSD_IMAGE = _conf("usb", "image_path", "/opt/kvm/images/drive.img")
 STORE_IMG = "/opt/kvm/store.img"           # scratch RW LUN backing file (host -> Pi block store)
 # Extra browser origins allowed to open WebSockets / send unsafe requests (comma-separated host[:port]).
@@ -265,7 +268,9 @@ API_INFO = {
                  "{t:'reset'} release everything; {t:'ping',ts} -> server replies {t:'pong',ts} "
                  "(echoes ts) to measure round-trip latency over this socket."},
         {"method": "GET", "path": "/snapshot", "auth": True, "desc": "JPEG of the target screen now."},
-        {"method": "GET", "path": "/stream", "auth": True, "desc": "Live MJPEG stream."},
+        {"method": "GET", "path": "/stream", "auth": True, "desc": "Live MJPEG stream (of the selected capture card)."},
+        {"method": "GET", "path": "/api/video/sources", "auth": True, "desc": "Selectable capture cards (multi-PC): {sources:[{index,label}], active, multi}. Configure via [video] devices = Label:/dev/videoN, ..."},
+        {"method": "POST", "path": "/api/video/select", "auth": True, "body": "{index}", "desc": "Switch the live stream to that capture card (restarts the streamer, ~1-2s). Only a configured [video] devices card is allowed."},
         {"method": "GET", "path": "/api/ocr", "auth": True, "query": "lang, psm, min_conf, region (x,y,w,h), scale, words",
          "desc": "OCR the current screen -> {image:{w,h}, text, lines[], blocks[]}. Each line/block has text, a "
                  "bbox [x,y,w,h] in image pixels and a confidence; lines are in reading order and blocks group "
@@ -367,6 +372,70 @@ async def snapshot(_: bool = Depends(require_auth)):
     except Exception:
         raise HTTPException(status_code=502, detail="stream source unavailable")
     return Response(r.content, media_type=r.headers.get("content-type", "image/jpeg"))
+
+
+# ----------------------------- capture source selection (multi-PC) -----------------------------
+def _video_sources():
+    """Parse [video] devices ('PC1:/dev/video0, PC2:/dev/video1') into [{index, label, device}]. Read fresh
+    so Config-page edits show up. Falls back to the single [video] device when devices is blank (backward
+    compatible: one source). Only /dev/* device paths are accepted."""
+    c = configparser.ConfigParser()
+    c.read(CONF_PATH)
+    out = []
+    for item in c.get("video", "devices", fallback="").split(","):
+        item = item.strip()
+        if not item or ":" not in item:
+            continue
+        label, _, dev = item.partition(":")          # split on the FIRST colon (label : /dev/path)
+        label, dev = label.strip(), dev.strip()
+        if label and dev.startswith("/dev/"):
+            out.append({"index": len(out), "label": label, "device": dev})
+    if not out:
+        out = [{"index": 0, "label": "Screen", "device": c.get("video", "device", fallback="/dev/video0")}]
+    return out
+
+
+def _video_active(sources):
+    """Index of the source currently streaming, from the runtime pointer; 0 (the first/default) if unset."""
+    try:
+        with open(VIDEO_SOURCE_FILE) as f:
+            sel = f.read().strip()
+    except OSError:
+        sel = ""
+    for s in sources:
+        if s["device"] == sel:
+            return s["index"]
+    return 0
+
+
+@app.get("/api/video/sources")
+def video_sources(_: bool = Depends(require_auth)):
+    """List selectable capture cards for the UI (labels only; device paths stay server-side) + which is
+    live. multi=false means a single card -> the UI hides the selector."""
+    src = _video_sources()
+    return {"sources": [{"index": s["index"], "label": s["label"]} for s in src],
+            "active": _video_active(src), "multi": len(src) > 1}
+
+
+@app.post("/api/video/select")
+def video_select(payload: dict = Body(default={}), _: bool = Depends(require_auth)):
+    """Switch the live stream to another capture card: point kvm-ustreamer at that device and restart it
+    (~1-2s). Only a card in the configured [video] devices list can be chosen."""
+    src = _video_sources()
+    try:
+        chosen = src[int((payload or {}).get("index"))]
+    except (ValueError, TypeError, IndexError):
+        raise HTTPException(status_code=400, detail="no such video source")
+    try:
+        os.makedirs(os.path.dirname(VIDEO_SOURCE_FILE), exist_ok=True)
+        with open(VIDEO_SOURCE_FILE, "w") as f:      # kvm-ustreamer re-validates this against the allowlist
+            f.write(chosen["device"] + "\n")
+    except OSError as e:
+        raise HTTPException(status_code=500, detail="could not set video source: %s" % e)
+    proc = subprocess.run(["sudo", "-n", CONF_HELPER, "restart-streamer"], capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise HTTPException(status_code=502, detail=(proc.stderr or "streamer restart failed").strip())
+    return {"active": chosen["index"], "label": chosen["label"]}
 
 
 @app.get("/api/ocr")
@@ -1247,7 +1316,8 @@ CONFIG_FIELDS = [
     {"section": "video", "title": "Video capture",
      "note": "Apply with the “Restart streamer” button.",
      "fields": [
-         {"key": "device", "label": "Capture device", "type": "text", "default": "/dev/video0"},
+         {"key": "device", "label": "Capture device (single card, or the default source)", "type": "text", "default": "/dev/video0"},
+         {"key": "devices", "label": "Capture cards for multi-PC — Label:/dev/videoN, comma-separated (e.g. PC1:/dev/video0, PC2:/dev/video1). Blank = just the single device above; the UI shows a source picker when 2+ are listed.", "type": "text", "default": ""},
          {"key": "resolution", "label": "Resolution (WxH)", "type": "text", "default": "1920x1080"},
          {"key": "fps", "label": "Frames per second", "type": "number", "default": "30"},
          {"key": "ustreamer_host", "label": "uStreamer host", "type": "text", "default": "127.0.0.1"},

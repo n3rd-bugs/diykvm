@@ -1,8 +1,40 @@
 #!/bin/sh
-# Launch uStreamer using settings from /etc/kvm/kvm.conf
+# Launch uStreamer for the SELECTED capture card, using settings from /etc/kvm/kvm.conf.
+#
+# Multi-PC: [video] devices lists the cards as "Label:/dev/videoN" pairs. The web UI writes the chosen
+# device path to $SEL_FILE and restarts this service; we stream that device -- but ONLY if it is one of
+# the configured cards (the runtime file can never point us at an arbitrary path). With no devices list we
+# fall back to the single [video] device, so existing single-card setups are unchanged.
 G() { kvm-conf-get "$1" "$2" "$3"; }
+SEL_FILE=/run/kvm/video-source
+
+DEVICES=$(G video devices "")
+DEFAULT=$(G video device /dev/video0)
+SEL=$(cat "$SEL_FILE" 2>/dev/null || true)
+
+first=""
+active=""
+if [ -n "$DEVICES" ]; then
+    oldifs=$IFS
+    IFS=,
+    # shellcheck disable=SC2086  # intentional word-split of the comma-separated list (IFS=, set above)
+    for entry in $DEVICES; do
+        dev=$(printf '%s' "$entry" | sed 's/^[^:]*://; s/^[[:space:]]*//; s/[[:space:]]*$//')
+        case "$dev" in
+            /dev/video*|/dev/v4l/*) ;;   # a v4l capture node or a stable by-id symlink
+            *) continue ;;               # skip malformed / non-capture entries
+        esac
+        [ -z "$first" ] && first="$dev"
+        [ "$dev" = "$SEL" ] && active="$dev"   # honor the selection only when it is an allowlisted card
+    done
+    IFS=$oldifs
+fi
+
+[ -z "$first" ] && first="$DEFAULT"      # no devices list -> single-card fallback
+[ -z "$active" ] && active="$first"      # no valid selection -> the first/default card
+
 exec /usr/bin/ustreamer \
-  --device="$(G video device /dev/video0)" \
+  --device="$active" \
   --format=MJPEG \
   --resolution="$(G video resolution 1920x1080)" \
   --desired-fps="$(G video fps 30)" \

@@ -140,6 +140,7 @@
     <strong>DIY&nbsp;PiKVM</strong>
     <button id="cap">Capture input: OFF</button>
     <button id="cad" title="Ctrl+Alt+Del">Ctrl-Alt-Del</button>
+    <select id="vidsrc" title="capture source — pick which PC to watch" style="display:none"></select>
     <button id="rel" title="release stuck keys/buttons">Release all</button>
     <button id="files" title="virtual USB drive">Files ▾</button>
     <button id="kbd" title="on-screen keyboard">⌨</button>
@@ -264,6 +265,35 @@ const wsURL = (p) => (location.protocol === 'https:' ? 'wss://' : 'ws://') + loc
 const streamURL = '/stream';                 // proxied through the authenticated app
 const img = document.getElementById('screen');
 img.src = streamURL;
+
+// ---- capture source picker (multi-PC) + auto-reconnect the MJPEG stream ----
+// If the stream drops (the streamer restarting -- e.g. after a source switch), reconnect shortly. This
+// also makes the video self-heal across any ustreamer restart.
+img.addEventListener('error', () => { setTimeout(() => { img.src = streamURL + '?t=' + Date.now(); }, 1000); });
+const vidsrc = document.getElementById('vidsrc');
+async function loadVideoSources() {
+  try {
+    const s = await api('/api/video/sources');
+    if (!s || !s.multi) { vidsrc.style.display = 'none'; return; }   // single card -> no picker
+    vidsrc.innerHTML = '';
+    s.sources.forEach(src => {
+      const o = document.createElement('option'); o.value = src.index; o.textContent = src.label;  // text = no XSS
+      vidsrc.appendChild(o);
+    });
+    vidsrc.value = String(s.active);
+    vidsrc.style.display = '';
+  } catch (e) { /* leave the picker hidden if sources can't be read */ }
+}
+vidsrc.onchange = async () => {
+  const idx = Number(vidsrc.value), label = vidsrc.options[vidsrc.selectedIndex].textContent;
+  vidsrc.disabled = true;
+  try {
+    await api('/api/video/select', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ index: idx }) });
+    img.src = streamURL + '?t=' + Date.now();     // reconnect; onerror retries until the streamer is back up
+  } catch (e) { alert('Could not switch to ' + label + ': ' + e.message); }
+  vidsrc.disabled = false;
+};
+loadVideoSources();
 
 const dot  = document.getElementById('dot');
 const info = document.getElementById('info');

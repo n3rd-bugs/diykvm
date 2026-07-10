@@ -19,6 +19,9 @@ User=diykvm
 Group=diykvm
 SupplementaryGroups=dialout gpio
 RuntimeDirectory=kvm
+# Keep /run/kvm across a kvm-web restart so the selected capture source (/run/kvm/video-source, read by
+# kvm-ustreamer) isn't lost when the web service restarts. (It still resets to the default on reboot.)
+RuntimeDirectoryPreserve=yes
 WorkingDirectory=/opt/kvm/app
 EnvironmentFile=-/etc/kvm/kvm.env
 ExecStart=/opt/kvm/venv/bin/python /opt/kvm/app/server.py
