@@ -1329,12 +1329,17 @@ CONFIG_FIELDS = [
          {"key": "ustreamer_host", "label": "uStreamer host", "type": "text", "default": "127.0.0.1"},
          {"key": "ustreamer_port", "label": "uStreamer port", "type": "number", "default": "8080"},
      ]},
-    {"section": "usb", "title": "Virtual USB drive & serial",
-     "note": "Applied after: sudo systemctl restart kvm-gadget (briefly re-enumerates USB).",
+    {"section": "usb", "title": "USB gadget functions",
+     "note": "Which functions the target sees. Each costs USB endpoints (the Pi has only 7): keyboard/mouse "
+             "1 each, drive 2, serial 3 — turn off what a target doesn't need for a more robust gadget. "
+             "Applied after: sudo systemctl restart kvm-gadget (briefly re-enumerates USB).",
      "fields": [
+         {"key": "keyboard", "label": "Keyboard (HID) — needed to type to the target", "type": "bool", "default": "true"},
+         {"key": "mouse", "label": "Mouse (HID)", "type": "bool", "default": "true"},
+         {"key": "mass_storage", "label": "Virtual USB drive (mass storage)", "type": "bool", "default": "true"},
+         {"key": "usb_serial", "label": "Present a USB serial (COM) port to the target", "type": "bool", "default": "false"},
          {"key": "image_path", "label": "Drive image path", "type": "text", "default": "/opt/kvm/images/drive.img"},
          {"key": "image_size", "label": "Image size (e.g. 1G, 512M)", "type": "text", "default": "1G"},
-         {"key": "usb_serial", "label": "Present a USB serial (COM) port to the target", "type": "bool", "default": "false"},
          {"key": "store_lun", "label": "Present a 2nd mass-storage LUN (scratch RW block store) the host can write bulk data to (read back via /api/store)", "type": "bool", "default": "false"},
          {"key": "store_size", "label": "Block store size (e.g. 64M, 256M, 1G)", "type": "text", "default": "64M"},
          {"key": "store_inquiry", "label": "Block store SCSI INQUIRY vendor/product string (blank = kernel default; lets a specific host identify the LUN)", "type": "text", "default": ""},
