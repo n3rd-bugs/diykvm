@@ -203,6 +203,20 @@ class HIDController:
         self._write("kbd", self._kbd_report())
         self._write("mouse", self._rel_report())
 
+    def close(self):
+        """Close the HID fds. Call this BEFORE a gadget re-enumerate (UDC unbind): the /dev/hidg* char
+        devices are torn down by hidg_unbind during the unbind, and holding them open across that has
+        triggered a kernel refcount underflow / use-after-free in usb_f_hid (hidg_unbind -> cdev_device_del)
+        that leaves HID dead (opens then fail with ENXIO). reopen() re-acquires them afterward."""
+        with self._lock:
+            for which in ("kbd", "mouse"):
+                if self._fds[which] is not None:
+                    try:
+                        os.close(self._fds[which])
+                    except OSError:
+                        pass
+                    self._fds[which] = None
+
     def reopen(self, retries: int = 12, delay: float = 0.3) -> bool:
         """Re-open both HID devices after the USB gadget was re-enumerated (the /dev/hidg* nodes are
         recreated, so the old fds go stale). Clears any stuck keys/buttons, then retries the open while udev

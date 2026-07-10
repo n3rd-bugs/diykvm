@@ -737,20 +737,26 @@ def _bounce_gadget(verb, timeout):
     if not _reenum_lock.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="a re-enumerate is already in progress")
     try:
+        # Release /dev/hidg* BEFORE the UDC unbind. The unbind tears the HID char devices down via
+        # hidg_unbind; holding them open across that has triggered a kernel refcount use-after-free in
+        # usb_f_hid that leaves HID dead (opens fail ENXIO until a full gadget rebuild). Reopen after.
+        hid.close()
+        r = None
         try:
             r = subprocess.run(["sudo", "-n", GADGET_HELPER, verb],
                                capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
             raise HTTPException(status_code=502, detail="%s timed out" % verb)
+        finally:
+            # The /dev/hidg* were torn down + recreated by the bounce; reopen on EVERY path (even a failed
+            # bounce) so the keyboard/mouse come back instead of staying dead.
+            hid_ok = hid.reopen()
+            if not hid_ok:
+                print("[%s] HID re-open incomplete; will recover on next input" % verb, flush=True)
         if r.returncode == 3:               # helper's own flock: another bounce is mid-flight
             raise HTTPException(status_code=409, detail="a re-enumerate is already in progress")
         if r.returncode != 0:
             raise HTTPException(status_code=502, detail=(r.stderr or r.stdout or (verb + " failed")).strip())
-        # The gadget was re-enumerated -> /dev/hidg* were recreated; reopen them now so the keyboard/mouse
-        # keep working instead of waiting for (and possibly dropping) the next input event.
-        hid_ok = hid.reopen()
-        if not hid_ok:
-            print("[%s] HID re-open incomplete; will recover on next input" % verb, flush=True)
         detail = (r.stdout or "").strip()
         EVENTS.publish("reenumerate", ok=True, hid_reopened=hid_ok, detail=detail)
         return {"hid_reopened": hid_ok, "detail": detail}
