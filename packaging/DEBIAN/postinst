@@ -105,7 +105,16 @@ case "$1" in
     systemctl daemon-reload
     systemctl enable kvm-gadget.service ustreamer.service kvm-web.service >/dev/null 2>&1 || true
     systemctl start ustreamer.service >/dev/null 2>&1 || true
-    echo "diykvm: installed. Reboot to activate the USB gadget, then open https://<pi-ip>:8000/"
+    if [ -n "$2" ] && systemctl is-active --quiet kvm-gadget.service; then
+      # Upgrade of a live system: rebuild the gadget so the new function layout and the new app code go
+      # live together (a later watchdog restart of kvm-web must not run new code against an old gadget).
+      # Requires=kvm-gadget propagates this restart to kvm-web in the safe order (web stops before the
+      # teardown, starts after gadget-up). Briefly re-enumerates USB on the target (~1s).
+      systemctl restart kvm-gadget.service >/dev/null 2>&1 || true
+      echo "diykvm: upgraded; USB gadget rebuilt (target re-enumerated briefly)."
+    else
+      echo "diykvm: installed. Reboot to activate the USB gadget, then open https://<pi-ip>:8000/"
+    fi
     ;;
 esac
 exit 0

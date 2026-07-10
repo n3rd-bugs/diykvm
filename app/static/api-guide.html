@@ -167,7 +167,7 @@ connected.</p>
 <tr><th>type</th><th>fields / meaning</th></tr>
 <tr><td><code>snapshot</code></td><td>full state <code>{usb, hid, serial, msd, power, kvmswitch}</code> (sent once, on connect)</td></tr>
 <tr><td><code>usb</code></td><td><code>{udc, bound, state}</code> — the gadget/USB state. <code>state</code> is <code>configured</code> once the target has enumerated the gadget, <code>not attached</code> when the target is gone or has no USB/HID driver (e.g. a dead OS), <code>unbound</code> while re-enumerating. <b>This is how tooling sees the target lose/regain the keyboard, mouse, drive and COM port.</b></td></tr>
-<tr><td><code>hid</code></td><td><code>{keyboard, mouse}</code> — whether the Pi currently has each HID device open (i.e. input can reach the target)</td></tr>
+<tr><td><code>hid</code></td><td><code>{keyboard, mouse, mouse_rel}</code> — whether the Pi currently has each HID device open (i.e. input can reach the target). <code>mouse_rel</code> is <code>false</code> when the optional relative pointer is disabled (<code>[usb] mouse_rel</code>) or shed by the USB endpoint budget; relative input (<code>mr</code>) is then emulated on the absolute mouse.</td></tr>
 <tr><td><code>serial</code></td><td><code>{ports:[{device, open, clients, reconnect, reconnects, reconnecting, error, …}]}</code>; <code>reconnects</code> ticks each time a port self-heals after the target re-enumerated its COM</td></tr>
 <tr><td><code>reenumerate</code></td><td><code>{ok, hid_reopened, detail}</code> — emitted when someone calls <code>POST /api/serial/reenumerate</code></td></tr>
 </table>

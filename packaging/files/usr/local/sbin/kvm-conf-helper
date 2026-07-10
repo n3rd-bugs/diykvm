@@ -50,7 +50,7 @@ SCHEMA = {
     "video": {"device": DEV, "resolution": RES, "fps": INT,
               "ustreamer_host": HOST, "ustreamer_port": PORT, "devices": VIDDEVS},
     "usb": {"image_path": PATH, "image_size": SIZE, "usb_serial": BOOL,
-            "keyboard": BOOL, "mouse": BOOL, "mass_storage": BOOL,
+            "keyboard": BOOL, "mouse": BOOL, "mouse_rel": BOOL, "mass_storage": BOOL,
             "store_lun": BOOL, "store_size": SIZE, "store_inquiry": INQ},
     "serial": {"default_baud": BAUD, "default_flow": FLOW, "autostart": DEVLIST, "reconnect": BOOL},
     "power": {"enabled": BOOL, "mode": PMODE, "active_low": BOOL, "open_drain": BOOL,

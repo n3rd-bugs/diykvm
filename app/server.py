@@ -1,7 +1,7 @@
 """DIY PiKVM web control plane.
 
 - Login (session cookie) or API key (agents).
-- Single-page UI; WebSocket /ws -> HID gadget (keyboard /dev/hidg0, mouse /dev/hidg1).
+- Single-page UI; WebSocket /ws -> HID gadget (keyboard /dev/hidg0, abs mouse /dev/hidg1, rel mouse /dev/hidg2).
 - Video proxied from uStreamer (localhost) behind auth.
 - Serial console bridge over /ws/serial (device allow-listed).
 - Agent API guide at /api-guide.
@@ -306,7 +306,7 @@ API_INFO = {
                  "frames (raw bytes); transmit BINARY frames (verbatim) or TEXT frames (UTF-8). Status lines "
                  "are TEXT frames. Disconnecting leaves the port open; release it with POST /api/serial/close."},
         {"method": "GET", "path": "/api/events/state", "auth": True,
-         "desc": "Point-in-time state snapshot: {usb:{udc,bound,state}, hid:{keyboard,mouse}, serial:[...], msd, power, kvmswitch}."},
+         "desc": "Point-in-time state snapshot: {usb:{udc,bound,state}, hid:{keyboard,mouse,mouse_rel}, serial:[...], msd, power, kvmswitch}. mouse_rel is false when the optional relative pointer is disabled ([usb] mouse_rel) or shed by the endpoint budget; relative input is then emulated on the absolute mouse."},
         {"method": "WS", "path": "/ws/events", "auth": True, "query": "replay (0-256), token",
          "desc": "Live event stream (JSON). On connect: {type:'snapshot',...} full state, then two kinds of events. COARSE full-state per domain (fold to rebuild state): 'usb','hid','serial','power','msd','reenumerate'. SEMANTIC target transitions (each has a 'message'): 'usb.enumerated'/'usb.enumerating'/'usb.suspended'/'usb.resumed'/'usb.detached', 'gadget.bound'/'gadget.unbound', 'power.on'/'power.off', 'serial.enumerated'/'serial.deenumerated'/'serial.opened'/'serial.closed'/'serial.reconnected'/'serial.error'/'serial.error_cleared', 'hid.online'/'hid.offline', 'drive.attached'/'drive.detached'/'drive.editing'. ?replay=N replays recent events."},
         {"method": "GET", "path": "/api/store/status", "auth": True, "desc": "Scratch block store: {present, path, block_size, size_bytes, blocks} (2nd mass-storage LUN the host writes to; enable with [usb] store_lun)."},
@@ -1330,12 +1330,13 @@ CONFIG_FIELDS = [
          {"key": "ustreamer_port", "label": "uStreamer port", "type": "number", "default": "8080"},
      ]},
     {"section": "usb", "title": "USB gadget functions",
-     "note": "Which functions the target sees. Each costs USB endpoints (the Pi has only 7): keyboard/mouse "
-             "1 each, drive 2, serial 3 — turn off what a target doesn't need for a more robust gadget. "
-             "Applied after: sudo systemctl restart kvm-gadget (briefly re-enumerates USB).",
+     "note": "Which functions the target sees. Each costs USB endpoints (the Pi has only 7): keyboard and "
+             "each mouse 1, drive 2, serial 3 — turn off what a target doesn't need for a more robust "
+             "gadget. Applied after: sudo systemctl restart kvm-gadget (briefly re-enumerates USB).",
      "fields": [
          {"key": "keyboard", "label": "Keyboard (HID) — needed to type to the target", "type": "bool", "default": "true"},
-         {"key": "mouse", "label": "Mouse (HID)", "type": "bool", "default": "true"},
+         {"key": "mouse", "label": "Mouse — absolute pointer (HID; what the UI's Absolute mode uses)", "type": "bool", "default": "true"},
+         {"key": "mouse_rel", "label": "Mouse — relative pointer (HID; what the UI's Relative mode uses; auto-dropped with a warning if the endpoint budget is exceeded)", "type": "bool", "default": "true"},
          {"key": "mass_storage", "label": "Virtual USB drive (mass storage)", "type": "bool", "default": "true"},
          {"key": "usb_serial", "label": "Present a USB serial (COM) port to the target", "type": "bool", "default": "false"},
          {"key": "image_path", "label": "Drive image path", "type": "text", "default": "/opt/kvm/images/drive.img"},

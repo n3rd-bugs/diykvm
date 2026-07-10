@@ -16,9 +16,11 @@ For install/usage see the top‑level [README](../README.md); the agent API is a
   cut each target's power, and reads the line back for state.
 - `kvmswitch.py` — external KVM switch over GPIO: pulses a configured line per target (`gpioset`) to
   press a hardware KVM switch's select buttons (display + USB).
-- `hid.py` — two HID devices: an 8‑byte **no‑Report‑ID boot keyboard** on `/dev/hidg0`
-  (`KeyboardEvent.code`→HID usage; BIOS/UEFI‑compatible) and a report‑ID‑multiplexed **mouse** on
-  `/dev/hidg1` (absolute 0..1 → 0..32767, relative, clicks/wheel); `release_all()` safety.
+- `hid.py` — three HID devices: an 8‑byte **no‑Report‑ID boot keyboard** on `/dev/hidg0`
+  (`KeyboardEvent.code`→HID usage; BIOS/UEFI‑compatible), an **absolute mouse** on `/dev/hidg1`
+  (0..1 → 0..32767) and an optional **relative mouse** on `/dev/hidg2` — separate USB interfaces
+  because Linux targets drop the buttons of a second pointer collection merged into one interface.
+  Clicks/wheel ride whichever pointer moved last; `release_all()` safety.
 - `msd.py` — virtual drive: an image **library** under `/opt/kvm/images` (upload whole disk images /
   ISOs, list, select, delete) plus the built‑in editable EFI drive. Attaches the chosen image to the
   target via configfs `lun.0/file` (ISOs read‑only as a CD‑ROM), or loop‑mounts the EFI ESP for file

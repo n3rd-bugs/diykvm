@@ -15,22 +15,26 @@ peripheral mode:
 dtoverlay=dwc2,dr_mode=peripheral
 ```
 
-## Design note — two HID interfaces (BIOS/UEFI‑safe)
+## Design note — three HID interfaces (BIOS/UEFI‑safe, Linux‑target‑safe)
 The keyboard is a USB **boot keyboard** (subclass=1, protocol=1, an 8‑byte report with **no Report
 ID**) on its own HID function, so it works in the target's **BIOS/UEFI** firmware — which speaks only
-the HID boot protocol and cannot parse Report IDs. The mouse is a second HID function (absolute +
-relative, multiplexed by Report IDs 2/3). Two HID functions on the Pi's **dwc2** controller would
-normally make the host re‑enumerate the device every ~10 s; that is avoided by making each HID
-function **IN‑endpoint‑only** (`no_out_endpoint=1`), so both HID functions plus mass storage stay
-within the dwc2 endpoint budget and enumerate once, stably. Keyboard LEDs arrive via SET_REPORT on
-EP0. Mass storage uses bulk endpoints and coexists fine.
+the HID boot protocol and cannot parse Report IDs. The **absolute** pointer (Report ID 2) and the
+**relative** pointer (Report ID 3) are two further, **separate** HID functions. They used to be two
+collections multiplexed on one interface — which Windows splits into two devices, but **Linux**
+(hid‑generic) merges into a single input device and silently **drops the second collection's
+buttons**, so relative‑mode clicks never arrived on Linux targets. As separate interfaces every OS
+binds two complete mice. Multiple HID functions on the Pi's **dwc2** controller would normally make
+the host re‑enumerate the device every ~10 s; that is avoided by making each HID function
+**IN‑endpoint‑only** (`no_out_endpoint=1`), so the HID functions plus mass storage stay within the
+dwc2 endpoint budget and enumerate once, stably. Keyboard LEDs arrive via SET_REPORT on EP0. Mass
+storage uses bulk endpoints and coexists fine.
 
 ## Report protocol
 - **Keyboard** — write to `/dev/hidg0` (boot keyboard, **no Report ID**, 8 bytes): `<mods> 00 <k1..k6>`
-- **Mouse** — write to `/dev/hidg1` (Report‑ID multiplexed):
-  - **Absolute mouse** — Report ID 2, 7 bytes: `02 <buttons> <Xlo Xhi> <Ylo Yhi> <wheel>` (X/Y 0..32767 LE)
-  - **Relative mouse** — Report ID 3, 5 bytes: `03 <buttons> <dx> <dy> <wheel>` (signed)
-  - buttons: bit0 = left, bit1 = right, bit2 = middle.
+- **Absolute mouse** — write to `/dev/hidg1`, Report ID 2, 7 bytes:
+  `02 <buttons> <Xlo Xhi> <Ylo Yhi> <wheel>` (X/Y 0..32767 LE)
+- **Relative mouse** — write to `/dev/hidg2`, Report ID 3, 5 bytes: `03 <buttons> <dx> <dy> <wheel>` (signed)
+- buttons: bit0 = left, bit1 = right, bit2 = middle.
 
 ```sh
 # type 'a' (8-byte boot report, no Report ID)
@@ -38,6 +42,9 @@ printf '\x00\x00\x04\x00\x00\x00\x00\x00' | sudo tee /dev/hidg0 >/dev/null
 printf '\x00\x00\x00\x00\x00\x00\x00\x00' | sudo tee /dev/hidg0 >/dev/null
 # move the absolute pointer to screen centre (Report ID 2, on hidg1)
 printf '\x02\x00\xff\x3f\xff\x3f\x00' | sudo tee /dev/hidg1 >/dev/null
+# left-click where the cursor is, on the relative mouse (Report ID 3, on hidg2)
+printf '\x03\x01\x00\x00\x00' | sudo tee /dev/hidg2 >/dev/null
+printf '\x03\x00\x00\x00\x00' | sudo tee /dev/hidg2 >/dev/null
 ```
 
 ## Target power & KVM switch (GPIO)

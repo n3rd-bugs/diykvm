@@ -106,16 +106,16 @@ def power_events(prev, cur):
 
 
 def hid_events(prev, cur):
-    """prev/cur = {'keyboard':bool,'mouse':bool} from hid.devices_open()."""
+    """prev/cur = {'keyboard':bool,'mouse':bool,'mouse_rel':bool} from hid.devices_open()."""
     if prev is None or cur is None:
         return []
     out = []
-    for dev in ("keyboard", "mouse"):
+    for dev, label in (("keyboard", "Keyboard"), ("mouse", "Mouse"), ("mouse_rel", "Relative mouse")):
         was, now = bool(prev.get(dev)), bool(cur.get(dev))
         if now and not was:
-            out.append(_ev("hid.online", "%s HID online." % dev.capitalize(), device=dev))
+            out.append(_ev("hid.online", "%s HID online." % label, device=dev))
         elif was and not now:
-            out.append(_ev("hid.offline", "%s HID offline." % dev.capitalize(), device=dev))
+            out.append(_ev("hid.offline", "%s HID offline." % label, device=dev))
     return out
 
 
