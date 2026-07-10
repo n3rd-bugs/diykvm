@@ -151,6 +151,7 @@
     <button id="serialbtn" title="serial console">Serial</button>
     <button id="powerbtn" title="target power (GPIO)">⏻ Power</button>
     <button id="kvmbtn" title="external KVM switch (GPIO)">⇄ KVM</button>
+    <button id="replugbtn" title="unplug &amp; re-plug the USB device to the target (brief ~1s USB drop; the target re-detects keyboard, mouse, drive and COM)">⟳ Replug USB</button>
     <label class="barchk" title="send occasional mouse nudges so the target display doesn't sleep (paused while you interact)"><input type="checkbox" id="awake"> Keep awake</label>
     <span class="sp"></span>
     <span id="info">—</span>
@@ -857,6 +858,23 @@ document.getElementById('serreenum').onclick = async () => {
   try { const r = await api('/api/serial/reenumerate', {method:'POST'});
         serstatus.textContent = 're-enumerated' + (r && r.detail ? (' ('+r.detail+')') : ''); }
   catch(e){ serstatus.textContent = e.message; }
+};
+
+// ---- Replug USB: unplug + re-plug the whole gadget so the target re-detects it ----
+const replugBtn = document.getElementById('replugbtn');
+replugBtn.onclick = async () => {
+  if (!confirm('Unplug and re-plug the USB device to the target?\n\nThe whole USB gadget briefly disconnects and re-appears (~1s): the target re-detects the keyboard, mouse, virtual drive and COM port. Use this to make the target re-detect the KVM.')) return;
+  const orig = replugBtn.textContent;
+  replugBtn.disabled = true; replugBtn.textContent = '⟳ Replugging…';
+  let msg = '⟳ Replugged ✓';
+  try {
+    await api('/api/serial/reenumerate', { method: 'POST' });
+  } catch (e) {
+    msg = '⟳ Replug failed';
+    alert('Replug failed: ' + e.message + '\n\nIf the target is stuck (addressed but not configured), try again — or use the longer recovery: POST /api/gadget/recover.');
+  }
+  replugBtn.textContent = msg;
+  setTimeout(() => { replugBtn.disabled = false; replugBtn.textContent = orig; }, 2500);
 };
 function serAppend(t){ serout.textContent += t; serout.scrollTop = serout.scrollHeight;
   if(serout.textContent.length>200000) serout.textContent = serout.textContent.slice(-150000); }
