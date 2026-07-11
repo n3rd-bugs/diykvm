@@ -11,6 +11,7 @@ falls back to a sane default, so the app also runs with no config file present.
 """
 import io
 import os
+import re
 import time
 import asyncio
 import socket
@@ -268,7 +269,12 @@ API_INFO = {
                  "{t:'reset'} release everything; {t:'ping',ts} -> server replies {t:'pong',ts} "
                  "(echoes ts) to measure round-trip latency over this socket."},
         {"method": "GET", "path": "/snapshot", "auth": True, "desc": "JPEG of the target screen now."},
-        {"method": "GET", "path": "/stream", "auth": True, "desc": "Live MJPEG stream (of the selected capture card)."},
+        {"method": "GET", "path": "/stream", "auth": True, "desc": "Live MJPEG stream (of the selected capture card). On slow links prefer /ws/video."},
+        {"method": "WS", "path": "/ws/video", "auth": True,
+         "desc": "Client-paced video: per frame the server sends a text message (capture X-Timestamp) then the "
+                 "JPEG as a binary message, and waits for ANY reply before sending the next (always the "
+                 "freshest). Bounds video delay to ~1 frame + RTT on any link -- a slow link gets fewer fps, "
+                 "never a backlog. Auth like /ws (session cookie or ?token=)."},
         {"method": "GET", "path": "/api/video/sources", "auth": True, "desc": "Selectable capture cards (multi-PC): {sources:[{index,label}], active, multi}. Configure via [video] devices = Label:/dev/videoN, ..."},
         {"method": "POST", "path": "/api/video/select", "auth": True, "body": "{index}", "desc": "Switch the live stream to that capture card (restarts the streamer, ~1-2s). Only a configured [video] devices card is allowed."},
         {"method": "GET", "path": "/api/ocr", "auth": True, "query": "lang, psm, min_conf, region (x,y,w,h), scale, words",
@@ -343,25 +349,138 @@ def healthz():
 
 
 # ----------------------------- video proxy (behind auth) -----------------------------
+class _MJPEGTap:
+    """A latest-frame tap on uStreamer's MJPEG stream. A pump task parses multipart parts and keeps only
+    the NEWEST complete one; consumers take whatever is freshest whenever they are ready, so a slow
+    consumer gets a lower frame RATE, never a growing frame QUEUE."""
+
+    def __init__(self):
+        self.client = None
+        self.resp = None
+        self.ctype = "multipart/x-mixed-replace;boundary=boundarydonotcross"
+        self.latest = None               # newest complete part (leading boundary included)
+        self.fresh = asyncio.Event()
+        self.done = asyncio.Event()
+        self._task = None
+
+    async def open(self):
+        self.client = httpx.AsyncClient(timeout=None)
+        try:
+            self.resp = await self.client.send(self.client.build_request("GET", f"{USTREAMER}/stream"), stream=True)
+        except Exception:
+            await self.client.aclose()   # don't leak the client if uStreamer is unreachable
+            raise HTTPException(status_code=502, detail="stream source unavailable")
+        self.ctype = self.resp.headers.get("content-type", self.ctype)
+        bnd = self.ctype.split("boundary=", 1)[-1].split(";", 1)[0].strip().strip('"') or "boundarydonotcross"
+        self._delim = ("--" + bnd).encode()
+        self._task = asyncio.create_task(self._pump())
+        return self
+
+    async def _pump(self):
+        buf, delim = b"", self._delim
+        try:
+            async for chunk in self.resp.aiter_raw():
+                buf += chunk
+                while True:
+                    start = buf.find(delim)
+                    if start < 0:
+                        break
+                    nxt = buf.find(delim, start + len(delim))
+                    if nxt < 0:
+                        if start > 0:
+                            buf = buf[start:]          # drop pre-boundary noise, keep the partial part
+                        break
+                    self.latest = buf[start:nxt]       # one complete part; replaces any unsent one
+                    buf = buf[nxt:]
+                    self.fresh.set()
+                if len(buf) > (8 << 20):               # runaway guard: no boundary in 8 MB -> resync
+                    buf = buf[-len(delim):]
+        except Exception:
+            pass
+        finally:
+            self.done.set()
+            self.fresh.set()                           # wake any waiting consumer so it can finish
+
+    async def take(self):
+        """Wait for (then consume) the freshest complete part; None when the upstream has ended."""
+        while not self.done.is_set():
+            await self.fresh.wait()
+            self.fresh.clear()
+            part, self.latest = self.latest, None
+            if part is not None:
+                return part
+        return None
+
+    async def close(self):
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except Exception:
+                pass
+        if self.resp is not None:
+            await self.resp.aclose()
+        if self.client is not None:
+            await self.client.aclose()
+
+
 @app.get("/stream")
 async def stream(_: bool = Depends(require_auth)):
-    client = httpx.AsyncClient(timeout=None)
-    try:
-        r = await client.send(client.build_request("GET", f"{USTREAMER}/stream"), stream=True)
-    except Exception:
-        await client.aclose()            # don't leak the client if uStreamer is unreachable
-        raise HTTPException(status_code=502, detail="stream source unavailable")
+    """Live MJPEG relay through a latest-frame tap (see _MJPEGTap): each yield sends the freshest frame.
+    NOTE: over a slow link the kernel's TCP send buffer still queues several frames beyond the app's
+    control -- for a genuinely bounded video delay use /ws/video (client-paced) instead; the UI does."""
+    tap = await _MJPEGTap().open()
 
     async def gen():
         try:
-            async for chunk in r.aiter_raw():
-                yield chunk
-        finally:
-            await r.aclose()
-            await client.aclose()
+            while True:
+                part = await tap.take()
+                if part is None:
+                    break
+                yield part               # awaits the client socket; frames arriving meanwhile coalesce
+        finally:                         # client gone or upstream ended
+            await tap.close()
 
-    return StreamingResponse(gen(), media_type=r.headers.get(
-        "content-type", "multipart/x-mixed-replace;boundary=boundarydonotcross"))
+    return StreamingResponse(gen(), media_type=tap.ctype)
+
+
+@app.websocket("/ws/video")
+async def ws_video(sock: WebSocket):
+    """Client-paced video: one JPEG frame per client ack, always the freshest. Bounds end-to-end video
+    delay to ~one frame + RTT on ANY link: at most one frame is ever in flight, so a constrained
+    (remote/VPN) link gets a lower frame rate instead of seconds of buffered backlog -- which also stops
+    the video from bufferbloating the very link the input WebSocket shares. Protocol: server sends a
+    text frame with the capture X-Timestamp, then the JPEG as a binary frame; the client replies with
+    any message when it is ready for the next."""
+    if not ws_authed(sock):
+        await sock.close(code=1008)
+        return
+    await sock.accept()
+    try:
+        tap = await _MJPEGTap().open()
+    except HTTPException:
+        await sock.close(code=1011)
+        return
+    try:
+        while True:
+            part = await tap.take()
+            if part is None:
+                break                    # upstream ended (e.g. streamer restart) -> client reconnects
+            head, _, body = part.partition(b"\r\n\r\n")
+            if not body:
+                continue
+            if body.endswith(b"\r\n"):
+                body = body[:-2]
+            m = re.search(rb"X-Timestamp: ([0-9.]+)", head)
+            await sock.send_text(m.group(1).decode() if m else "0")
+            await sock.send_bytes(bytes(body))
+            await sock.receive()         # the ack: client is ready for the next frame
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    except Exception:
+        pass
+    finally:
+        await tap.close()
 
 
 @app.get("/snapshot")
@@ -1326,6 +1445,7 @@ CONFIG_FIELDS = [
          {"key": "devices", "label": "Capture cards for multi-PC — Label:/dev/videoN, comma-separated (e.g. PC1:/dev/video0, PC2:/dev/video1). Blank = just the single device above; the UI shows a source picker when 2+ are listed.", "type": "text", "default": ""},
          {"key": "resolution", "label": "Resolution (WxH)", "type": "text", "default": "1920x1080"},
          {"key": "fps", "label": "Frames per second", "type": "number", "default": "30"},
+         {"key": "quality", "label": "JPEG quality 1–100 — bandwidth knob. On a remote/slow link lower this first (40–60) so the stream fits the pipe; the viewer already degrades to fewer frames rather than lagging, but a stream wider than the link also queues your mouse input behind the video.", "type": "number", "default": "80"},
          {"key": "ustreamer_host", "label": "uStreamer host", "type": "text", "default": "127.0.0.1"},
          {"key": "ustreamer_port", "label": "uStreamer port", "type": "number", "default": "8080"},
      ]},

@@ -262,32 +262,69 @@ const host = location.hostname;
 const wsURL = (p) => (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + p;
 const streamURL = '/stream';                 // proxied through the authenticated app
 const img = document.getElementById('screen');
-img.src = streamURL;
 
-// ---- capture source picker (multi-PC) + auto-reconnect the MJPEG stream ----
-// If the stream drops (the streamer restarting -- e.g. after a source switch), reconnect shortly. This
-// also makes the video self-heal across any ustreamer restart.
+// ---- video transport: client-paced WebSocket frames, MJPEG <img> as fallback ----
+// /ws/video sends ONE JPEG per ack (always the freshest), so at most one frame is ever in flight:
+// video delay stays ~1 frame + RTT on ANY link, and a slow/remote link degrades to fewer fps instead
+// of seconds of buffered backlog (which also queued the INPUT websocket behind the video bytes).
+// Blob URLs are revoked every frame, so nothing accumulates in the tab (no MJPEG hygiene needed).
+let vws = null, vwsMode = false, vwsFails = 0, _vBlob = null;
+function wsVideoConnect() {
+  if (vws || document.hidden) return;
+  let gotFrame = false;
+  try { vws = new WebSocket(wsURL('/ws/video')); } catch (e) { videoFallback(); return; }
+  vws.binaryType = 'blob';
+  vws.onmessage = (e) => {
+    if (typeof e.data === 'string') return;          // frame metadata (capture timestamp) -- unused here
+    gotFrame = true; vwsFails = 0; vwsMode = true;
+    const prev = _vBlob;
+    _vBlob = URL.createObjectURL(e.data);
+    img.src = _vBlob;
+    if (prev) URL.revokeObjectURL(prev);
+    if (vws && vws.readyState === 1) vws.send('a');  // ready for the next (freshest) frame
+  };
+  vws.onerror = () => { try { vws.close(); } catch (e) {} };
+  vws.onclose = () => {
+    vws = null;
+    if (document.hidden) return;                     // visibilitychange resumes
+    if (!gotFrame && ++vwsFails >= 2) { videoFallback(); return; }   // WS video unavailable -> MJPEG
+    setTimeout(wsVideoConnect, 1000);                // streamer restart / transient drop: reconnect
+  };
+}
+function videoFallback() { vwsMode = false; img.src = streamURL + '?t=' + Date.now(); }
+function videoRestart() {                            // e.g. after switching the capture source
+  if (vws) { try { vws.close(); } catch (e) {} }     // onclose reconnects to the fresh stream
+  else if (!vwsMode) img.src = streamURL + '?t=' + Date.now();
+}
+wsVideoConnect();
+
+// MJPEG fallback path: reconnect if the <img> stream drops (streamer restarting etc.)
 img.addEventListener('error', () => { setTimeout(() => {
-  if (!document.hidden) img.src = streamURL + '?t=' + Date.now();   // hidden tabs resume on visibility
+  if (!document.hidden && !vwsMode) img.src = streamURL + '?t=' + Date.now();
 }, 1000); });
 
-// ---- stream hygiene (fixes input latency growing over a long session) ----
+// ---- stream hygiene (MJPEG fallback only; WS video revokes its blobs every frame) ----
 // A multipart MJPEG <img> is "loading" forever, so the browser never releases what the element has
 // buffered: over a long session the tab's memory balloons and GC pauses make the WHOLE tab sluggish --
-// felt first as mouse lag, while the video still looks fine. Shed the buildup by reconnecting the
-// stream every few minutes (a one-frame blink, deferred while the operator is actively driving), and
-// stop streaming entirely while the tab is hidden.
+// felt first as mouse lag. Shed the buildup by reconnecting the stream every few minutes (a one-frame
+// blink, deferred while the operator is actively driving), and stop streaming while the tab is hidden.
 let _srPending = false;
 function _streamRefresh() {
-  if (document.hidden) { _srPending = false; return; }               // visibilitychange restores it
+  if (document.hidden || vwsMode) { _srPending = false; return; }
   if (Date.now() - lastActivity < 5000) { setTimeout(_streamRefresh, 15000); return; }  // wait for idle
   _srPending = false;
   img.src = streamURL + '?t=' + Date.now();
 }
-setInterval(() => { if (!_srPending) { _srPending = true; _streamRefresh(); } }, 5 * 60 * 1000);
+setInterval(() => { if (!_srPending && !vwsMode) { _srPending = true; _streamRefresh(); } }, 5 * 60 * 1000);
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) { img.src = ''; }                             // release the stream + its buffers
-  else { img.src = streamURL + '?t=' + Date.now(); }
+  if (document.hidden) {                             // release the stream + its buffers
+    if (vws) { try { vws.close(); } catch (e) {} }
+    img.src = '';
+  } else if (vwsMode || vwsFails < 2) {
+    wsVideoConnect();
+  } else {
+    img.src = streamURL + '?t=' + Date.now();
+  }
 });
 const vidsrc = document.getElementById('vidsrc');
 async function loadVideoSources() {
@@ -308,7 +345,7 @@ vidsrc.onchange = async () => {
   vidsrc.disabled = true;
   try {
     await api('/api/video/select', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ index: idx }) });
-    img.src = streamURL + '?t=' + Date.now();     // reconnect; onerror retries until the streamer is back up
+    videoRestart();                               // reconnect to the fresh source (WS video or MJPEG)
   } catch (e) { alert('Could not switch to ' + label + ': ' + e.message); }
   vidsrc.disabled = false;
 };

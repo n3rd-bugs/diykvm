@@ -43,11 +43,12 @@ FLOW = r"(none|rtscts|xonxoff)"               # serial flow control mode
 INQ = r"[A-Za-z0-9 ._\-]{0,28}"               # SCSI INQUIRY vendor/product (printable, no shell metas), or blank
 PMODE = r"(relay|button)"                     # power control style: latched relay | momentary power button
 VIDDEVS = r"[A-Za-z0-9 _:,./\-]{0,256}"       # comma-separated Label:/dev/videoN capture cards, or blank
+PCT = r"(100|[1-9][0-9]?)"                    # 1..100 (JPEG quality)
 
 SCHEMA = {
     "web": {"host": HOST, "port": PORT, "tls": BOOL,
             "tls_cert": PATH, "tls_key": PATH, "allowed_origins": ORIGINS},
-    "video": {"device": DEV, "resolution": RES, "fps": INT,
+    "video": {"device": DEV, "resolution": RES, "fps": INT, "quality": PCT,
               "ustreamer_host": HOST, "ustreamer_port": PORT, "devices": VIDDEVS},
     "usb": {"image_path": PATH, "image_size": SIZE, "usb_serial": BOOL,
             "keyboard": BOOL, "mouse": BOOL, "mouse_rel": BOOL, "mass_storage": BOOL,
