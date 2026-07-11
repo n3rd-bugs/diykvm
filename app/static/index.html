@@ -267,7 +267,28 @@ img.src = streamURL;
 // ---- capture source picker (multi-PC) + auto-reconnect the MJPEG stream ----
 // If the stream drops (the streamer restarting -- e.g. after a source switch), reconnect shortly. This
 // also makes the video self-heal across any ustreamer restart.
-img.addEventListener('error', () => { setTimeout(() => { img.src = streamURL + '?t=' + Date.now(); }, 1000); });
+img.addEventListener('error', () => { setTimeout(() => {
+  if (!document.hidden) img.src = streamURL + '?t=' + Date.now();   // hidden tabs resume on visibility
+}, 1000); });
+
+// ---- stream hygiene (fixes input latency growing over a long session) ----
+// A multipart MJPEG <img> is "loading" forever, so the browser never releases what the element has
+// buffered: over a long session the tab's memory balloons and GC pauses make the WHOLE tab sluggish --
+// felt first as mouse lag, while the video still looks fine. Shed the buildup by reconnecting the
+// stream every few minutes (a one-frame blink, deferred while the operator is actively driving), and
+// stop streaming entirely while the tab is hidden.
+let _srPending = false;
+function _streamRefresh() {
+  if (document.hidden) { _srPending = false; return; }               // visibilitychange restores it
+  if (Date.now() - lastActivity < 5000) { setTimeout(_streamRefresh, 15000); return; }  // wait for idle
+  _srPending = false;
+  img.src = streamURL + '?t=' + Date.now();
+}
+setInterval(() => { if (!_srPending) { _srPending = true; _streamRefresh(); } }, 5 * 60 * 1000);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { img.src = ''; }                             // release the stream + its buffers
+  else { img.src = streamURL + '?t=' + Date.now(); }
+});
 const vidsrc = document.getElementById('vidsrc');
 async function loadVideoSources() {
   try {
