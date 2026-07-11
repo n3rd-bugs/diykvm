@@ -246,6 +246,15 @@ class SerialManager:
     def __init__(self, pool):
         self._pool = pool
         self._ports = {}              # device -> _Port
+        self._locks = {}              # device -> asyncio.Lock serializing open/close per device
+
+    def _lock_for(self, device):
+        # Per-device lock: open() awaits mid-sequence (await p.close()), and a concurrent open/close for
+        # the SAME tty in that window could register a port the first coroutine then pops -- an
+        # unreachable orphan whose drain task keeps the tty open and steals RX forever.
+        if device not in self._locks:
+            self._locks[device] = asyncio.Lock()
+        return self._locks[device]
 
     async def open(self, device, baud, flow="none", dtr=True, rts=True, reconnect=True, reopen=False):
         """Open the port (idempotent). Reopens if settings differ or reopen=True. reconnect=True makes the
@@ -253,31 +262,33 @@ class SerialManager:
         loop = asyncio.get_event_loop()
         flow = flow if flow in FLOW_MODES else "none"
         baud = int(baud)
-        p = self._ports.get(device)
-        if p and p.alive:
-            if not reopen and p.settings() == (baud, flow, bool(dtr), bool(rts)):
-                p._reconnect = bool(reconnect)   # update the behavior flag on reuse
-                return p              # already open with the same settings; reuse
-            await p.close()
-            self._ports.pop(device, None)
-        try:
-            p = _Port(device, baud, flow, dtr, rts, self._pool, loop, reconnect=reconnect)
-        except Exception as e:
-            raise SerialError(str(e))
-        p.start()
-        self._ports[device] = p
-        return p
+        async with self._lock_for(device):
+            p = self._ports.get(device)
+            if p and p.alive:
+                if not reopen and p.settings() == (baud, flow, bool(dtr), bool(rts)):
+                    p._reconnect = bool(reconnect)   # update the behavior flag on reuse
+                    return p              # already open with the same settings; reuse
+                await p.close()
+                self._ports.pop(device, None)
+            try:
+                p = _Port(device, baud, flow, dtr, rts, self._pool, loop, reconnect=reconnect)
+            except Exception as e:
+                raise SerialError(str(e))
+            p.start()
+            self._ports[device] = p
+            return p
 
     def get(self, device):
         p = self._ports.get(device)
         return p if (p and p.alive) else None
 
     async def close(self, device):
-        p = self._ports.pop(device, None)
-        if not p:
-            return False
-        await p.close()
-        return True
+        async with self._lock_for(device):
+            p = self._ports.pop(device, None)
+            if not p:
+                return False
+            await p.close()
+            return True
 
     def clear(self, device):
         """Clear an open port's scrollback buffer. Returns the number of bytes dropped, or None if the

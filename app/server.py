@@ -1313,7 +1313,7 @@ CONFIG_FIELDS = [
      "fields": [
          {"key": "host", "label": "Bind address", "type": "text", "default": "0.0.0.0"},
          {"key": "port", "label": "Port", "type": "number", "default": "8000"},
-         {"key": "tls", "label": "Enable HTTPS (TLS)", "type": "bool", "default": "false"},
+         {"key": "tls", "label": "Enable HTTPS (TLS)", "type": "bool", "default": "true"},
          {"key": "tls_cert", "label": "TLS certificate path", "type": "text", "default": "/etc/kvm/tls/cert.pem"},
          {"key": "tls_key", "label": "TLS key path", "type": "text", "default": "/etc/kvm/tls/key.pem"},
          {"key": "allowed_origins", "label": "Extra allowed origins (host[:port], comma-separated)",
@@ -1407,16 +1407,20 @@ def config_get(_: bool = Depends(require_auth)):
 
 @app.post("/api/config")
 def config_save(payload: dict = Body(default={}), _: bool = Depends(require_auth)):
-    # Rebuild the config from the known schema only (every key written with the submitted value or
-    # its default); the privileged helper re-validates each value before it touches the real file.
+    # MERGE semantics: rebuild the config from the known schema only, with each key taking the submitted
+    # value, else its CURRENT on-disk value, else the schema default. A partial POST must never reset
+    # omitted settings (the old behavior silently reverted them to schema defaults -- including turning
+    # HTTPS off). The privileged helper re-validates every value before it touches the real file.
     data = payload if isinstance(payload, dict) else {}
+    cur = configparser.ConfigParser()
+    cur.read(CONF_PATH)
     c = configparser.ConfigParser()
     for sec in CONFIG_FIELDS:
         name = sec["section"]
         c.add_section(name)
         incoming = data.get(name) if isinstance(data.get(name), dict) else {}
         for f in sec["fields"]:
-            v = incoming.get(f["key"], f["default"])
+            v = incoming.get(f["key"], cur.get(name, f["key"], fallback=f["default"]))
             if isinstance(v, bool):
                 v = "true" if v else "false"
             c.set(name, f["key"], str(v))

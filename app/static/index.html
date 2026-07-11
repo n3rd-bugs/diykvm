@@ -617,8 +617,10 @@ async function fmImages() {
       const tags = (im.attached ? '<span class="tag">attached</span>' : '')
         + (im.cdrom ? ' <span class="tag" style="color:#9bd;border-color:#46c">ISO</span>' : '')
         + (im.default ? ' <span class="tag" style="color:#d9b36a;border-color:#a8772c">EFI</span>' : '');
-      li.innerHTML = '<span class="nm">💿 ' + im.name + '</span><span class="sz">' + fmtSize(im.size) + '</span>'
+      // the NAME comes off the Pi's filesystem -- insert it as text, never markup (no XSS)
+      li.innerHTML = '<span class="nm">💿 </span><span class="sz">' + fmtSize(im.size) + '</span>'
         + tags + ' <button class="att-btn">Attach</button>' + (im.default ? '' : ' <span class="del">✕</span>');
+      li.querySelector('.nm').appendChild(document.createTextNode(im.name));
       li.querySelector('.att-btn').onclick = async () => {
         fmErr('attaching ' + im.name + '…');
         try { await api('/api/msd/images/attach?name=' + encodeURIComponent(im.name), {method:'POST'}); await fmStatus(); }

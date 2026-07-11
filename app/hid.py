@@ -84,6 +84,11 @@ class HIDController:
         # absolute to match the UI's default desktop mode.
         self._mmode = "abs"
         self._rel_warned = False    # one-shot log when relative input has to be emulated/dropped
+        # Quiesce gate: True between close() and reopen(). While set, _write DROPS reports instead of
+        # lazily re-opening -- otherwise input arriving during a gadget bounce would re-acquire /dev/hidg*
+        # in the window between hid.close() and the UDC unbind, re-exposing the usb_f_hid use-after-free
+        # that close-before-unbind exists to prevent.
+        self._suspended = False
         for which in self.DEVICES:
             self._open(which)
         if self._fds["kbd"] is None or self._fds["mabs"] is None:
@@ -122,6 +127,8 @@ class HIDController:
         # (now lock-free) status reads are never starved. The single _hid_pool worker serializes writes.
         # Returns True (sent) / None (dropped) / False (unrecoverable) so a chunked caller can bail early.
         with self._lock:
+            if self._suspended:
+                return None            # quiesced for a gadget bounce: NEVER (re)open /dev/hidg* now
             if self._fds[which] is None:
                 self._open(which)
             fd = self._fds[which]
@@ -170,16 +177,20 @@ class HIDController:
     def _rel_report(self, dx: int = 0, dy: int = 0, wheel: int = 0) -> bytes:
         return bytes([MOUSE_REL_ID, self._btn, dx & 0xFF, dy & 0xFF, wheel & 0xFF])
 
-    # The _send_* wrappers keep _btn_sent (last button bits written per device) in step with every report,
-    # since every report embeds the current button byte. They pass through _write's sent/dropped status.
+    # The _send_* wrappers keep _btn_sent (last button bits written per device) in step with every report
+    # that was actually DELIVERED (every report embeds the current button byte). A dropped/failed write
+    # must not be recorded as delivered -- a lost button-release would otherwise never be retried by
+    # _sync_stale_buttons and the target would keep the button held.
     def _send_abs(self, wheel: int = 0):
         r = self._write("mabs", self._abs_report(wheel))
-        self._btn_sent["mabs"] = self._btn
+        if r is True:
+            self._btn_sent["mabs"] = self._btn
         return r
 
     def _send_rel(self, dx: int = 0, dy: int = 0, wheel: int = 0):
         r = self._write("mrel", self._rel_report(dx, dy, wheel))
-        self._btn_sent["mrel"] = self._btn
+        if r is True:
+            self._btn_sent["mrel"] = self._btn
         return r
 
     def _rel_available(self) -> bool:
@@ -305,11 +316,14 @@ class HIDController:
         self._sync_stale_buttons()
 
     def close(self):
-        """Close the HID fds. Call this BEFORE a gadget re-enumerate (UDC unbind): the /dev/hidg* char
-        devices are torn down by hidg_unbind during the unbind, and holding them open across that has
-        triggered a kernel refcount underflow / use-after-free in usb_f_hid (hidg_unbind -> cdev_device_del)
-        that leaves HID dead (opens then fail with ENXIO). reopen() re-acquires them afterward."""
+        """Close the HID fds AND suspend writes. Call this BEFORE a gadget re-enumerate (UDC unbind): the
+        /dev/hidg* char devices are torn down by hidg_unbind during the unbind, and holding them open
+        across that has triggered a kernel refcount underflow / use-after-free in usb_f_hid (hidg_unbind
+        -> cdev_device_del) that leaves HID dead (opens then fail with ENXIO). Suspending is essential:
+        without it, any input event racing the bounce would lazily re-open the nodes in exactly that
+        window. reopen() is the only way to resume writes."""
         with self._lock:
+            self._suspended = True
             for which in self.DEVICES:
                 if self._fds[which] is not None:
                     try:
@@ -328,6 +342,7 @@ class HIDController:
         Without this, the keyboard/mouse only recover on the NEXT input event (the lazy reopen in _write),
         which leaves a window where input is silently dropped after a re-enumerate."""
         with self._lock:
+            self._suspended = False    # bounce is over: writes (and lazy opens) may resume
             self._mods = 0
             self._keys = []
             self._btn = 0
