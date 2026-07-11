@@ -305,7 +305,11 @@ function connect() {
   ws.onerror = () => ws.close();
 }
 connect();
-const send = (o) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
+const send = (o) => {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify(o));
+  if (o.t === 'mm' || o.t === 'mr') trackCursor(o);   // feeds zoom-follow (keeps the cursor centred)
+};
 
 // Keyboard Lock lets Esc (and other system keys) reach the target instead of the browser using it to
 // exit Pointer Lock / Fullscreen. It only works in fullscreen on a secure (HTTPS) context; elsewhere
@@ -715,7 +719,7 @@ for (const row of KB){
 // ---- touch on the video (gesture model) ----
 //   1 finger: tap=left click · hold&drag=move · double-tap-hold=left held (drag if moved)
 //   2 finger: tap=right click · hold&drag=SCROLL (wheel) · double-tap-hold=right held (drag if moved)
-//   pinch:    zoom the video in/out (drag while pinched to pan); snaps back at 1×
+//   pinch:    zoom the video in/out; while zoomed the view follows the mouse cursor; snaps back at 1×
 // Listeners on #wrap (the whole video area) so a 2nd finger in the letterbox is still counted.
 const TAP_MS    = 250;   // max duration for a no-move touch to count as a tap
 const TAP_MOVE  = 12;    // px of travel under which a touch still counts as a tap (no move)
@@ -738,7 +742,32 @@ function commitHold(){ holdTimer=null; held=btnFor(); send({t:'mb',button:held,d
 // Zoom scales #screen around its centre; panning follows the pinch midpoint. Absolute-mouse mapping
 // stays exact while zoomed: getBoundingClientRect() reflects the CSS transform, so click coordinates
 // keep lining up with what is on screen. #wrap has overflow:hidden, so the spill is clipped.
+// While zoomed the view FOLLOWS the mouse: every move recentres the viewport on the (estimated) target
+// cursor, clamped at the image edges. The estimate mirrors what the Pi does with what we send: mm sets
+// it exactly; mr deltas land 1:1 on the 0..32767 absolute axis when the relative pointer is emulated
+// (mouse_rel off -- the common setup), or roughly 1:1 in target pixels when a real relative mouse exists.
 let zoom=1, panX=0, panY=0, pinch=null, pinched=false;
+const ABS_MAX = 32767;
+let curX = 0.5, curY = 0.5;     // estimated target cursor, normalized 0..1
+let relIsReal = false;          // gadget has a real relative mouse (vs server-side abs emulation)
+(async () => { try {
+  const r = await fetch('/api/events/state');
+  if (r.ok) { const s = await r.json(); relIsReal = !!(s.hid && s.hid.mouse_rel); }
+} catch (e) {} })();
+function trackCursor(o){
+  if (o.t === 'mm') { curX = o.x; curY = o.y; }
+  else {                                           // mr: mirror the server's clamp at the screen edges
+    const dw = relIsReal ? (img.naturalWidth || 1920) : ABS_MAX;
+    const dh = relIsReal ? (img.naturalHeight || 1080) : ABS_MAX;
+    curX = Math.max(0, Math.min(1, curX + o.dx / dw));
+    curY = Math.max(0, Math.min(1, curY + o.dy / dh));
+  }
+  if (zoom > 1){                                   // keep the cursor centred (applyZoom clamps at edges)
+    panX = -(curX - 0.5) * img.clientWidth  * zoom;
+    panY = -(curY - 0.5) * img.clientHeight * zoom;
+    applyZoom();
+  }
+}
 const touchDist = (ts)=> Math.hypot(ts[0].clientX-ts[1].clientX, ts[0].clientY-ts[1].clientY);
 function applyZoom(){
   // keep the scaled image's edges from drifting inside where its unscaled edges were
@@ -747,7 +776,7 @@ function applyZoom(){
   panY = Math.max(-my, Math.min(my, panY));
   img.style.transform = zoom > 1 ? 'translate(' + panX + 'px,' + panY + 'px) scale(' + zoom + ')' : '';
 }
-function pinchArm(ts){ pinch = {d0: touchDist(ts), z0: zoom, mx0: midX(ts), my0: midY(ts), px0: panX, py0: panY}; }
+function pinchArm(ts){ pinch = {d0: touchDist(ts), z0: zoom}; }
 function pinchMove(ts){                              // returns true while the gesture is a pinch
   if(!pinch) return false;
   const d = touchDist(ts);
@@ -758,7 +787,10 @@ function pinchMove(ts){                              // returns true while the g
   if(!pinched) return false;
   zoom = Math.max(1, Math.min(ZOOM_MAX, pinch.z0 * d / pinch.d0));
   if(zoom <= 1.02){ zoom = 1; panX = panY = 0; }     // snap back to fit
-  else { panX = pinch.px0 + (midX(ts) - pinch.mx0); panY = pinch.py0 + (midY(ts) - pinch.my0); }
+  else {                                             // the cursor is the anchor: zoom centres on it
+    panX = -(curX - 0.5) * img.clientWidth  * zoom;
+    panY = -(curY - 0.5) * img.clientHeight * zoom;
+  }
   applyZoom();
   gesture(zoom > 1 ? '🔍 ' + zoom.toFixed(1) + '×' : '🔍 fit');
   return true;
