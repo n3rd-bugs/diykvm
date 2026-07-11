@@ -3,6 +3,10 @@ Description=DIY PiKVM web control plane (FastAPI -> HID)
 After=network-online.target kvm-gadget.service
 Wants=network-online.target
 Requires=kvm-gadget.service
+# PartOf: a stop/restart of kvm-gadget propagates to kvm-web too, so new app code and the new gadget layout
+# go live together on an upgrade, and kvm-web's /dev/hidg* fds are closed BEFORE the gadget teardown (avoids
+# the usb_f_hid use-after-free). PartOf propagates stop+restart only, not start -- After= still orders us.
+PartOf=kvm-gadget.service
 
 [Service]
 # Type=notify + WatchdogSec: the app pings the systemd watchdog from its event loop (sd_notify

@@ -1,9 +1,8 @@
 [Unit]
-Description=DIY PiKVM USB HID gadget (keyboard + absolute mouse)
+Description=DIY PiKVM USB gadget (keyboard, mice, drive, serial -- per [usb] config)
 Documentation=https://www.kernel.org/doc/Documentation/usb/gadget_configfs.txt
 After=sys-kernel-config.mount systemd-modules-load.service
 Wants=sys-kernel-config.mount
-ConditionPathExists=/sys/class/udc
 
 [Service]
 Type=oneshot

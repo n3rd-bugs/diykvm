@@ -164,9 +164,10 @@ if [ "$MREL" = "true" ];  then ln -s "$G/functions/hid.usb2"          "$G/config
 if [ "$MSD" = "true" ];   then ln -s "$G/functions/mass_storage.usb0" "$G/configs/c.1/"; fi
 if [ "$ACM" = "true" ];   then ln -s "$G/functions/acm.usb0"          "$G/configs/c.1/"; fi
 
-# Bind to the USB Device Controller (wait for it — dwc2 may not be ready at early boot)
+# Bind to the USB Device Controller (wait up to ~30s for it -- at early boot the dwc2/udc-core modules may
+# not have probed yet, and this unit has no ConditionPathExists guard, so the wait must cover that window)
 UDC=""
-for _ in $(seq 1 50); do
+for _ in $(seq 1 150); do
   for u in /sys/class/udc/*; do [ -e "$u" ] && { UDC=${u##*/}; break; }; done
   [ -n "$UDC" ] && break
   sleep 0.2
