@@ -1336,7 +1336,7 @@ CONFIG_FIELDS = [
      "fields": [
          {"key": "keyboard", "label": "Keyboard (HID) — needed to type to the target", "type": "bool", "default": "true"},
          {"key": "mouse", "label": "Mouse — absolute pointer (HID; what the UI's Absolute mode uses)", "type": "bool", "default": "true"},
-         {"key": "mouse_rel", "label": "Mouse — relative pointer (HID; what the UI's Relative mode uses; auto-dropped with a warning if the endpoint budget is exceeded)", "type": "bool", "default": "true"},
+         {"key": "mouse_rel", "label": "Mouse — relative pointer (HID). Turn OFF if the target keeps re-detecting USB in a loop — some hosts/KVM switches can't digest a 3rd HID interface; relative input is then emulated on the absolute mouse. Also auto-dropped if the endpoint budget is exceeded.", "type": "bool", "default": "true"},
          {"key": "mass_storage", "label": "Virtual USB drive (mass storage)", "type": "bool", "default": "true"},
          {"key": "usb_serial", "label": "Present a USB serial (COM) port to the target", "type": "bool", "default": "false"},
          {"key": "image_path", "label": "Drive image path", "type": "text", "default": "/opt/kvm/images/drive.img"},
