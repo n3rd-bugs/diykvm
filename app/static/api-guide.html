@@ -73,10 +73,16 @@ async def type_hello(pi, key):
         await ws.send(json.dumps({"t":"mm","x":0.5,"y":0.5}))   # cursor to screen center
 asyncio.run(type_hello("192.168.1.120","&lt;KEY&gt;"))</code></pre>
 
-<h2>3. Screen <span class="pill">GET /snapshot</span> <span class="pill">GET /stream</span> <span class="pill">WS /ws/video</span> <span class="pill">GET /api/ocr</span></h2>
+<h2>3. Screen <span class="pill">GET /snapshot</span> <span class="pill">GET /stream</span> <span class="pill">WS /ws/h264</span> <span class="pill">WS /ws/video</span> <span class="pill">GET /api/ocr</span></h2>
 <table>
 <tr><td><code>GET /snapshot</code></td><td>single JPEG of the target screen right now</td></tr>
-<tr><td><code>GET /stream</code></td><td>live MJPEG (<code>multipart/x-mixed-replace</code>) of the selected capture card. On slow links prefer <code>/ws/video</code>.</td></tr>
+<tr><td><code>GET /stream</code></td><td>live MJPEG (<code>multipart/x-mixed-replace</code>) of the selected capture card. On slow links prefer <code>/ws/h264</code> or <code>/ws/video</code>.</td></tr>
+<tr><td><code>WS /ws/h264?token=&lt;KEY&gt;</code></td><td><b>H.264 video</b> (the low-bandwidth transport, ~0.4–3&nbsp;Mbit/s vs ~25 for MJPEG).
+    Each <b>BINARY</b> message is <code>[1 header byte (bit0&nbsp;=&nbsp;keyframe)]</code> + one Annex-B access unit;
+    SPS/PPS ride on every frame, so decoding can start (and resync) at any keyframe — feed it to a WebCodecs
+    <code>VideoDecoder</code> (no <code>description</code> = Annex-B). Hardware-encoded on the Pi at
+    <code>[video] h264_bitrate</code>; a viewer that falls behind is resynced at the next keyframe. The socket
+    closes immediately when <code>[video] h264=false</code> or ffmpeg is missing — fall back to <code>/ws/video</code>.</td></tr>
 <tr><td><code>WS /ws/video?token=&lt;KEY&gt;</code></td><td><b>Client-paced video.</b> Per frame the server sends a
     <b>TEXT</b> message (JSON metadata <code>{ts,kb,level,q,scale}</code>) then the JPEG as a <b>BINARY</b>
     message, and waits for <b>any</b> reply before sending the next — so it always sends the freshest frame and

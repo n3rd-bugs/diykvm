@@ -49,6 +49,7 @@ SCHEMA = {
     "web": {"host": HOST, "port": PORT, "tls": BOOL,
             "tls_cert": PATH, "tls_key": PATH, "allowed_origins": ORIGINS},
     "video": {"device": DEV, "resolution": RES, "fps": INT, "quality": PCT, "adaptive": BOOL,
+              "h264": BOOL, "h264_bitrate": INT,
               "ustreamer_host": HOST, "ustreamer_port": PORT, "devices": VIDDEVS},
     "usb": {"image_path": PATH, "image_size": SIZE, "usb_serial": BOOL,
             "keyboard": BOOL, "mouse": BOOL, "mouse_rel": BOOL, "mass_storage": BOOL,

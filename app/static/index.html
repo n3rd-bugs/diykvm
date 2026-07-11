@@ -24,8 +24,9 @@
   #dot.up { background: #3a3; }
   #wrap { position: relative; flex: 1 1 auto; min-width: 0; display: flex;
           align-items: center; justify-content: center; overflow: hidden; }
-  #screen { max-width: 100%; max-height: 100%; display: block; cursor: crosshair;
+  #screen, #hscreen { max-width: 100%; max-height: 100%; display: block; cursor: crosshair;
             background: #000; }
+  #hscreen { display: none; }   /* H.264 (WebCodecs) canvas; swapped in for #screen when active */
   /* file manager — in-flow right column (does not overlay the stream) */
   #fm { flex: 0 0 360px; max-width: 92vw; background: #181818; border-left: 1px solid #333;
         display: none; flex-direction: column; padding: 12px; gap: 10px; overflow: auto; }
@@ -59,7 +60,7 @@
   #fmimglist li .tag { font-size: 10px; border: 1px solid #2c9a45; color: #79f29a; border-radius: 3px; padding: 0 4px; }
   #fmupbar { width: 100%; height: 10px; }
   /* touch + on-screen controls */
-  #wrap, #screen { touch-action: none; }
+  #wrap, #screen, #hscreen { touch-action: none; }
   #bar { flex-wrap: wrap; }
   /* in-flow bottom panel (does not overlay the stream) */
   #panel { flex: 0 0 auto; display: none; flex-direction: column; gap: 4px; padding: 6px;
@@ -163,6 +164,7 @@
   <div id="mid">
   <div id="wrap">
     <img id="screen" alt="target screen">
+    <canvas id="hscreen"></canvas>
   </div>
 
     <div id="fm">
@@ -263,6 +265,72 @@ const host = location.hostname;
 const wsURL = (p) => (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + p;
 const streamURL = '/stream';                 // proxied through the authenticated app
 const img = document.getElementById('screen');
+const hcanvas = document.getElementById('hscreen');    // H.264 (WebCodecs) render target
+const hctx = hcanvas.getContext('2d');
+const screens = [img, hcanvas];              // input listeners bind to both; one is visible at a time
+// `view` = whichever element is displaying video right now. All mouse geometry (absolute mapping,
+// zoom transform, pointer lock) follows it, so the H.264 canvas behaves exactly like the MJPEG <img>.
+let view = img;
+function setView(el) {
+  if (view === el) return;
+  el.style.transform = view.style.transform; view.style.transform = '';
+  view.style.display = 'none'; el.style.display = 'block';
+  if (view === img) img.src = '';            // stop the MJPEG stream while the canvas is live
+  view = el;
+}
+
+// ---- video transport: H.264/WebCodecs first, paced-MJPEG WebSocket next, MJPEG <img> last ----
+// /ws/h264 is the Chrome-Remote-Desktop-style path: hardware-encoded H.264 at ~0.4-3 Mbit/s (vs ~25
+// for MJPEG), decoded by the browser's VideoDecoder onto a canvas. A slow viewer is resynced by the
+// server at the next keyframe, so delay stays bounded. Frames: [1 header byte (bit0=key)] + Annex-B AU.
+let hws = null, hActive = false, hFails = 0, hdec = null, _hts = 0;
+function h264Connect() {
+  if (hws || document.hidden) return;
+  if (hFails >= 2 || !window.VideoDecoder) { wsVideoConnect(); return; }
+  let gotFrame = false;
+  try { hws = new WebSocket(wsURL('/ws/h264')); } catch (e) { hFails = 2; wsVideoConnect(); return; }
+  hws.binaryType = 'arraybuffer';
+  hws.onmessage = (e) => {
+    const d = new Uint8Array(e.data);
+    const key = (d[0] & 1) === 1;
+    if (!hdec) {
+      try {
+        hdec = new VideoDecoder({
+          output: (frame) => {
+            if (hcanvas.width !== frame.displayWidth || hcanvas.height !== frame.displayHeight) {
+              hcanvas.width = frame.displayWidth; hcanvas.height = frame.displayHeight;
+            }
+            hctx.drawImage(frame, 0, 0);
+            frame.close();
+          },
+          error: () => h264Fail(),
+        });
+        // no `description` = Annex-B input; SPS/PPS arrive inside every keyframe AU
+        hdec.configure({ codec: 'avc1.640028', optimizeForLatency: true });
+      } catch (err) { h264Fail(); return; }
+    }
+    if (!gotFrame && !key) return;             // decoding must start on a keyframe
+    try {
+      hdec.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: (_hts += 33333), data: d.subarray(1) }));
+      if (!gotFrame) { gotFrame = true; hActive = true; hFails = 0; setView(hcanvas); }
+    } catch (err) { h264Fail(); }
+  };
+  hws.onerror = () => { try { hws.close(); } catch (e) {} };
+  hws.onclose = () => {
+    hws = null;
+    if (hdec) { try { hdec.close(); } catch (e) {} hdec = null; }
+    if (document.hidden) return;               // visibilitychange resumes
+    if (!gotFrame && ++hFails >= 2) { hActive = false; setView(img); wsVideoConnect(); return; }
+    setTimeout(h264Connect, 1000);             // streamer restart / transient drop: reconnect
+  };
+}
+function h264Fail() {                          // decoder/socket trouble: fall back to MJPEG transports
+  hFails = 2; hActive = false;
+  if (hws) { try { hws.close(); } catch (e) {} }
+  if (hdec) { try { hdec.close(); } catch (e) {} hdec = null; }
+  setView(img);
+  wsVideoConnect();
+}
 
 // ---- video transport: client-paced WebSocket frames, MJPEG <img> as fallback ----
 // /ws/video sends ONE JPEG per ack (always the freshest), so at most one frame is ever in flight:
@@ -302,14 +370,15 @@ function wsVideoConnect() {
 }
 function videoFallback() { vwsMode = false; vstat.textContent = ''; img.src = streamURL + '?t=' + Date.now(); }
 function videoRestart() {                            // e.g. after switching the capture source
-  if (vws) { try { vws.close(); } catch (e) {} }     // onclose reconnects to the fresh stream
-  else if (!vwsMode) img.src = streamURL + '?t=' + Date.now();
+  if (hws) { try { hws.close(); } catch (e) {} }     // onclose reconnects to the fresh stream
+  else if (vws) { try { vws.close(); } catch (e) {} }
+  else if (!vwsMode && !hActive) img.src = streamURL + '?t=' + Date.now();
 }
-wsVideoConnect();
+h264Connect();
 
 // MJPEG fallback path: reconnect if the <img> stream drops (streamer restarting etc.)
 img.addEventListener('error', () => { setTimeout(() => {
-  if (!document.hidden && !vwsMode) img.src = streamURL + '?t=' + Date.now();
+  if (!document.hidden && !vwsMode && !hActive) img.src = streamURL + '?t=' + Date.now();
 }, 1000); });
 
 // ---- stream hygiene (MJPEG fallback only; WS video revokes its blobs every frame) ----
@@ -319,16 +388,19 @@ img.addEventListener('error', () => { setTimeout(() => {
 // blink, deferred while the operator is actively driving), and stop streaming while the tab is hidden.
 let _srPending = false;
 function _streamRefresh() {
-  if (document.hidden || vwsMode) { _srPending = false; return; }
+  if (document.hidden || vwsMode || hActive) { _srPending = false; return; }
   if (Date.now() - lastActivity < 5000) { setTimeout(_streamRefresh, 15000); return; }  // wait for idle
   _srPending = false;
   img.src = streamURL + '?t=' + Date.now();
 }
-setInterval(() => { if (!_srPending && !vwsMode) { _srPending = true; _streamRefresh(); } }, 5 * 60 * 1000);
+setInterval(() => { if (!_srPending && !vwsMode && !hActive) { _srPending = true; _streamRefresh(); } }, 5 * 60 * 1000);
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {                             // release the stream + its buffers
+    if (hws) { try { hws.close(); } catch (e) {} }
     if (vws) { try { vws.close(); } catch (e) {} }
     img.src = '';
+  } else if (hFails < 2 && window.VideoDecoder) {
+    h264Connect();
   } else if (vwsMode || vwsFails < 2) {
     wsVideoConnect();
   } else {
@@ -475,7 +547,7 @@ const mmodeBtn = document.getElementById('mmode');
 const msens = document.getElementById('msens');
 const msensWrap = document.getElementById('msenswrap');
 const msensVal = document.getElementById('msensval');
-const lockedToImg = () => document.pointerLockElement === img;
+const lockedToImg = () => document.pointerLockElement === view;
 function renderMouseMode() {
   mmodeBtn.textContent = 'Mouse: ' + (mouseMode === 'relative' ? 'Relative' : 'Absolute');
   mmodeBtn.classList.toggle('on', mouseMode === 'relative');
@@ -497,7 +569,7 @@ document.addEventListener('pointerlockchange', () => {
 });
 
 function norm(e) {
-  const r = img.getBoundingClientRect();
+  const r = view.getBoundingClientRect();
   return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height };
 }
 // Coalesce mouse motion to one message per animation frame. A high-DPI / high-polling-rate mouse can
@@ -519,7 +591,7 @@ function _flushMotion() {
 function _scheduleMotion() { if (!_rafId) _rafId = requestAnimationFrame(_flushMotion); }
 // Flush any rAF-pending motion immediately so a click/scroll is sent AFTER the move and lands in place.
 function _flushNow() { if (_rafId) cancelAnimationFrame(_rafId); _flushMotion(); }
-img.addEventListener('mousemove', (e) => {
+screens.forEach(el => el.addEventListener('mousemove', (e) => {
   if (!capturing) return;
   if (mouseMode === 'relative') {
     if (!lockedToImg()) return;
@@ -533,18 +605,18 @@ img.addEventListener('mousemove', (e) => {
   _absPend = p;
   info.textContent = `${(p.x*100).toFixed(0)}% , ${(p.y*100).toFixed(0)}%`;
   _scheduleMotion();
-});
-img.addEventListener('mousedown', (e) => {
-  if (!capturing) { setCapture(true); if (mouseMode === 'relative') img.requestPointerLock(); return; }
-  if (mouseMode === 'relative' && !lockedToImg()) { img.requestPointerLock(); return; }  // grab first
+}));
+screens.forEach(el => el.addEventListener('mousedown', (e) => {
+  if (!capturing) { setCapture(true); if (mouseMode === 'relative') view.requestPointerLock(); return; }
+  if (mouseMode === 'relative' && !lockedToImg()) { view.requestPointerLock(); return; }  // grab first
   e.preventDefault(); _flushNow(); send({ t: 'mb', button: e.button, down: true });
-});
+}));
 window.addEventListener('mouseup', (e) => {
   if (!capturing) return;
   if (mouseMode === 'relative' && !lockedToImg()) return;   // the lock-acquiring click sends no button
   _flushNow(); send({ t: 'mb', button: e.button, down: false });
 });
-img.addEventListener('contextmenu', (e) => e.preventDefault());
+screens.forEach(el => el.addEventListener('contextmenu', (e) => e.preventDefault()));
 // Scroll wheel. A plain mouse fires one event per notch, but high-resolution trackpads (macOS, Windows
 // Precision) report tiny pixel deltas and fire dozens of events per flick, so mapping every event to a
 // full HID tick overshoots wildly. Instead accumulate the raw deltaY, normalized by the reported unit,
@@ -553,7 +625,7 @@ img.addEventListener('contextmenu', (e) => e.preventDefault());
 // so an old remainder never spills into the next gesture. A normal notch (one page, ~3 lines, or a
 // ~100px pixel step) crosses the threshold exactly once, so ordinary mice still give one tick per notch.
 let _wheelAcc = 0, _wheelSign = 0, _wheelTs = 0;
-img.addEventListener('wheel', (e) => {
+screens.forEach(el => el.addEventListener('wheel', (e) => {
   if (!capturing) return;
   e.preventDefault();
   const dy = e.deltaY;
@@ -571,7 +643,7 @@ img.addEventListener('wheel', (e) => {
   _flushNow();                                 // send pending moves first so the scroll lands in place
   const tick = sign > 0 ? -1 : 1;              // screen deltaY is positive-down; HID wheel is positive-up
   for (let i = 0; i < ticks; i++) send({ t: 'mw', dy: tick });
-}, { passive: false });
+}, { passive: false }));
 
 // ---- toolbar actions ----
 document.getElementById('cad').onclick = () => {
@@ -860,24 +932,24 @@ let relIsReal = false;          // gadget has a real relative mouse (vs server-s
 function trackCursor(o){
   if (o.t === 'mm') { curX = o.x; curY = o.y; }
   else {                                           // mr: mirror the server's clamp at the screen edges
-    const dw = relIsReal ? (img.naturalWidth || 1920) : ABS_MAX;
-    const dh = relIsReal ? (img.naturalHeight || 1080) : ABS_MAX;
+    const dw = relIsReal ? ((view === img ? img.naturalWidth : hcanvas.width) || 1920) : ABS_MAX;
+    const dh = relIsReal ? ((view === img ? img.naturalHeight : hcanvas.height) || 1080) : ABS_MAX;
     curX = Math.max(0, Math.min(1, curX + o.dx / dw));
     curY = Math.max(0, Math.min(1, curY + o.dy / dh));
   }
   if (zoom > 1){                                   // keep the cursor centred (applyZoom clamps at edges)
-    panX = -(curX - 0.5) * img.clientWidth  * zoom;
-    panY = -(curY - 0.5) * img.clientHeight * zoom;
+    panX = -(curX - 0.5) * view.clientWidth  * zoom;
+    panY = -(curY - 0.5) * view.clientHeight * zoom;
     applyZoom();
   }
 }
 const touchDist = (ts)=> Math.hypot(ts[0].clientX-ts[1].clientX, ts[0].clientY-ts[1].clientY);
 function applyZoom(){
   // keep the scaled image's edges from drifting inside where its unscaled edges were
-  const mx = img.clientWidth  * (zoom-1) / 2, my = img.clientHeight * (zoom-1) / 2;
+  const mx = view.clientWidth  * (zoom-1) / 2, my = view.clientHeight * (zoom-1) / 2;
   panX = Math.max(-mx, Math.min(mx, panX));
   panY = Math.max(-my, Math.min(my, panY));
-  img.style.transform = zoom > 1 ? 'translate(' + panX + 'px,' + panY + 'px) scale(' + zoom + ')' : '';
+  view.style.transform = zoom > 1 ? 'translate(' + panX + 'px,' + panY + 'px) scale(' + zoom + ')' : '';
 }
 function pinchArm(ts){ pinch = {d0: touchDist(ts), z0: zoom}; }
 function pinchMove(ts){                              // returns true while the gesture is a pinch
@@ -891,8 +963,8 @@ function pinchMove(ts){                              // returns true while the g
   zoom = Math.max(1, Math.min(ZOOM_MAX, pinch.z0 * d / pinch.d0));
   if(zoom <= 1.02){ zoom = 1; panX = panY = 0; }     // snap back to fit
   else {                                             // the cursor is the anchor: zoom centres on it
-    panX = -(curX - 0.5) * img.clientWidth  * zoom;
-    panY = -(curY - 0.5) * img.clientHeight * zoom;
+    panX = -(curX - 0.5) * view.clientWidth  * zoom;
+    panY = -(curY - 0.5) * view.clientHeight * zoom;
   }
   applyZoom();
   gesture(zoom > 1 ? '🔍 ' + zoom.toFixed(1) + '×' : '🔍 fit');

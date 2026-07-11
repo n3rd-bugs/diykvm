@@ -20,6 +20,7 @@ case "$1" in
     usermod -aG dialout diykvm 2>/dev/null || true   # serial console access
     getent group gpio >/dev/null || groupadd --system gpio   # GPIO power control (/dev/gpiochip*)
     usermod -aG gpio diykvm 2>/dev/null || true      # (kvm-web.service requires the gpio group to exist)
+    usermod -aG video diykvm 2>/dev/null || true     # hardware H.264 encoder (/dev/video11) for /ws/h264
 
     # validate + lock down the sudoers drop-in (never leave a broken sudoers file)
     if [ -f /etc/sudoers.d/diykvm ]; then

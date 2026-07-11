@@ -14,6 +14,7 @@ import os
 import re
 import json
 import time
+import shutil
 import asyncio
 import socket
 import subprocess
@@ -272,6 +273,12 @@ API_INFO = {
                  "(echoes ts) to measure round-trip latency over this socket."},
         {"method": "GET", "path": "/snapshot", "auth": True, "desc": "JPEG of the target screen now."},
         {"method": "GET", "path": "/stream", "auth": True, "desc": "Live MJPEG stream (of the selected capture card). On slow links prefer /ws/video."},
+        {"method": "WS", "path": "/ws/h264", "auth": True,
+         "desc": "H.264 video for WebCodecs clients: binary messages of [1 header byte (bit0=keyframe)] + one "
+                 "Annex-B access unit (SPS/PPS on every frame; join/rejoin at any keyframe). Hardware-encoded "
+                 "on the Pi at [video] h264_bitrate (~0.4-3 Mbit/s vs ~25 for MJPEG); a viewer that falls "
+                 "behind is resynced at the next keyframe. Closes immediately when [video] h264=false or "
+                 "ffmpeg is missing -- fall back to /ws/video. Auth like /ws (session cookie or ?token=)."},
         {"method": "WS", "path": "/ws/video", "auth": True,
          "desc": "Client-paced video: per frame the server sends a text message (JSON {ts,kb,level,q,scale}) "
                  "then the JPEG as a binary message, and waits for ANY reply before sending the next (always "
@@ -549,6 +556,177 @@ async def ws_video(sock: WebSocket):
         pass
     finally:
         await tap.close()
+
+
+# ----------------------------- H.264 video (WebCodecs clients) -----------------------------
+# One shared hardware transcode (uStreamer MJPEG -> software decode -> the Pi's h264_v4l2m2m encoder,
+# ~1.3 cores total) fanned out to every /ws/h264 viewer. H.264 turns the ~25 Mbit/s MJPEG stream into
+# 0.4-3 Mbit/s (inter-frame coding; mostly-static desktops sit near the floor), so remote links stop
+# being saturated at all -- the Chrome-Remote-Desktop-style transport. ffmpeg reads uStreamer's HTTP
+# stream as just another client, so there is no V4L2 device contention with MJPEG/snapshot/OCR.
+
+def _h264_conf():
+    c = configparser.ConfigParser()
+    c.read(CONF_PATH)
+    on = c.get("video", "h264", fallback="true").strip().lower() in ("1", "true", "yes", "on")
+    try:
+        kbps = max(300, min(20000, int(c.get("video", "h264_bitrate", fallback="3000"))))
+    except ValueError:
+        kbps = 3000
+    return on, kbps
+
+
+def _iter_nal_starts(buf: bytes):
+    """Yield (start, header) for each Annex-B start code: start includes a 4-byte code's leading zero,
+    header is the offset of the NAL header byte (type = buf[header] & 0x1F)."""
+    i = 0
+    while True:
+        j = buf.find(b"\x00\x00\x01", i)
+        if j < 0:
+            return
+        yield (j - 1 if j > 0 and buf[j - 1] == 0 else j), j + 3
+        i = j + 3
+
+
+class _H264Client:
+    __slots__ = ("q", "wait_idr")
+
+    def __init__(self):
+        self.q = asyncio.Queue(maxsize=30)   # ~1s of frames; overflow = viewer is behind -> IDR resync
+        self.wait_idr = True                 # a decoder must join (and rejoin) on a keyframe
+
+
+class _H264Source:
+    """Ref-counted shared transcoder: starts ffmpeg with the first viewer, kills it with the last.
+    The pump splits ffmpeg's Annex-B output into access units (the encoder emits SPS+PPS+one VCL NAL
+    per frame, so any IDR is a self-contained join point) and fans them out; a viewer whose queue
+    overflows gets its backlog dumped and rejoins cleanly at the next keyframe, so a slow link adds at
+    most ~one GOP of delay instead of accumulating forever."""
+
+    def __init__(self):
+        self.clients = set()
+        self.proc = None
+        self.task = None
+        self.lock = asyncio.Lock()
+
+    async def attach(self, kbps: int) -> _H264Client:
+        async with self.lock:
+            c = _H264Client()
+            self.clients.add(c)
+            if self.proc is None:
+                self.proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+                    "-use_wallclock_as_timestamps", "1", "-fflags", "nobuffer", "-flags", "low_delay",
+                    "-f", "mpjpeg", "-i", f"{USTREAMER}/stream",
+                    "-an", "-c:v", "h264_v4l2m2m", "-b:v", "%dk" % kbps, "-g", "30", "-bf", "0",
+                    "-pix_fmt", "yuv420p", "-f", "h264", "pipe:1",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+                self.task = asyncio.create_task(self._pump(self.proc))
+            return c
+
+    async def detach(self, c: _H264Client):
+        async with self.lock:
+            self.clients.discard(c)
+            if not self.clients and self.proc is not None:
+                proc, task, self.proc, self.task = self.proc, self.task, None, None
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                if task:
+                    task.cancel()
+                    try:
+                        await task
+                    except Exception:
+                        pass
+
+    def _fan(self, idr: bool, au: bytes):
+        payload = (b"\x01" if idr else b"\x00") + au
+        for c in list(self.clients):
+            if c.wait_idr:
+                if not idr:
+                    continue
+                c.wait_idr = False
+            try:
+                c.q.put_nowait(payload)
+            except asyncio.QueueFull:
+                while not c.q.empty():           # viewer ~1s behind: dump the backlog,
+                    try:
+                        c.q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                c.wait_idr = True                # ...and rejoin at the next keyframe
+
+    async def _pump(self, proc):
+        buf = b""
+        try:
+            while True:
+                chunk = await proc.stdout.read(65536)
+                if not chunk:
+                    break                        # ffmpeg ended (e.g. streamer restarted): viewers reconnect
+                buf += chunk
+                starts = list(_iter_nal_starts(buf))
+                emitted = 0
+                for k in range(len(starts) - 1):     # the final NAL may still be partial; keep it buffered
+                    s, h = starts[k]
+                    ntyp = buf[h] & 0x1F
+                    if ntyp in (1, 5):               # a VCL NAL closes the access unit (one per frame)
+                        nxt = starts[k + 1][0]
+                        self._fan(ntyp == 5, buf[emitted:nxt])
+                        emitted = nxt
+                if emitted:
+                    buf = buf[emitted:]
+                if len(buf) > (16 << 20):
+                    buf = b""                        # runaway guard (no start codes): resync
+        except Exception:
+            pass
+        finally:
+            async with self.lock:
+                if self.proc is proc:                # pump died on its own: let the next attach restart
+                    self.proc = None
+                    self.task = None
+            for c in list(self.clients):
+                while not c.q.empty():
+                    try:
+                        c.q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                try:
+                    c.q.put_nowait(None)             # source ended: viewer sockets close + reconnect
+                except asyncio.QueueFull:
+                    pass
+
+
+_h264_src = _H264Source()
+
+
+@app.websocket("/ws/h264")
+async def ws_h264(sock: WebSocket):
+    """H.264 for WebCodecs viewers: binary messages of [1-byte header (bit0 = keyframe)] + one Annex-B
+    access unit (SPS/PPS ride on every frame, so decoding can start at any keyframe). The UI prefers
+    this transport and falls back to /ws/video (paced MJPEG), then the MJPEG <img>. Disabled via
+    [video] h264=false or when ffmpeg is not installed (the socket closes and clients fall back)."""
+    if not ws_authed(sock):
+        await sock.close(code=1008)
+        return
+    await sock.accept()
+    on, kbps = _h264_conf()
+    if not on or not shutil.which("ffmpeg"):
+        await sock.close(code=1011)
+        return
+    client = await _h264_src.attach(kbps)
+    try:
+        while True:
+            payload = await client.q.get()
+            if payload is None:
+                break
+            await sock.send_bytes(payload)
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    except Exception:
+        pass
+    finally:
+        await _h264_src.detach(client)
 
 
 @app.get("/snapshot")
@@ -1515,6 +1693,8 @@ CONFIG_FIELDS = [
          {"key": "fps", "label": "Frames per second", "type": "number", "default": "30"},
          {"key": "quality", "label": "JPEG quality 1–100 — the base bandwidth knob (what the capture encodes at).", "type": "number", "default": "80"},
          {"key": "adaptive", "label": "Adaptive video — automatically lower quality/scale per viewer when their link is slow, keeping latency at ~1 frame (shown as ▼q… in the toolbar). Applies immediately on the next video reconnect.", "type": "bool", "default": "true"},
+         {"key": "h264", "label": "H.264 video (hardware-encoded, ~0.4–3 Mbit/s vs ~25 for MJPEG) for browsers with WebCodecs — the low-bandwidth transport; falls back to MJPEG automatically. Needs ffmpeg on the Pi.", "type": "bool", "default": "true"},
+         {"key": "h264_bitrate", "label": "H.264 target bitrate, kbit/s (300–20000). The encoder undershoots on static screens; this caps motion.", "type": "number", "default": "3000"},
          {"key": "ustreamer_host", "label": "uStreamer host", "type": "text", "default": "127.0.0.1"},
          {"key": "ustreamer_port", "label": "uStreamer port", "type": "number", "default": "8080"},
      ]},
