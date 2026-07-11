@@ -9,8 +9,9 @@ For install/usage see the top‑level [README](../README.md); the agent API is a
   proxy (`/stream`, `/snapshot`), input WebSocket `/ws` (HID writes run off the event loop and mouse
   motion is **coalesced** server‑side, so a fast/high‑DPI mouse can't back up or stall the loop),
   mass‑storage REST `/api/msd/*`, binary‑clean serial WebSocket `/ws/serial`, target power `/api/power`,
-  external KVM switch `/api/kvmswitch`, config read/write `/api/config` (+ the `/config` page), a public
-  machine‑readable API descriptor `/api`, and a `/pingtest` latency meter (`/ws` `ping`/`pong`).
+  external KVM switch `/api/kvmswitch`, config read/write `/api/config` (+ the `/config` page), the device
+  event stream `/ws/events` + snapshot `/api/events/state`, a public machine‑readable API descriptor `/api`,
+  and a `/pingtest` latency meter (`/ws` `ping`/`pong`).
   Reads `/etc/kvm/kvm.conf` (host/port/TLS, ustreamer URL, image path, USB serial, capture shortcut).
 - `power.py` — latched per-target power over GPIO: drives a relay line on/off (`pinctrl`) to connect or
   cut each target's power, and reads the line back for state.
@@ -37,6 +38,12 @@ For install/usage see the top‑level [README](../README.md); the agent API is a
   bounded **backlog** that a connecting client receives once and is then dropped — and bytes delivered live
   are never retained — so reconnecting never duplicates. Opens **raw, 8N1, echo off, DTR asserted** with
   selectable **RTS/CTS or XON/XOFF** flow control; explicit **open/close** lifecycle decoupled from clients.
+- `events.py` — in‑process **event bus**: request handlers and a background poller publish state‑change
+  events; `/ws/events` clients subscribe and get them as JSON, with a small ring buffer for replay‑on‑connect,
+  so tooling tracks USB‑gadget/serial/drive/power/switch state without polling (`GET /api/events/state`).
+- `target_events.py` — **pure** derivations that turn raw domain‑state diffs into fine‑grained semantic
+  target transitions (`usb.enumerated`, `gadget.bound`, `power.on`/`off`, `serial.opened`/`reconnected`,
+  `hid.online`/`offline`, `drive.attached`…) alongside the coarse per‑domain events.
 - `static/` — `index.html` (single‑page UI), `config.html` (settings page), `login.html`, `api-guide.html`,
   `pingtest.html` (browser↔Pi latency meter).
 
@@ -59,9 +66,10 @@ gadget at ~125 Hz, so a fast/high‑DPI client can't outrun the USB write rate o
 ## Notes
 - The web service runs **unprivileged** (user `diykvm`): it writes `/dev/hidg*` via the `diykvm`
   group (udev rule), opens serial ports via `dialout`, drives the power GPIO via the `gpio` group
-  (`/dev/gpiochip*`), and performs the privileged virtual‑drive and config transitions through
-  `sudo /usr/local/sbin/kvm-msd-helper {attach|detach|eject|import|delete}` and
-  `sudo /usr/local/sbin/kvm-conf-helper {write|restart-streamer}` (fixed verbs, no path arguments).
+  (`/dev/gpiochip*`), and performs the privileged virtual‑drive, config and gadget transitions through
+  `sudo /usr/local/sbin/kvm-msd-helper {attach|detach|eject|import|delete}`,
+  `sudo /usr/local/sbin/kvm-conf-helper {write|restart-streamer}` and
+  `sudo /usr/local/sbin/kvm-gadget-helper {reenumerate|recover}` (fixed verbs, no path arguments).
   The image library `/opt/kvm/images` is **root‑owned** — the app reads it, but uploads/deletes go
   through the helper (an upload is streamed in over the helper's stdin), so the directory the helper
   trusts can never be tampered with. The config helper validates every value against a strict allowlist

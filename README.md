@@ -91,11 +91,30 @@ sudo systemctl restart kvm-web ustreamer kvm-gadget
 | `web` | `tls`, `tls_cert`, `tls_key` | `true` | serve HTTPS (and `wss://` for input); on by default with a self‑signed cert |
 | `web` | `allowed_origins` | _(blank)_ | extra browser origins permitted to connect |
 | `video` | `device`, `resolution`, `fps` | `/dev/video0`, `1920x1080`, `30` | capture + stream |
+| `video` | `devices` | _(blank)_ | multi‑PC: `Label:/dev/videoN, …` capture cards; UI shows a source picker (blank = just `device`) |
+| `video` | `quality` | `80` | base JPEG quality 1‑100 (the bandwidth knob the capture encodes at) |
+| `video` | `adaptive` | `true` | per‑viewer: on a slow link, auto re‑encode that viewer's `/ws/video` frames smaller to hold latency at ~1 frame |
+| `usb` | `keyboard`, `mouse`, `mouse_rel`, `mass_storage` | `true` | which gadget functions to present (boot keyboard / absolute mouse / relative mouse / virtual drive); see the endpoint budget below |
 | `usb` | `image_path`, `image_size` | `/opt/kvm/images/drive.img`, `1G` | virtual drive |
 | `usb` | `usb_serial` | `false` | also present a USB serial (CDC‑ACM) COM port to the target (Pi side `/dev/ttyGS0`) |
 | `usb` | `store_lun`, `store_size`, `store_inquiry` | `false`, `64M`, _(blank)_ | also present a 2nd mass‑storage LUN (scratch RW block store) the host can WRITE(10) to and you read back via `GET /api/store/region` — a generic one‑way host→Pi bulk data store (logs, captures, firmware dumps …). `store_inquiry` sets the SCSI INQUIRY so a specific host identifies the LUN |
 | `serial` | `default_baud`, `default_flow`, `autostart`, `reconnect` | `115200`, `none`, _(blank)_, `true` | serial console: UI defaults (flow; raw/8N1/DTR/buffered); `autostart` auto‑opens listed ports from boot (blank = the other end opens on demand via `POST /api/serial/open`); `reconnect` auto‑reopens a dropped port. `POST /api/serial/reenumerate` re‑enumerates the gadget so the target gets a fresh COM port |
+| `power` | `enabled`, `mode`, `targets`, … | `false`, `relay`, _(blank)_ | per‑target GPIO power — `relay` (latched connect/cut) or `button` (momentary front‑panel button, `hold_on_sec`/`hold_off_sec`); `targets = Label:BCMpin, …` |
+| `kvmswitch` | `enabled`, `ports`, `pulse_ms` | `false`, _(blank)_, `300` | external hardware KVM switch — pulse a GPIO per select button; `ports = Label:BCMpin, …` |
 | `ui` | `capture_exit` | `Ctrl+Space` | shortcut to release input capture (blank = on‑screen button only) |
+
+**USB endpoint budget.** The Pi's **dwc2** controller has **7** endpoints. Each `[usb]` function costs some,
+so the enabled set must fit — with everything on the total is 8, one over, and `kvm-gadget` **auto‑sheds the
+relative mouse** (the one nicety) and logs a `WARN` (relative input then falls back onto the absolute mouse):
+
+| Function | Endpoints |
+|---|---|
+| `keyboard` | 1 |
+| `mouse` (absolute) | 1 |
+| `mouse_rel` (relative) | 1 |
+| `mass_storage` | 2 |
+| `usb_serial` (CDC‑ACM) | 3 |
+| **all on** | **8 → over budget, relative mouse dropped** |
 
 ### HTTPS (on by default)
 
@@ -143,8 +162,10 @@ examples for input, screen capture, the virtual drive and serial, is at **`/api-
 LAN‑only by design. Authentication (session cookie, `SameSite=lax`, or API key) is required for
 every endpoint; WebSockets and unsafe requests are **Origin‑checked** (blocks cross‑site hijacking);
 logins are **rate‑limited**; the serial console only opens **enumerated** ports; the video stream is
-proxied behind auth. The web app itself runs **unprivileged** (user `diykvm`) — only the two
-virtual‑drive transitions are privileged, through a no‑argument `sudo` helper. There is no internet
+proxied behind auth. The web app itself runs **unprivileged** (user `diykvm`); the only root it can reach is
+a tiny, fixed set of `sudo` helper verbs with **no path arguments** — `kvm-msd-helper {attach|detach|eject|import|delete}`,
+`kvm-conf-helper {write|restart-streamer}` and `kvm-gadget-helper {reenumerate|recover}` (nine verbs across
+three helpers, enumerated in `sudoers.d/diykvm`). There is no internet
 hardening — do not expose port 8000 directly; use a VPN (WireGuard/Tailscale) for remote access.
 
 ## Building from source
@@ -165,12 +186,16 @@ TARGET ── HDMI ──▶ USB capture ──▶ /dev/video0 ──▶ ustream
 operator ◀── LAN ───────────────────────────────────────────────┘
 ```
 
-- **`kvm-gadget`** builds a composite USB gadget via configfs: a **boot‑protocol keyboard**
-  interface (no Report ID, so it works in the target's BIOS/UEFI), a separate **mouse** interface
-  (absolute + relative, multiplexed by report IDs), a mass‑storage function backed by the drive image,
-  and — when `usb.usb_serial` is set — a **CDC‑ACM serial** interface the target sees as a COM port (the
-  Pi side is `/dev/ttyGS0`). Each HID interface is IN‑endpoint‑only so they fit the Pi's dwc2 endpoint
-  budget alongside mass storage and the optional serial.
+- **`kvm-gadget`** builds a composite USB gadget via configfs, out of **three separate HID functions**:
+  a **boot‑protocol keyboard** (`/dev/hidg0`, no Report ID, so it works in the target's BIOS/UEFI), an
+  **absolute mouse** (`/dev/hidg1`) and an optional **relative mouse** (`/dev/hidg2`) — plus a mass‑storage
+  function backed by the drive image, and, when `usb.usb_serial` is set, a **CDC‑ACM serial** interface the
+  target sees as a COM port (the Pi side is `/dev/ttyGS0`). The two pointers are **separate interfaces on
+  purpose**: packed as two collections in one interface, Linux targets (hid‑generic) merge them into one
+  input device and silently **drop the second collection's buttons**, so relative‑mode clicks never reached
+  Linux — as their own interfaces every OS binds two complete mice. Each HID function is **IN‑endpoint‑only**
+  (`no_out_endpoint=1`) so the set fits the Pi's dwc2 endpoint budget alongside mass storage and the optional
+  serial, and enumerates once instead of resetting every ~10&nbsp;s.
 - **`ustreamer`** serves the capture as MJPEG on localhost.
 - **`kvm-web`** (FastAPI) serves the UI, proxies the video behind auth, turns WebSocket input
   events into HID reports, manages the virtual drive (configfs + loop‑mounted ESP), bridges the

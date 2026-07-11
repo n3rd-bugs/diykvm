@@ -31,14 +31,18 @@ agents can fetch it to discover everything below programmatically.</p>
 <h2>1. Authentication</h2>
 <p>Humans log in at <code>/login</code> (session cookie). <b>Agents use the API key.</b> Get it by exchanging
 credentials once:</p>
-<pre><code>curl -s -X POST http://&lt;pi&gt;:8000/api/login \
+<pre><code>curl -sk -X POST https://&lt;pi&gt;:8000/api/login \
      -d username=admin -d password=YOURPASS
 # -> {"api_key":"&lt;KEY&gt;"}</code></pre>
+<p class="muted"><b>TLS is on by default</b> (self-signed cert) — the appliance serves <code>https://</code> and
+<code>wss://</code>. The examples below use them; pass <code>curl -k</code> (or
+<code>rejectUnauthorized:false</code> / an unverified TLS context) to accept the self-signed cert. If you set
+<code>[web] tls = false</code>, use <code>http://</code> and <code>ws://</code> instead.</p>
 <p>Then send the key on every request — HTTP header <b><code>X-API-Key: &lt;KEY&gt;</code></b> (or
 <code>Authorization: Bearer &lt;KEY&gt;</code>); for WebSockets add <b><code>?token=&lt;KEY&gt;</code></b> to the URL.</p>
 
 <h2>2. Input — keyboard &amp; mouse <span class="pill">WS /ws</span></h2>
-<p>Connect to <code>ws://&lt;pi&gt;:8000/ws?token=&lt;KEY&gt;</code> and send JSON messages:</p>
+<p>Connect to <code>wss://&lt;pi&gt;:8000/ws?token=&lt;KEY&gt;</code> and send JSON messages:</p>
 <table>
 <tr><th>Message</th><th>Effect</th></tr>
 <tr><td><code>{"t":"kd","code":"KeyA"}</code></td><td>key down (<code>code</code> = JS <code>KeyboardEvent.code</code>)</td></tr>
@@ -59,19 +63,26 @@ Insert Delete</code>, modifiers <code>ControlLeft ShiftLeft AltLeft MetaLeft</co
 punctuation <code>Minus Equal BracketLeft BracketRight Backslash Semicolon Quote Backquote Comma Period
 Slash</code>. To type a capital "A": <code>kd ShiftLeft</code>, <code>kd KeyA</code>, <code>ku KeyA</code>, <code>ku ShiftLeft</code>.</p>
 <h3>Example (Python)</h3>
-<pre><code>import asyncio, json, websockets
+<pre><code>import asyncio, json, ssl, websockets
+NOVERIFY = ssl.create_default_context(); NOVERIFY.check_hostname = False; NOVERIFY.verify_mode = ssl.CERT_NONE  # self-signed
 async def type_hello(pi, key):
-    async with websockets.connect(f"ws://{pi}:8000/ws?token={key}") as ws:
+    async with websockets.connect(f"wss://{pi}:8000/ws?token={key}", ssl=NOVERIFY) as ws:
         for c in ["KeyH","KeyI"]:
             await ws.send(json.dumps({"t":"kd","code":c}))
             await ws.send(json.dumps({"t":"ku","code":c}))
         await ws.send(json.dumps({"t":"mm","x":0.5,"y":0.5}))   # cursor to screen center
 asyncio.run(type_hello("192.168.1.120","&lt;KEY&gt;"))</code></pre>
 
-<h2>3. Screen <span class="pill">GET /snapshot</span> <span class="pill">GET /stream</span> <span class="pill">GET /api/ocr</span></h2>
+<h2>3. Screen <span class="pill">GET /snapshot</span> <span class="pill">GET /stream</span> <span class="pill">WS /ws/video</span> <span class="pill">GET /api/ocr</span></h2>
 <table>
 <tr><td><code>GET /snapshot</code></td><td>single JPEG of the target screen right now</td></tr>
-<tr><td><code>GET /stream</code></td><td>live MJPEG (<code>multipart/x-mixed-replace</code>)</td></tr>
+<tr><td><code>GET /stream</code></td><td>live MJPEG (<code>multipart/x-mixed-replace</code>) of the selected capture card. On slow links prefer <code>/ws/video</code>.</td></tr>
+<tr><td><code>WS /ws/video?token=&lt;KEY&gt;</code></td><td><b>Client-paced video.</b> Per frame the server sends a
+    <b>TEXT</b> message (JSON metadata <code>{ts,kb,level,q,scale}</code>) then the JPEG as a <b>BINARY</b>
+    message, and waits for <b>any</b> reply before sending the next — so it always sends the freshest frame and
+    bounds delay to ~1 frame + RTT (a slow link gets fewer fps, never a backlog). With <code>[video]
+    adaptive=true</code> (default) frames are auto re-encoded smaller when the send→ack cycle exceeds the
+    latency budget. Reply with anything (e.g. an empty frame) to request the next.</td></tr>
 <tr><td><code>GET /api/ocr</code></td><td><b>Read the screen as text.</b> OCRs the current frame (local Tesseract) and returns
     <code>{image:{w,h}, text, lines[], blocks[]}</code>. Every <code>line</code> has <code>text</code>, a
     <code>bbox:[x,y,w,h]</code> in image pixels and a <code>conf</code>; <code>lines</code> are in reading order,
@@ -80,11 +91,20 @@ asyncio.run(type_hello("192.168.1.120","&lt;KEY&gt;"))</code></pre>
     <code>scale</code>, <code>words=1</code> (per-word boxes). On-demand; ~1&ndash;4&nbsp;s per 1080p frame.</td></tr>
 </table>
 <pre><code>import requests
-d = requests.get("http://&lt;pi&gt;:8000/api/ocr", headers={"X-API-Key":"&lt;KEY&gt;"},
-                 params={"min_conf": 60}).json()
+d = requests.get("https://&lt;pi&gt;:8000/api/ocr", headers={"X-API-Key":"&lt;KEY&gt;"},
+                 params={"min_conf": 60}, verify=False).json()   # verify=False: self-signed cert
 for ln in d["lines"]:                       # text in reading order, with positions
     print(ln["bbox"], round(ln["conf"]), ln["text"])</code></pre>
-<pre><code>curl -s -H "X-API-Key: &lt;KEY&gt;" http://&lt;pi&gt;:8000/snapshot -o screen.jpg</code></pre>
+<pre><code>curl -sk -H "X-API-Key: &lt;KEY&gt;" https://&lt;pi&gt;:8000/snapshot -o screen.jpg</code></pre>
+
+<h3>Capture-card selection (multi-PC)</h3>
+<p>With more than one capture card configured (<code>[video] devices = Label:/dev/videoN, …</code>), pick
+which one <code>/stream</code>, <code>/snapshot</code> and <code>/ws/video</code> show:</p>
+<table>
+<tr><th>Endpoint</th><th>Does</th></tr>
+<tr><td><code>GET /api/video/sources</code></td><td><code>{sources:[{index,label}], active, multi}</code> — the configured capture cards.</td></tr>
+<tr><td><code>POST /api/video/select</code> <code>{"index":N}</code></td><td>switch the live stream to that card (restarts the streamer, ~1–2&nbsp;s). Only a configured card is allowed.</td></tr>
+</table>
 
 <h2>4. Virtual USB drive / EFI boot media <span class="pill">/api/msd/*</span></h2>
 <p>The target sees a removable USB disk (a GPT disk with a FAT32 EFI System Partition). The drive is either
@@ -100,10 +120,10 @@ for ln in d["lines"]:                       # text in reading order, with positi
 <tr><td><code>POST /api/msd/mkdir?path=</code> · <code>DELETE /api/msd/rm?path=</code></td><td>make / remove</td></tr>
 </table>
 <pre><code># put a UEFI bootloader on the ESP, then boot the target from it
-curl -s -X POST -H "X-API-Key: &lt;KEY&gt;" http://&lt;pi&gt;:8000/api/msd/detach
-curl -s -H "X-API-Key: &lt;KEY&gt;" -F file=@BOOTX64.EFI \
-     "http://&lt;pi&gt;:8000/api/msd/upload?path=EFI/BOOT"
-curl -s -X POST -H "X-API-Key: &lt;KEY&gt;" http://&lt;pi&gt;:8000/api/msd/attach</code></pre>
+curl -sk -X POST -H "X-API-Key: &lt;KEY&gt;" https://&lt;pi&gt;:8000/api/msd/detach
+curl -sk -H "X-API-Key: &lt;KEY&gt;" -F file=@BOOTX64.EFI \
+     "https://&lt;pi&gt;:8000/api/msd/upload?path=EFI/BOOT"
+curl -sk -X POST -H "X-API-Key: &lt;KEY&gt;" https://&lt;pi&gt;:8000/api/msd/attach</code></pre>
 
 <h3>Boot images — upload a whole image / ISO</h3>
 <p>Instead of editing the EFI drive, upload a complete disk image or installer ISO and hand it to the target.</p>
@@ -116,9 +136,19 @@ curl -s -X POST -H "X-API-Key: &lt;KEY&gt;" http://&lt;pi&gt;:8000/api/msd/attac
 <tr><td><code>DELETE /api/msd/images?name=</code></td><td>delete an image (not the attached one or the default EFI drive)</td></tr>
 </table>
 <pre><code># upload an installer ISO and boot the target from it
-curl -s -X POST -H "X-API-Key: &lt;KEY&gt;" -F file=@ubuntu.iso \
-     http://&lt;pi&gt;:8000/api/msd/images/upload
-curl -s -X POST -H "X-API-Key: &lt;KEY&gt;" "http://&lt;pi&gt;:8000/api/msd/images/attach?name=ubuntu.iso"</code></pre>
+curl -sk -X POST -H "X-API-Key: &lt;KEY&gt;" -F file=@ubuntu.iso \
+     https://&lt;pi&gt;:8000/api/msd/images/upload
+curl -sk -X POST -H "X-API-Key: &lt;KEY&gt;" "https://&lt;pi&gt;:8000/api/msd/images/attach?name=ubuntu.iso"</code></pre>
+
+<h3>Scratch block store — bulk host→Pi data <span class="pill">/api/store/*</span></h3>
+<p>Enable <code>[usb] store_lun</code> to present a <b>second</b> mass-storage LUN: a scratch, read-write block
+device the target can <code>WRITE(10)</code> to and you read back on the Pi — a generic one-way host→Pi bulk
+store (logs, captures, firmware dumps …). One-way only; the Pi exposes what the host wrote.</p>
+<table>
+<tr><th>Endpoint</th><th>Does</th></tr>
+<tr><td><code>GET /api/store/status</code></td><td><code>{present, path, block_size, size_bytes, blocks}</code></td></tr>
+<tr><td><code>GET /api/store/region?lba=&amp;blocks=</code></td><td>read raw blocks the host wrote — <code>blocks</code>×512&nbsp;B from <code>lba</code> (page-cache, coherent after the host's FUA). Response header <code>X-Store-Blocks</code> = blocks actually returned.</td></tr>
+</table>
 
 <h2>5. Serial console <span class="pill">/api/serial/open</span> <span class="pill">/api/serial/close</span> <span class="pill">WS /ws/serial</span></h2>
 <p>Each port has <b>one owner</b> on the server: it is drained <b>continuously</b> and fanned out to any
@@ -141,16 +171,19 @@ requests it with <code>POST /api/serial/open</code> when it wants the Pi to atta
 <tr><td><code>GET /api/serial/status</code></td><td>open ports + settings, buffered byte count and client count, plus the supported <code>flow_modes</code>.</td></tr>
 <tr><td><code>POST /api/serial/open</code></td><td><code>{device, baud, flow:none|rtscts|xonxoff, dtr, rts, reconnect, reopen}</code> — open the port and keep it draining into the ring buffer even with no client. Idempotent. This is how the other end requests the Pi attach when <code>autostart</code> is off.</td></tr>
 <tr><td><code>POST /api/serial/close</code></td><td><code>{device}</code> — close the port and stop buffering.</td></tr>
-<tr><td><code>POST /api/serial/reenumerate</code></td><td>re-enumerate the USB gadget (unbind + re-bind its UDC) so the target re-detects the device and gets a <b>fresh CDC-ACM COM port</b> on demand. Because USB enumerates per device, the keyboard, mouse and mass-storage interface also briefly re-appear (~1&nbsp;s); an open Pi-side port self-heals.</td></tr>
+<tr><td><code>POST /api/serial/clear</code></td><td><code>{device}</code> — discard the port's buffered RX scrollback (the detached backlog replayed to the next client). Returns <code>{discarded, open}</code>; leaves the port open.</td></tr>
+<tr><td><code>POST /api/serial/reenumerate</code></td><td>re-enumerate the USB gadget (unbind + re-bind its UDC) so the target re-detects the device and gets a <b>fresh CDC-ACM COM port</b> on demand. Quick bounce (~0.4&nbsp;s). Because USB enumerates per device, the keyboard, mouse and mass-storage interface also briefly re-appear (~1&nbsp;s); an open Pi-side port self-heals.</td></tr>
+<tr><td><code>POST /api/gadget/recover</code></td><td>recover a <b>wedged</b> gadget: unbind + re-bind the UDC while holding the disconnect ~2&nbsp;s, so a host stuck mid-enumeration (state <code>not attached</code> / addressed-but-not-configured, e.g. after a re-enum storm or a config-change rebuild) fully deregisters and re-enumerates clean — a brief re-enumerate won't unstick it. Bounces <b>all</b> USB ~2&nbsp;s; returns <code>{recovered, hid_reopened, detail}</code>.</td></tr>
 <tr><td><code>WS /ws/serial?device=/dev/ttyGS0&amp;baud=115200&amp;flow=none&amp;dtr=1&amp;token=&lt;KEY&gt;</code></td>
     <td><b>Binary-clean.</b> Subscribes to the port (auto-opens it with these settings if needed), replays the
     buffered scrollback, then streams live. RX arrives as WebSocket <b>BINARY</b> frames (raw bytes); transmit
     <b>BINARY</b> frames (verbatim) or <b>TEXT</b> frames (UTF-8). Status lines arrive as <b>TEXT</b> frames.</td></tr>
 </table>
-<pre><code>import asyncio, websockets
+<pre><code>import asyncio, ssl, websockets
+NOVERIFY = ssl.create_default_context(); NOVERIFY.check_hostname = False; NOVERIFY.verify_mode = ssl.CERT_NONE  # self-signed
 async def console(pi, key, dev):
-    url=f"ws://{pi}:8000/ws/serial?device={dev}&amp;baud=115200&amp;token={key}"
-    async with websockets.connect(url) as ws:
+    url=f"wss://{pi}:8000/ws/serial?device={dev}&amp;baud=115200&amp;token={key}"
+    async with websockets.connect(url, ssl=NOVERIFY) as ws:
         await ws.send(b"\r")                            # bytes -> written verbatim
         async for msg in ws:
             if isinstance(msg, bytes): handle_serial_bytes(msg)   # raw RX (lossless)
@@ -169,8 +202,19 @@ connected.</p>
 <tr><td><code>usb</code></td><td><code>{udc, bound, state}</code> — the gadget/USB state. <code>state</code> is <code>configured</code> once the target has enumerated the gadget, <code>not attached</code> when the target is gone or has no USB/HID driver (e.g. a dead OS), <code>unbound</code> while re-enumerating. <b>This is how tooling sees the target lose/regain the keyboard, mouse, drive and COM port.</b></td></tr>
 <tr><td><code>hid</code></td><td><code>{keyboard, mouse, mouse_rel}</code> — whether the Pi currently has each HID device open (i.e. input can reach the target). <code>mouse_rel</code> is <code>false</code> when the optional relative pointer is disabled (<code>[usb] mouse_rel</code>) or shed by the USB endpoint budget; relative input (<code>mr</code>) is then emulated on the absolute mouse.</td></tr>
 <tr><td><code>serial</code></td><td><code>{ports:[{device, open, clients, reconnect, reconnects, reconnecting, error, …}]}</code>; <code>reconnects</code> ticks each time a port self-heals after the target re-enumerated its COM</td></tr>
+<tr><td><code>power</code></td><td><code>{mode, enabled, available, targets:[{label, on, …}]}</code> — the target-power state (as <code>GET /api/power/state</code>); a coarse re-send whenever any target's power changes</td></tr>
+<tr><td><code>msd</code></td><td>virtual-drive state (as <code>GET /api/msd/status</code>: <code>{state, attached, editing, …}</code>); re-sent when the drive attaches / detaches / goes to editing</td></tr>
 <tr><td><code>reenumerate</code></td><td><code>{ok, hid_reopened, detail}</code> — emitted when someone calls <code>POST /api/serial/reenumerate</code></td></tr>
 </table>
+<p>Alongside those coarse per-domain events, the stream also carries <b>semantic target transitions</b> — each a
+<code>{seq, ts, type, message, …}</code> object naming the thing that just happened, so tooling can react to an
+event instead of diffing state: <code>usb.enumerated</code>, <code>usb.enumerating</code>,
+<code>usb.suspended</code>, <code>usb.resumed</code>, <code>usb.detached</code>; <code>gadget.bound</code>,
+<code>gadget.unbound</code>; <code>power.on</code>, <code>power.off</code>; <code>serial.enumerated</code>,
+<code>serial.deenumerated</code>, <code>serial.opened</code>, <code>serial.closed</code>,
+<code>serial.reconnected</code>, <code>serial.error</code>, <code>serial.error_cleared</code>;
+<code>hid.online</code>, <code>hid.offline</code>; <code>drive.attached</code>, <code>drive.detached</code>,
+<code>drive.editing</code>. Fold the coarse events to rebuild state; watch the semantic ones for edges.</p>
 <p>Browser — fold the stream into a live state object:</p>
 <pre><code>const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';        // match how the page was served
 const ws = new WebSocket(`${proto}${location.host}/ws/events?token=${KEY}`);  // browsers may also use the session cookie
@@ -196,15 +240,16 @@ async def watch(host, key):
             if ev["type"] == "usb":
                 print("target USB:", ev["state"], "| HID open:", state.get("hid"))
 asyncio.run(watch("192.168.1.120", "&lt;KEY&gt;"))</code></pre>
-<p class="muted">One-shot snapshot without a socket: <code>curl -s -H "X-API-Key: &lt;KEY&gt;" https://&lt;pi&gt;:8000/api/events/state</code>.</p>
+<p class="muted">One-shot snapshot without a socket: <code>curl -sk -H "X-API-Key: &lt;KEY&gt;" https://&lt;pi&gt;:8000/api/events/state</code>.</p>
 
 <h2>7. Power, KVM switch &amp; configuration <span class="pill">/api/power</span> <span class="pill">/api/kvmswitch</span> <span class="pill">/api/config</span></h2>
-<p>Configure the GPIO targets on the <code>/config</code> page first. <b>Target power</b> — each target's
-GPIO drives a relay that connects or cuts its power (latched on/off):</p>
+<p>Configure the GPIO targets on the <code>/config</code> page first. <b>Target power</b> — each target's GPIO
+drives either a <b>latched relay</b> that connects/cuts power, or a <b>momentary front-panel power button</b>
+(<code>[power] mode</code>):</p>
 <table>
 <tr><th>Endpoint</th><th>Does</th></tr>
-<tr><td><code>GET /api/power/state</code></td><td><code>{enabled, available, targets:[{label, on}]}</code> — <code>on</code> is true (powered), false (cut), or null (not yet driven)</td></tr>
-<tr><td><code>POST /api/power</code> <code>{"index":0,"on":true}</code></td><td>connect power to that target (<code>"on":false</code> cuts it — a hard power-off)</td></tr>
+<tr><td><code>GET /api/power/state</code></td><td><code>{mode:"relay"|"button", enabled, available, targets:[{label, on}]}</code> — <code>on</code> is true (powered), false (cut), or null (not yet driven). In <b>button</b> mode each target also carries <code>{holding, holding_secs, fault}</code> and the top level adds <code>{hold_on_sec, hold_off_sec}</code>.</td></tr>
+<tr><td><code>POST /api/power</code> <code>{"index":0,"on":true}</code></td><td><b>Relay:</b> connect power (<code>"on":false</code> cuts it — a hard power-off). <b>Button:</b> <code>"on":true</code> taps the power button briefly (power on), <code>"on":false</code> holds it for <code>hold_off_sec</code> (force off) — returns immediately while the hold runs; a second request for a target mid-hold gets <code>409</code>.</td></tr>
 </table>
 <p><b>External KVM switch</b> — pulse a GPIO to press a hardware switch's select button (display + USB):</p>
 <table>
@@ -219,10 +264,10 @@ GPIO drives a relay that connects or cuts its power (latched on/off):</p>
 <tr><td><code>POST /api/config/restart-streamer</code></td><td>restart the video streamer to apply <code>[video]</code> changes</td></tr>
 </table>
 <pre><code># connect power to the first target, then switch the KVM to it
-curl -s -X POST -H "X-API-Key: &lt;KEY&gt;" -H "Content-Type: application/json" \
-     -d '{"index":0,"on":true}' http://&lt;pi&gt;:8000/api/power
-curl -s -X POST -H "X-API-Key: &lt;KEY&gt;" -H "Content-Type: application/json" \
-     -d '{"index":0}' http://&lt;pi&gt;:8000/api/kvmswitch</code></pre>
+curl -sk -X POST -H "X-API-Key: &lt;KEY&gt;" -H "Content-Type: application/json" \
+     -d '{"index":0,"on":true}' https://&lt;pi&gt;:8000/api/power
+curl -sk -X POST -H "X-API-Key: &lt;KEY&gt;" -H "Content-Type: application/json" \
+     -d '{"index":0}' https://&lt;pi&gt;:8000/api/kvmswitch</code></pre>
 
 <h2>8. Notes</h2>
 <ul>
@@ -230,6 +275,6 @@ curl -s -X POST -H "X-API-Key: &lt;KEY&gt;" -H "Content-Type: application/json" 
 <li>The emulated keyboard is a USB <b>boot keyboard</b>, so it works in the target's <b>BIOS/UEFI</b> setup and boot menus — not just the running OS.</li>
 <li>GPIO power and KVM-switch control must be wired and enabled on the <code>/config</code> page first; cutting a target's power is a hard power-off (unsaved work is lost).</li>
 <li>Rotate the API key by re-running <code>setup_auth.py</code> on the Pi.</li>
-<li>Everything is LAN-only; there is no rate limiting — don't expose port 8000 to the internet without a VPN.</li>
+<li>Login is <b>rate-limited</b> per client IP: 5 failed attempts arm an exponential lockout (doubling from 5&nbsp;s, capped at 300&nbsp;s) and further attempts get <code>HTTP 429</code> until it expires. Everything is still LAN-only — don't expose port 8000 to the internet without a VPN.</li>
 </ul>
 </div></body></html>

@@ -65,4 +65,5 @@ request asks for it.
 ## Notes
 - The USB‑C port carries data only; power the Pi independently (PoE or 5 V) so the port is free.
 - The absolute pointer maps to the target's **primary** display; use relative moves for multi‑monitor.
-- Gadget id: VID `0x1d6b` / PID `0x0108`, serial `kvm-0001`.
+- Gadget id: VID `0x1d6b` / PID `0x0108` (or `0x0109` when `usb_serial` is on — the PID tracks the
+  interface set), serial `kvm-0001`.
