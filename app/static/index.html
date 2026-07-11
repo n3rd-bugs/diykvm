@@ -26,8 +26,6 @@
           align-items: center; justify-content: center; overflow: hidden; }
   #screen { max-width: 100%; max-height: 100%; display: block; cursor: crosshair;
             background: #000; }
-  #hint { position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
-          background: #000a; padding: 4px 10px; border-radius: 6px; pointer-events: none; }
   /* file manager — in-flow right column (does not overlay the stream) */
   #fm { flex: 0 0 360px; max-width: 92vw; background: #181818; border-left: 1px solid #333;
         display: none; flex-direction: column; padding: 12px; gap: 10px; overflow: auto; }
@@ -164,7 +162,6 @@
   <div id="mid">
   <div id="wrap">
     <img id="screen" alt="target screen">
-    <div id="hint">Click the screen to capture keyboard &amp; mouse · Ctrl+Space or button to release</div>
   </div>
 
     <div id="fm">
@@ -352,11 +349,6 @@ function comboLabel() {
   m.push(c.code.replace(/^Key/, '').replace(/^Digit/, ''));
   return m.join('+');
 }
-function updateHint() {
-  const h = document.getElementById('hint');
-  if (h) h.textContent = 'Click the screen or go Fullscreen to capture keyboard & mouse · ' + comboLabel() + ' or the button to release';
-}
-updateHint();
 (async () => {
   try {
     const r = await fetch('/api/config');
@@ -367,7 +359,6 @@ updateHint();
       if (f) exitCombo = parseCombo(f.value);   // null if blank -> shortcut disabled
     }
   } catch (e) {}
-  updateHint();
 })();
 
 // ---- keyboard ----
@@ -724,12 +715,15 @@ for (const row of KB){
 // ---- touch on the video (gesture model) ----
 //   1 finger: tap=left click · hold&drag=move · double-tap-hold=left held (drag if moved)
 //   2 finger: tap=right click · hold&drag=SCROLL (wheel) · double-tap-hold=right held (drag if moved)
+//   pinch:    zoom the video in/out (drag while pinched to pan); snaps back at 1×
 // Listeners on #wrap (the whole video area) so a 2nd finger in the letterbox is still counted.
 const TAP_MS    = 250;   // max duration for a no-move touch to count as a tap
 const TAP_MOVE  = 12;    // px of travel under which a touch still counts as a tap (no move)
 const DOUBLE_MS = 300;   // a touch starting within this of a tap is the "hold" half of a double-tap
 const HOLD_DELAY = 70;   // wait this long before engaging a hold, so a 2nd finger can settle the L/R choice
 const SCROLL_PX = 18;    // finger travel per wheel tick for 2-finger scroll
+const PINCH_PX  = 30;    // finger-distance change that turns a 2-finger gesture into a pinch (not a scroll)
+const ZOOM_MAX  = 4;
 const touchSurface = document.getElementById('wrap');
 let held=null, isHold=false, holdTimer=null, maxF=0, active=false, scrollAccum=0,
     prevTapEnd=0, startT=0, sx=0, sy=0, moved=false, refX=0, refY=0;
@@ -740,10 +734,41 @@ const btnFor = ()=> maxF >= 2 ? 2 : 0;             // 0 = left (1 finger), 2 = r
 function commitHold(){ holdTimer=null; held=btnFor(); send({t:'mb',button:held,down:true});
   gesture(held===2 ? 'dbl✌ → right held' : 'dbl☝ → left held'); }
 
+// ---- pinch zoom (video magnifier; the browser's own zoom is disabled by the viewport meta) ----
+// Zoom scales #screen around its centre; panning follows the pinch midpoint. Absolute-mouse mapping
+// stays exact while zoomed: getBoundingClientRect() reflects the CSS transform, so click coordinates
+// keep lining up with what is on screen. #wrap has overflow:hidden, so the spill is clipped.
+let zoom=1, panX=0, panY=0, pinch=null, pinched=false;
+const touchDist = (ts)=> Math.hypot(ts[0].clientX-ts[1].clientX, ts[0].clientY-ts[1].clientY);
+function applyZoom(){
+  // keep the scaled image's edges from drifting inside where its unscaled edges were
+  const mx = img.clientWidth  * (zoom-1) / 2, my = img.clientHeight * (zoom-1) / 2;
+  panX = Math.max(-mx, Math.min(mx, panX));
+  panY = Math.max(-my, Math.min(my, panY));
+  img.style.transform = zoom > 1 ? 'translate(' + panX + 'px,' + panY + 'px) scale(' + zoom + ')' : '';
+}
+function pinchArm(ts){ pinch = {d0: touchDist(ts), z0: zoom, mx0: midX(ts), my0: midY(ts), px0: panX, py0: panY}; }
+function pinchMove(ts){                              // returns true while the gesture is a pinch
+  if(!pinch) return false;
+  const d = touchDist(ts);
+  if(!pinched && Math.abs(d - pinch.d0) > PINCH_PX){
+    pinched = true; moved = true;                    // a pinch is never a tap/hold/scroll
+    if(holdTimer){ clearTimeout(holdTimer); holdTimer = null; }
+  }
+  if(!pinched) return false;
+  zoom = Math.max(1, Math.min(ZOOM_MAX, pinch.z0 * d / pinch.d0));
+  if(zoom <= 1.02){ zoom = 1; panX = panY = 0; }     // snap back to fit
+  else { panX = pinch.px0 + (midX(ts) - pinch.mx0); panY = pinch.py0 + (midY(ts) - pinch.my0); }
+  applyZoom();
+  gesture(zoom > 1 ? '🔍 ' + zoom.toFixed(1) + '×' : '🔍 fit');
+  return true;
+}
+
 touchSurface.addEventListener('touchstart', (e)=>{
   e.preventDefault(); if(!capturing) setCapture(true);
   const n = e.touches.length;
   refX = sx = midX(e.touches); refY = sy = midY(e.touches); scrollAccum = 0;
+  if(n === 2) pinchArm(e.touches); else pinch = null;   // 2 fingers down: candidate pinch
   if(!active){                                      // first finger of a new sequence
     active = true; startT = Date.now(); moved = false; maxF = n;
     isHold = !!(prevTapEnd && (startT - prevTapEnd) < DOUBLE_MS); prevTapEnd = 0;
@@ -760,6 +785,12 @@ touchSurface.addEventListener('touchstart', (e)=>{
 
 touchSurface.addEventListener('touchmove', (e)=>{
   e.preventDefault(); if(!capturing) return;
+  // Pinch first: while (or after) a pinch, this gesture only zooms/pans -- no scroll, move or hold.
+  if(held === null && e.touches.length === 2 && pinchMove(e.touches)){
+    refX = midX(e.touches); refY = midY(e.touches); scrollAccum = 0;
+    return;
+  }
+  if(pinched) return;                               // pinch ended but fingers still down: stay inert
   if(holdTimer){ clearTimeout(holdTimer); commitHold(); }         // movement -> engage the hold now
   const cx = midX(e.touches), cy = midY(e.touches);
   const rdx = cx - refX, rdy = cy - refY;
@@ -782,9 +813,12 @@ function touchEnd(e){
   e.preventDefault();
   if(e.touches.length > 0){                         // a finger lifted, others remain: re-baseline (no jump)
     refX = sx = midX(e.touches); refY = sy = midY(e.touches); scrollAccum = 0;
+    if(e.touches.length !== 2) pinch = null;        // pinch needs exactly two fingers
     return;
   }
   active = false;
+  if(pinched){ pinch = null; pinched = false; moved = false; gesture('—'); return; }  // a pinch is never a click
+  pinch = null;
   if(holdTimer){                                    // hold released before it engaged = quick 2nd tap -> click
     clearTimeout(holdTimer); holdTimer = null;
     const b = btnFor(); send({t:'mb',button:b,down:true}); send({t:'mb',button:b,down:false});
@@ -800,12 +834,10 @@ function touchEnd(e){
 touchSurface.addEventListener('touchend', touchEnd, {passive:false});
 touchSurface.addEventListener('touchcancel', touchEnd, {passive:false});
 
-// On a touch device, default to capture ON, reveal the mouse bar, and explain the gestures.
+// On a touch device, default to capture ON and reveal the mouse bar (gesture feedback shows in #info).
 if (isTouch){
   setCapture(true);
   mouseBtn.click();
-  document.getElementById('hint').textContent =
-    'Tap=click · 1-finger drag=move · 2-finger drag=scroll · double-tap-hold=drag · 1-finger=left/2-finger=right · ⌨ keyboard';
 }
 
 // ---------------- serial console ----------------
