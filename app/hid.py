@@ -101,31 +101,34 @@ class HIDController:
         except OSError:
             self._fds[which] = None
 
-    def _try_write(self, fd: int, data: bytes) -> bool:
+    def _try_write(self, fd: int, data: bytes):
         """Bounded non-blocking write of one HID report. Waits up to WRITE_TIMEOUT for the endpoint to
-        accept it, then writes. Returns True if the fd is still usable (report sent, or dropped because the
-        target isn't draining) and False if the fd errored and should be reopened. Never blocks unbounded."""
+        accept it, then writes. Returns True if the report was written, None if it was dropped (the target
+        isn't draining -- the fd is still fine), and False if the fd errored and should be reopened.
+        Never blocks unbounded."""
         try:
             _, wready, _ = select.select([], [fd], [], WRITE_TIMEOUT)
             if not wready:
-                return True                # target not accepting reports now -> drop this one, keep the fd
+                return None                # target not accepting reports now -> drop this one, keep the fd
             os.write(fd, data)
             return True
         except BlockingIOError:
-            return True                    # endpoint momentarily full -> drop, fd is fine
+            return None                    # endpoint momentarily full -> drop, fd is fine
         except OSError:
             return False                   # real error (e.g. gadget rebuilt) -> caller reopens
 
     def _write(self, which: str, data: bytes):
         # Held only for the bounded write (<= WRITE_TIMEOUT), never indefinitely, so reopen() and the
         # (now lock-free) status reads are never starved. The single _hid_pool worker serializes writes.
+        # Returns True (sent) / None (dropped) / False (unrecoverable) so a chunked caller can bail early.
         with self._lock:
             if self._fds[which] is None:
                 self._open(which)
             fd = self._fds[which]
             if fd is None:
-                return
-            if self._try_write(fd, data) is False:
+                return False
+            r = self._try_write(fd, data)
+            if r is False:
                 # gadget may have been rebuilt; reopen once and retry
                 try:
                     os.close(fd)
@@ -133,8 +136,8 @@ class HIDController:
                     pass
                 self._fds[which] = None
                 self._open(which)
-                if self._fds[which] is not None:
-                    self._try_write(self._fds[which], data)
+                r = self._try_write(self._fds[which], data) if self._fds[which] is not None else False
+            return r
 
     # ---- keyboard (8 bytes, NO report id) -> /dev/hidg0 ----
     def _kbd_report(self) -> bytes:
@@ -168,14 +171,16 @@ class HIDController:
         return bytes([MOUSE_REL_ID, self._btn, dx & 0xFF, dy & 0xFF, wheel & 0xFF])
 
     # The _send_* wrappers keep _btn_sent (last button bits written per device) in step with every report,
-    # since every report embeds the current button byte.
+    # since every report embeds the current button byte. They pass through _write's sent/dropped status.
     def _send_abs(self, wheel: int = 0):
-        self._write("mabs", self._abs_report(wheel))
+        r = self._write("mabs", self._abs_report(wheel))
         self._btn_sent["mabs"] = self._btn
+        return r
 
     def _send_rel(self, dx: int = 0, dy: int = 0, wheel: int = 0):
-        self._write("mrel", self._rel_report(dx, dy, wheel))
+        r = self._write("mrel", self._rel_report(dx, dy, wheel))
         self._btn_sent["mrel"] = self._btn
+        return r
 
     def _rel_available(self) -> bool:
         # The relative pointer is optional (mouse_rel toggle / endpoint budget). An open fd, or a node that
@@ -210,15 +215,17 @@ class HIDController:
 
         The relative report carries one signed byte per axis (-127..127). Coalesced or high-DPI moves
         can exceed that, so split a large delta into <=127 steps rather than clamp it (which would lose
-        motion and make a fast pointer trail). The total is bounded so one call can't stall the writer.
+        motion and make a fast pointer trail). The cap allows a 50x-speed flick (UI speed sliders go to
+        50x); one call still can't stall the writer, because the chunk loop ABORTS on the first dropped
+        report -- a target that stopped draining gets no further chunks (they'd only queue stale motion).
 
         If the relative pointer is absent (mouse_rel off, or shed by the endpoint budget), relative input
         is EMULATED on the absolute mouse by advancing the tracked position -- touch input, Relative mode
         and keep-awake nudges keep working instead of dying silently. Starts from the screen centre if no
         absolute position is known yet.
         """
-        dx = max(-2000, min(2000, int(dx)))
-        dy = max(-2000, min(2000, int(dy)))
+        dx = max(-16000, min(16000, int(dx)))
+        dy = max(-16000, min(16000, int(dy)))
         if not self._rel_available():
             if not self._rel_warned:
                 print("[hid] relative pointer absent (%s): emulating relative input on the absolute mouse"
@@ -238,7 +245,8 @@ class HIDController:
         while dx or dy:
             sx = max(-127, min(127, dx)); dx -= sx
             sy = max(-127, min(127, dy)); dy -= sy
-            self._send_rel(sx, sy)
+            if self._send_rel(sx, sy) is not True:
+                break                      # dropped/errored: stop the stroke, don't queue stale motion
 
     def _sync_stale_buttons(self):
         """Clear pressed bits still latched on the OTHER pointer device. Each USB mouse keeps its own
