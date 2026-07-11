@@ -139,6 +139,7 @@
     <button id="cap">Capture input: OFF</button>
     <button id="cad" title="Ctrl+Alt+Del">Ctrl-Alt-Del</button>
     <select id="vidsrc" title="capture source — pick which PC to watch" style="display:none"></select>
+    <span id="vstat" title="adaptive video: frames are being sent at reduced quality/scale to keep latency at ~1 frame on this link" style="color:#c90; font-size:11px;"></span>
     <button id="rel" title="release stuck keys/buttons">Release all</button>
     <button id="files" title="virtual USB drive">Files ▾</button>
     <button id="kbd" title="on-screen keyboard">⌨</button>
@@ -269,13 +270,21 @@ const img = document.getElementById('screen');
 // of seconds of buffered backlog (which also queued the INPUT websocket behind the video bytes).
 // Blob URLs are revoked every frame, so nothing accumulates in the tab (no MJPEG hygiene needed).
 let vws = null, vwsMode = false, vwsFails = 0, _vBlob = null;
+const vstat = document.getElementById('vstat');
 function wsVideoConnect() {
   if (vws || document.hidden) return;
   let gotFrame = false;
   try { vws = new WebSocket(wsURL('/ws/video')); } catch (e) { videoFallback(); return; }
   vws.binaryType = 'blob';
   vws.onmessage = (e) => {
-    if (typeof e.data === 'string') return;          // frame metadata (capture timestamp) -- unused here
+    if (typeof e.data === 'string') {                // frame metadata: {ts, kb, level, q, scale}
+      try {
+        const m = JSON.parse(e.data);
+        vstat.textContent = (m && m.level > 0)       // ▼ = adaptive video is shrinking frames for this link
+          ? '▼q' + m.q + (m.scale < 1 ? '·' + Math.round(m.scale * 100) + '%' : '') : '';
+      } catch (err) {}
+      return;
+    }
     gotFrame = true; vwsFails = 0; vwsMode = true;
     const prev = _vBlob;
     _vBlob = URL.createObjectURL(e.data);
@@ -285,13 +294,13 @@ function wsVideoConnect() {
   };
   vws.onerror = () => { try { vws.close(); } catch (e) {} };
   vws.onclose = () => {
-    vws = null;
+    vws = null; vstat.textContent = '';
     if (document.hidden) return;                     // visibilitychange resumes
     if (!gotFrame && ++vwsFails >= 2) { videoFallback(); return; }   // WS video unavailable -> MJPEG
     setTimeout(wsVideoConnect, 1000);                // streamer restart / transient drop: reconnect
   };
 }
-function videoFallback() { vwsMode = false; img.src = streamURL + '?t=' + Date.now(); }
+function videoFallback() { vwsMode = false; vstat.textContent = ''; img.src = streamURL + '?t=' + Date.now(); }
 function videoRestart() {                            // e.g. after switching the capture source
   if (vws) { try { vws.close(); } catch (e) {} }     // onclose reconnects to the fresh stream
   else if (!vwsMode) img.src = streamURL + '?t=' + Date.now();

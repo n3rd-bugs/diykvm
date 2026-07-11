@@ -12,6 +12,7 @@ falls back to a sane default, so the app also runs with no config file present.
 import io
 import os
 import re
+import json
 import time
 import asyncio
 import socket
@@ -91,6 +92,7 @@ _hid_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hid")
 # One owner per serial device: drains continuously into a ring buffer and fans out to many WS clients.
 SERIAL = SerialManager(_serial_pool)
 _ocr_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ocr")   # OCR is CPU-heavy; keep it off-loop
+_video_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="videnc")  # adaptive re-encode (slow links only)
 EVENTS = EventBus()                  # state-change events fanned out to /ws/events subscribers
 
 
@@ -271,10 +273,12 @@ API_INFO = {
         {"method": "GET", "path": "/snapshot", "auth": True, "desc": "JPEG of the target screen now."},
         {"method": "GET", "path": "/stream", "auth": True, "desc": "Live MJPEG stream (of the selected capture card). On slow links prefer /ws/video."},
         {"method": "WS", "path": "/ws/video", "auth": True,
-         "desc": "Client-paced video: per frame the server sends a text message (capture X-Timestamp) then the "
-                 "JPEG as a binary message, and waits for ANY reply before sending the next (always the "
-                 "freshest). Bounds video delay to ~1 frame + RTT on any link -- a slow link gets fewer fps, "
-                 "never a backlog. Auth like /ws (session cookie or ?token=)."},
+         "desc": "Client-paced video: per frame the server sends a text message (JSON {ts,kb,level,q,scale}) "
+                 "then the JPEG as a binary message, and waits for ANY reply before sending the next (always "
+                 "the freshest). Bounds video delay to ~1 frame + RTT on any link -- a slow link gets fewer "
+                 "fps, never a backlog -- and with [video] adaptive=true (default) frames are auto re-encoded "
+                 "smaller when the measured send->ack cycle exceeds the latency budget. Auth like /ws "
+                 "(session cookie or ?token=)."},
         {"method": "GET", "path": "/api/video/sources", "auth": True, "desc": "Selectable capture cards (multi-PC): {sources:[{index,label}], active, multi}. Configure via [video] devices = Label:/dev/videoN, ..."},
         {"method": "POST", "path": "/api/video/select", "auth": True, "body": "{index}", "desc": "Switch the live stream to that capture card (restarts the streamer, ~1-2s). Only a configured [video] devices card is allowed."},
         {"method": "GET", "path": "/api/ocr", "auth": True, "query": "lang, psm, min_conf, region (x,y,w,h), scale, words",
@@ -444,23 +448,64 @@ async def stream(_: bool = Depends(require_auth)):
     return StreamingResponse(gen(), media_type=tap.ctype)
 
 
+# Adaptive-video ladder: (scale, jpeg_quality); quality None = pass the original frame through untouched.
+# Ordered by decreasing byte cost. Level is chosen per connection from the measured send->ack cycle time,
+# so a slow link gets smaller frames (more fps at the same latency) and a fast link gets the original.
+_VIDEO_LADDER = [(1.0, None), (1.0, 60), (1.0, 45), (2 / 3, 55), (1 / 2, 55), (1 / 2, 40), (3 / 8, 35)]
+
+
+def _jpeg_shrink(jpeg: bytes, scale: float, quality: int):
+    """Re-encode one JPEG frame smaller (optionally downscaled). Runs in _video_pool: CPU-bound
+    (~50-120ms at 1080p on a Pi 4), but only engaged when the link is already slow -- i.e. at low frame
+    rates -- so it never gates a fast stream. Returns None on any decode/encode trouble."""
+    try:
+        from PIL import Image
+        im = Image.open(io.BytesIO(jpeg))
+        if scale < 1.0:
+            w, h = im.size
+            im = im.resize((max(2, int(w * scale)) & ~1, max(2, int(h * scale)) & ~1), Image.BILINEAR)
+        if im.mode != "RGB":
+            im = im.convert("RGB")
+        out = io.BytesIO()
+        im.save(out, "JPEG", quality=quality)
+        return out.getvalue()
+    except Exception:
+        return None
+
+
 @app.websocket("/ws/video")
 async def ws_video(sock: WebSocket):
     """Client-paced video: one JPEG frame per client ack, always the freshest. Bounds end-to-end video
     delay to ~one frame + RTT on ANY link: at most one frame is ever in flight, so a constrained
     (remote/VPN) link gets a lower frame rate instead of seconds of buffered backlog -- which also stops
-    the video from bufferbloating the very link the input WebSocket shares. Protocol: server sends a
-    text frame with the capture X-Timestamp, then the JPEG as a binary frame; the client replies with
-    any message when it is ready for the next."""
+    the video from bufferbloating the very link the input WebSocket shares.
+
+    Adaptive quality ([video] adaptive, default on): the send->ack cycle time of every frame IS a live
+    measurement of what the link can carry, so the server walks _VIDEO_LADDER -- down fast when cycles
+    blow past the latency budget (smaller frames -> more fps at the same bounded latency), back up
+    slowly once there is sustained headroom. A fast LAN client stays at level 0 (originals untouched).
+
+    Protocol: per frame the server sends a text message (JSON {ts, kb, level, q, scale}) then the JPEG
+    as a binary message, and waits for ANY client reply before sending the next."""
     if not ws_authed(sock):
         await sock.close(code=1008)
         return
     await sock.accept()
+    adaptive = True
+    try:
+        c = configparser.ConfigParser()
+        c.read(CONF_PATH)
+        adaptive = c.get("video", "adaptive", fallback="true").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        pass
     try:
         tap = await _MJPEGTap().open()
     except HTTPException:
         await sock.close(code=1011)
         return
+    loop = asyncio.get_event_loop()
+    level, good, ewma = 0, 0, None
+    maxl = len(_VIDEO_LADDER) - 1
     try:
         while True:
             part = await tap.take()
@@ -472,9 +517,32 @@ async def ws_video(sock: WebSocket):
             if body.endswith(b"\r\n"):
                 body = body[:-2]
             m = re.search(rb"X-Timestamp: ([0-9.]+)", head)
-            await sock.send_text(m.group(1).decode() if m else "0")
-            await sock.send_bytes(bytes(body))
+            scale, q = _VIDEO_LADDER[level]
+            blob = bytes(body)
+            if q is not None:
+                small = await loop.run_in_executor(_video_pool, _jpeg_shrink, blob, scale, q)
+                if small and len(small) < len(blob):
+                    blob = small
+            await sock.send_text(json.dumps({"ts": float(m.group(1)) if m else 0,
+                                             "kb": len(blob) >> 10, "level": level,
+                                             "q": q, "scale": round(scale, 2)}))
+            t0 = loop.time()
+            await sock.send_bytes(blob)
             await sock.receive()         # the ack: client is ready for the next frame
+            cycle = loop.time() - t0     # RTT + transfer time of THIS frame = live capacity measurement
+            ewma = cycle if ewma is None else (0.7 * ewma + 0.3 * cycle)
+            if not adaptive:
+                continue
+            if ewma > 0.6 and level < maxl:          # badly over budget: drop two rungs at once
+                level = min(maxl, level + 2); good = 0; ewma = None
+            elif ewma > 0.3 and level < maxl:        # over budget: smaller frames
+                level += 1; good = 0; ewma = None
+            elif ewma < 0.15 and level > 0:          # sustained headroom: probe one rung up
+                good += 1
+                if good >= 10:
+                    level -= 1; good = 0; ewma = None
+            else:
+                good = 0
     except (WebSocketDisconnect, RuntimeError):
         pass
     except Exception:
@@ -1445,7 +1513,8 @@ CONFIG_FIELDS = [
          {"key": "devices", "label": "Capture cards for multi-PC — Label:/dev/videoN, comma-separated (e.g. PC1:/dev/video0, PC2:/dev/video1). Blank = just the single device above; the UI shows a source picker when 2+ are listed.", "type": "text", "default": ""},
          {"key": "resolution", "label": "Resolution (WxH)", "type": "text", "default": "1920x1080"},
          {"key": "fps", "label": "Frames per second", "type": "number", "default": "30"},
-         {"key": "quality", "label": "JPEG quality 1–100 — bandwidth knob. On a remote/slow link lower this first (40–60) so the stream fits the pipe; the viewer already degrades to fewer frames rather than lagging, but a stream wider than the link also queues your mouse input behind the video.", "type": "number", "default": "80"},
+         {"key": "quality", "label": "JPEG quality 1–100 — the base bandwidth knob (what the capture encodes at).", "type": "number", "default": "80"},
+         {"key": "adaptive", "label": "Adaptive video — automatically lower quality/scale per viewer when their link is slow, keeping latency at ~1 frame (shown as ▼q… in the toolbar). Applies immediately on the next video reconnect.", "type": "bool", "default": "true"},
          {"key": "ustreamer_host", "label": "uStreamer host", "type": "text", "default": "127.0.0.1"},
          {"key": "ustreamer_port", "label": "uStreamer port", "type": "number", "default": "8080"},
      ]},
