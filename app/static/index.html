@@ -433,7 +433,18 @@ function comboLabel() {
 })();
 
 // ---- keyboard ----
+// Keys typed into an on-page control must reach that control, not the target's HID keyboard. When
+// capture is ON we otherwise forward (and preventDefault) every key, which silently types the serial
+// line input, the raw-key console, the video-source select, and the config / file-manager fields into
+// the target. So bail out early -- no preventDefault, no forward -- whenever focus is in an editable
+// element and let the browser handle the key normally. The video screen (an <img>) never matches, so
+// driving the target is unaffected; the raw serial console is a <pre id="serout"> so it is named too.
+function typingInPage(e) {
+  const t = e.target;
+  return !!(t && t !== img && t.closest && t.closest('input, textarea, select, [contenteditable], #serout'));
+}
 window.addEventListener('keydown', (e) => {
+  if (typingInPage(e)) return;
   if (!capturing) return;
   if (comboMatches(e)) {                 // release-capture shortcut: let go of the target, don't forward
     e.preventDefault();
@@ -447,6 +458,7 @@ window.addEventListener('keydown', (e) => {
   send({ t: 'kd', code: e.code });
 }, true);
 window.addEventListener('keyup', (e) => {
+  if (typingInPage(e)) return;
   if (!capturing) return;
   e.preventDefault();
   send({ t: 'ku', code: e.code });
@@ -533,10 +545,32 @@ window.addEventListener('mouseup', (e) => {
   _flushNow(); send({ t: 'mb', button: e.button, down: false });
 });
 img.addEventListener('contextmenu', (e) => e.preventDefault());
+// Scroll wheel. A plain mouse fires one event per notch, but high-resolution trackpads (macOS, Windows
+// Precision) report tiny pixel deltas and fire dozens of events per flick, so mapping every event to a
+// full HID tick overshoots wildly. Instead accumulate the raw deltaY, normalized by the reported unit,
+// and emit one tick each time the total crosses a threshold; the leftover carries over so slow scrolls
+// still add up. Reset the running total when the direction flips or after ~300ms of no wheel activity
+// so an old remainder never spills into the next gesture. A normal notch (one page, ~3 lines, or a
+// ~100px pixel step) crosses the threshold exactly once, so ordinary mice still give one tick per notch.
+let _wheelAcc = 0, _wheelSign = 0, _wheelTs = 0;
 img.addEventListener('wheel', (e) => {
   if (!capturing) return;
   e.preventDefault();
-  _flushNow(); send({ t: 'mw', dy: e.deltaY > 0 ? -1 : 1 });
+  const dy = e.deltaY;
+  if (!dy) return;
+  const sign = dy > 0 ? 1 : -1;
+  const now = performance.now();
+  if (sign !== _wheelSign || now - _wheelTs > 300) _wheelAcc = 0;   // fresh gesture -> drop leftover
+  _wheelSign = sign; _wheelTs = now;
+  _wheelAcc += dy;
+  // accumulator units that make one tick: one page, ~3 lines, or ~100 pixels
+  const step = e.deltaMode === 2 ? 1 : e.deltaMode === 1 ? 3 : 100;
+  let ticks = 0;
+  while (Math.abs(_wheelAcc) >= step) { _wheelAcc -= sign * step; ticks++; }
+  if (!ticks) return;
+  _flushNow();                                 // send pending moves first so the scroll lands in place
+  const tick = sign > 0 ? -1 : 1;              // screen deltaY is positive-down; HID wheel is positive-up
+  for (let i = 0; i < ticks; i++) send({ t: 'mw', dy: tick });
 }, { passive: false });
 
 // ---- toolbar actions ----
