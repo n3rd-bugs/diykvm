@@ -63,7 +63,7 @@ Install the Debian package on Raspberry Pi OS (Bookworm, **64‑bit** — the OC
 prebuilt 32‑bit/armhf wheel, so a 32‑bit OS would need build tools to compile it):
 
 ```sh
-sudo apt install ./diykvm_0.7.1_all.deb
+sudo apt install ./diykvm_0.7.2_all.deb
 sudo reboot            # first install enables USB gadget mode (dtoverlay=dwc2,dr_mode=peripheral)
 ```
 
