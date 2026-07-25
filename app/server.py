@@ -315,7 +315,7 @@ API_INFO = {
         {"method": "POST", "path": "/api/serial/reenumerate", "auth": True,
          "desc": "Re-enumerate the USB gadget (unbind + re-bind its UDC) so the target re-detects the device and gets a fresh CDC-ACM COM port. Lets the other end request a fresh port on demand. Because USB enumerates per device, the keyboard, mouse and mass-storage interface also briefly re-appear (~1s); an open Pi-side serial port self-heals. Quick bounce (~0.4s); for a wedged gadget use /api/gadget/recover."},
         {"method": "POST", "path": "/api/gadget/recover", "auth": True,
-         "desc": "Recover a WEDGED USB gadget: unbind + re-bind the UDC while holding the disconnect ~2s, so a host stuck mid-enumeration (state 'not attached'/addressed-but-not-configured, e.g. after a re-enum storm or a config-change gadget rebuild) fully deregisters and re-enumerates clean -- a brief reenumerate won't unstick it. Bounces ALL USB ~2s; returns {recovered, hid_reopened, detail}."},
+         "desc": "Recover a DEAD/WEDGED USB gadget by escalation, stopping at the first step that brings the link back: (1) long re-plug -- unbind + re-bind the UDC holding the disconnect ~2s so a host stuck mid-enumeration deregisters and enumerates clean; (2) full gadget rebuild from config; (3) re-initialise the USB controller itself (dwc2 driver unbind/bind), the only step that clears a controller wedged with TX-FIFO flush timeouts. Drops ALL USB for a few seconds and can take ~30s. If every step runs and the link is still 'not attached', the controller sees no VBUS -- a physical cable/port fault -- and this returns 502 saying so. Returns {recovered, hid_reopened, detail} where detail names the step that worked."},
         {"method": "WS", "path": "/ws/serial", "auth": True, "query": "device, baud, flow, dtr, rts, reconnect, token",
          "desc": "Serial console, binary-clean. Subscribes to the shared port (auto-opens it with the given "
                  "settings if needed), replays the backlog accumulated while detached (then dropped, so "
@@ -1141,10 +1141,13 @@ def serial_reenumerate(_: bool = Depends(require_auth)):
 
 @app.post("/api/gadget/recover")
 def gadget_recover(_: bool = Depends(require_auth)):
-    """Recover a WEDGED USB gadget. Same unbind+rebind as reenumerate, but holds the disconnect ~2s so a host
-    that got stuck mid-enumeration (state 'not attached'/addressed-but-not-configured, e.g. after a re-enum
-    storm or a config-change gadget rebuild) fully DEREGISTERS the device and enumerates it clean -- a brief
-    bounce won't unstick that. Bounces ALL USB (~2s), then reopens HID. Single-flight with reenumerate."""
+    """Recover a DEAD or WEDGED USB gadget by ESCALATION, stopping at the first step that restores the link:
+    a long re-plug (2s disconnect, so a host stuck mid-enumeration deregisters and enumerates clean), then a
+    full gadget rebuild from config, then a re-initialise of the USB controller itself -- the only thing that
+    clears a controller wedged with TX-FIFO flush timeouts, where the UDC stays 'not attached' forever and no
+    gadget-level action helps. Drops ALL USB for a few seconds and can take ~30s; reopens HID afterwards.
+    If every step runs and the link is still down, the controller sees no VBUS: that is a physical cable/port
+    fault and the helper says so (502) instead of reporting a hollow success. Single-flight with reenumerate."""
     return {"recovered": True, **_bounce_gadget("recover", timeout=90)}
 
 

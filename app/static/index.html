@@ -152,6 +152,7 @@
     <button id="powerbtn" title="target power (GPIO)">⏻ Power</button>
     <button id="kvmbtn" title="external KVM switch (GPIO)">⇄ KVM</button>
     <button id="replugbtn" title="unplug &amp; re-plug the USB device to the target (brief ~1s USB drop; the target re-detects keyboard, mouse, drive and COM)">⟳ Replug USB</button>
+    <button id="recoverbtn" title="USB dead to the target? Escalating recovery: long re-plug, then a full gadget rebuild, then re-initialising the USB controller — stops as soon as the link is back">🛟 Recover USB</button>
     <label class="barchk" title="send occasional mouse nudges so the target display doesn't sleep (paused while you interact)"><input type="checkbox" id="awake"> Keep awake</label>
     <span class="sp"></span>
     <span id="info">—</span>
@@ -1110,10 +1111,31 @@ replugBtn.onclick = async () => {
     await api('/api/serial/reenumerate', { method: 'POST' });
   } catch (e) {
     msg = '⟳ Replug failed';
-    alert('Replug failed: ' + e.message + '\n\nIf the target is stuck (addressed but not configured), try again — or use the longer recovery: POST /api/gadget/recover.');
+    alert('Replug failed: ' + e.message + '\n\nIf the target still has no USB, use “Recover USB” — it escalates to a full gadget rebuild and a USB-controller re-initialise.');
   }
   replugBtn.textContent = msg;
   setTimeout(() => { replugBtn.disabled = false; replugBtn.textContent = orig; }, 2500);
+};
+
+// Escalating USB recovery: the server tries a long re-plug, then a full gadget rebuild, then re-initialises
+// the USB controller itself, stopping at the first step that brings the link back. It can take ~30s, so the
+// button stays busy until it answers. If every step runs and the link is still down, the controller sees no
+// VBUS at all — that is physical (cable/port), and the server says so rather than pretending it worked.
+const recoverBtn = document.getElementById('recoverbtn');
+recoverBtn.onclick = async () => {
+  if (!confirm('Recover USB to the target?\n\nEscalates until the link returns: long re-plug → full gadget rebuild → USB controller re-initialise. USB drops for a few seconds (the video is unaffected). Use this when the keyboard and mouse are dead.')) return;
+  const orig = recoverBtn.textContent;
+  recoverBtn.disabled = true; recoverBtn.textContent = '🛟 Recovering…';
+  let msg = '🛟 Recovered ✓';
+  try {
+    const r = await api('/api/gadget/recover', { method: 'POST' });
+    if (r && r.detail) info.textContent = r.detail;      // e.g. "recovered by rebuild (state=configured…)"
+  } catch (e) {
+    msg = '🛟 Recovery failed';
+    alert('USB recovery failed:\n\n' + e.message);
+  }
+  recoverBtn.textContent = msg;
+  setTimeout(() => { recoverBtn.disabled = false; recoverBtn.textContent = orig; }, 3000);
 };
 function serAppend(t){ serout.textContent += t; serout.scrollTop = serout.scrollHeight;
   if(serout.textContent.length>200000) serout.textContent = serout.textContent.slice(-150000); }

@@ -9,9 +9,7 @@ mass-storage interface. The Pi-side /dev/ttyGS0 and /dev/hidg* get their group p
 on re-creation, and an open serial port self-heals via the web app's reconnect logic.
 
     sudo kvm-gadget-helper reenumerate   # quick unbind + re-bind the UDC (fresh COM port / re-enumerate)
-    sudo kvm-gadget-helper recover       # like reenumerate but holds the disconnect ~2s so the host fully
-                                         #   deregisters a WEDGED device (addressed-but-not-configured) and
-                                         #   re-enumerates it clean -- a brief bounce won't unstick that.
+    sudo kvm-gadget-helper recover       # ESCALATING recovery for a dead/wedged gadget (see below)
     sudo kvm-gadget-helper status        # report gadget presence + current/available UDC (no change)
 
 It takes no other arguments and performs no other action. Because this briefly drops ALL USB on a live
@@ -19,8 +17,25 @@ target, it is made as crash-safe as possible:
   * single-flight -- an flock means two re-enumerates can never interleave on the UDC (a second caller is
     rejected with exit code 3, not queued, so the unbound window is never compounded);
   * the re-bind is retried and treats an already-effective bind (EBUSY) as success; and
-  * if a direct re-bind still fails it rebuilds the whole gadget via systemctl, checks the result, and
-    binds the rebuilt gadget itself if needed -- so the target is never silently left without USB.
+  * if a direct re-bind still fails it rebuilds the whole gadget, checks the result, and binds the rebuilt
+    gadget itself if needed -- so the target is never silently left without USB.
+
+`recover` walks an escalation ladder and STOPS at the first step that brings the link back, because each
+step costs the target more disruption. Each is strictly deeper than a plain re-enumerate:
+  1. long bounce   -- unbind + re-bind the UDC holding the disconnect ~2s, so a host stuck mid-enumeration
+                      (addressed-but-not-configured) fully deregisters the device and enumerates it clean.
+  2. full rebuild  -- tear the configfs gadget down and build it again from config (kvm-gadget-down.sh +
+                      kvm-gadget-up.sh). Fixes a gadget whose configfs state is wrong or half-built.
+  3. controller reprobe -- unbind/re-bind the dwc2 platform driver so the USB controller is re-initialised
+                      from scratch. This is the only step that clears a wedged controller -- the signature
+                      is `dwc2_hsotg_txfifo_flush: timeout flushing fifo GRSTCTL_TXFFLSH` in dmesg followed
+                      by a bind with no enumeration, leaving the UDC stuck at "not attached" forever.
+If the link is STILL "not attached" after step 3, the controller is healthy but sees no VBUS/session: no
+software action can fix that, so it is reported as a physical fault (cable/port/target-side power).
+
+NOTE: the rebuild deliberately runs the gadget scripts DIRECTLY rather than `systemctl restart kvm-gadget`.
+kvm-web.service is PartOf=kvm-gadget.service, so restarting the unit stops kvm-web -- and this helper runs
+as a child of kvm-web (via sudo), inside its cgroup, so it would kill ITSELF mid-recovery.
 """
 import errno
 import fcntl
@@ -33,7 +48,9 @@ G = "/sys/kernel/config/usb_gadget/kvm"
 UDC_FILE = os.path.join(G, "UDC")
 UDC_DIR = "/sys/class/udc"
 LOCK = "/run/kvm/gadget.lock"
-SYSTEMCTL = "/bin/systemctl" if os.path.exists("/bin/systemctl") else "/usr/bin/systemctl"
+GADGET_UP = "/usr/local/sbin/kvm-gadget-up.sh"
+GADGET_DOWN = "/usr/local/sbin/kvm-gadget-down.sh"
+DWC2_DRV = "/sys/bus/platform/drivers/dwc2"    # platform driver dir: unbind/bind re-probe the controller
 EXIT_BUSY = 3          # another re-enumerate is already running (the endpoint maps this to HTTP 409)
 
 
@@ -89,6 +106,74 @@ def _rebind(udc):
     return last
 
 
+def link_state():
+    """The UDC's view of the USB link: 'configured' once the host has enumerated us, 'not attached' when no
+    VBUS/session is seen at all, or an intermediate ('default', 'addressed', ...) mid-enumeration."""
+    for udc in available_udcs():
+        try:
+            with open(os.path.join(UDC_DIR, udc, "state")) as f:
+                return f.read().strip()
+        except OSError:
+            pass
+    return "unknown"
+
+
+def _linked_up(settle=3.0):
+    """True if the host has (re)enumerated us. Poll briefly: a real enumeration takes the host ~0.3-2s."""
+    deadline = time.time() + settle
+    while time.time() < deadline:
+        st = link_state()
+        if st not in ("not attached", "unknown", ""):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def _run(cmd, timeout=60):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stderr or r.stdout or "").strip()[:200]
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return 1, str(e)[:200]
+
+
+def _rebuild_gadget():
+    """Full teardown + rebuild from config, running the scripts DIRECTLY. Deliberately NOT `systemctl
+    restart kvm-gadget`: kvm-web is PartOf that unit, so the restart would stop kvm-web and kill this
+    helper (its own sudo child) mid-recovery."""
+    _run([GADGET_DOWN], timeout=40)
+    rc, err = _run([GADGET_UP], timeout=60)
+    return rc == 0, err
+
+
+def _reprobe_controller():
+    """Re-initialise the USB controller itself: unbind the platform device from dwc2 and bind it back. The
+    gadget must be torn down first (its UDC binding pins the controller) and rebuilt afterwards. This is
+    what clears a controller wedged with TX-FIFO flush timeouts, which no gadget-level action can fix."""
+    if not os.path.isdir(DWC2_DRV):
+        return False, "no dwc2 platform driver (built-in or renamed?)"
+    devs = [d for d in os.listdir(DWC2_DRV) if d.endswith(".usb")]
+    if not devs:
+        return False, "no dwc2 device bound"
+    dev = devs[0]
+    _run([GADGET_DOWN], timeout=40)                 # release the UDC before touching the driver
+    for action in ("unbind", "bind"):
+        try:
+            with open(os.path.join(DWC2_DRV, action), "w") as f:
+                f.write(dev + "\n")
+        except OSError as e:
+            if action == "bind":                    # left unbound: try to restore the gadget anyway
+                _rebuild_gadget()
+            return False, "%s %s failed: %s" % (action, dev, e)
+        time.sleep(2.0)                             # let the controller settle between the two halves
+    for _ in range(20):                             # wait for the re-probed UDC to appear
+        if available_udcs():
+            break
+        time.sleep(0.25)
+    ok, err = _rebuild_gadget()
+    return ok, err
+
+
 def _do_reenumerate(hold=0.4):
     if not os.path.isdir(G) or not os.path.exists(UDC_FILE):
         die("gadget not present (%s) -- is kvm-gadget running?" % G)
@@ -107,14 +192,11 @@ def _do_reenumerate(hold=0.4):
         print("reenumerated udc=%s" % udc)
         return
     # Direct re-bind failed -> rebuild the whole gadget so the target is never left without USB.
-    try:
-        r = subprocess.run([SYSTEMCTL, "restart", "kvm-gadget"], capture_output=True, text=True, timeout=40)
-    except (subprocess.TimeoutExpired, OSError):
-        r = None
+    ok, err = _rebuild_gadget()
     # kvm-gadget-up.sh re-binds on its own; wait for it, and bind directly if it rebuilt but stayed unbound.
     for _ in range(15):
         if current_udc():
-            print("reenumerated via kvm-gadget restart")
+            print("reenumerated via gadget rebuild")
             return
         if os.path.exists(UDC_FILE) and available_udcs():
             try:
@@ -122,16 +204,50 @@ def _do_reenumerate(hold=0.4):
             except OSError:
                 pass
         time.sleep(0.3)
-    rc = "timeout" if r is None else r.returncode
-    err = "" if r is None else (r.stderr or "").strip()[:200]
-    die("re-bind failed and restart did not recover (rc=%s err=%r) -- gadget may be UNBOUND; "
-        "recover with: sudo systemctl restart kvm-gadget" % (rc, err))
+    die("re-bind failed and rebuild did not recover (ok=%s err=%r) -- gadget may be UNBOUND; "
+        "try: sudo kvm-gadget-helper recover" % (ok, err))
 
 
-def reenumerate(hold=0.4):
-    # Single-flight: two concurrent bounces would interleave on the UDC and lengthen the window in which the
-    # target has NO usb. Reject a second caller (exit 3) rather than queue it. The lock is held across the
-    # restart fallback too. /run/kvm is the service RuntimeDirectory (root-writable).
+def _do_recover():
+    """Escalating recovery: stop at the first step that brings the link back (see the module docstring)."""
+    steps = []
+    before = link_state()
+
+    try:                                            # 1. long bounce -- unstick a host mid-enumeration
+        _do_reenumerate(hold=2.0)
+        steps.append("bounce")
+    except SystemExit:                              # gadget absent/unbindable: the rebuild below is the fix
+        steps.append("bounce:failed")
+    if _linked_up():
+        print("recovered by %s (state=%s, was %s)" % (steps[-1], link_state(), before))
+        return
+
+    ok, err = _rebuild_gadget()                     # 2. full gadget rebuild from config
+    steps.append("rebuild" if ok else "rebuild:failed(%s)" % err)
+    if _linked_up():
+        print("recovered by rebuild (state=%s, was %s)" % (link_state(), before))
+        return
+
+    ok, err = _reprobe_controller()                 # 3. re-initialise the USB controller itself
+    steps.append("controller-reprobe" if ok else "controller-reprobe:failed(%s)" % err)
+    if _linked_up(settle=5.0):
+        print("recovered by controller reprobe (state=%s, was %s)" % (link_state(), before))
+        return
+
+    # Everything the software can do is done and the controller still sees no session: this is physical.
+    st = link_state()
+    if st == "not attached":
+        die("gadget rebuilt and USB controller re-initialised, but the link is still 'not attached' -- the "
+            "controller sees NO VBUS from the target, which no software action can fix. Check the USB-C "
+            "data cable to the target (and that the target's port is powered). Steps tried: %s"
+            % ", ".join(steps))
+    die("recovery incomplete: link state '%s' after %s" % (st, ", ".join(steps)))
+
+
+def _locked(fn):
+    """Run fn under the single-flight lock: two concurrent bounces would interleave on the UDC and lengthen
+    the window in which the target has NO usb. Reject a second caller (exit 3) rather than queue it. The
+    lock is held across the rebuild/reprobe fallbacks too. /run/kvm is the RuntimeDirectory (root-writable)."""
     try:
         os.makedirs("/run/kvm", exist_ok=True)
     except OSError:
@@ -144,17 +260,21 @@ def reenumerate(hold=0.4):
         fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as e:
         if getattr(e, "errno", None) in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
-            sys.stderr.write("kvm-gadget-helper: reenumerate already in progress\n")
+            sys.stderr.write("kvm-gadget-helper: another gadget operation is already in progress\n")
             sys.exit(EXIT_BUSY)
         die("cannot lock %s: %s" % (LOCK, e))
     try:
-        _do_reenumerate(hold)
+        fn()
     finally:
         try:
             fcntl.flock(lockf, fcntl.LOCK_UN)
             lockf.close()
         except OSError:
             pass
+
+
+def reenumerate(hold=0.4):
+    _locked(lambda: _do_reenumerate(hold))
 
 
 def main():
@@ -164,7 +284,7 @@ def main():
     elif arg == "reenumerate":
         reenumerate()                      # quick bounce (0.4s hold): fresh COM port / re-enumerate on demand
     elif arg == "recover":
-        reenumerate(hold=2.0)              # long disconnect (2s): unstick a host-wedged gadget (see docstring)
+        _locked(_do_recover)               # escalating: bounce -> rebuild -> controller reprobe (see docstring)
     else:
         die("usage: kvm-gadget-helper {reenumerate|recover|status}")
 
