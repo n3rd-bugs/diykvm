@@ -1094,11 +1094,38 @@ async def serial_clear(payload: dict = Body(default={}), _: bool = Depends(requi
     return {"device": device, "discarded": discarded or 0, "open": discarded is not None}
 
 
+_bounce_times = []            # recent bounce timestamps, for the rate limiter below
+_BOUNCE_MIN_GAP = 10          # seconds between bounces
+_BOUNCE_MAX = 3               # ...and at most this many
+_BOUNCE_WINDOW = 300          # ...within this window
+
+
+def _bounce_rate_check():
+    """Rate-limit re-enumerates. Repeatedly bouncing USB is actively HARMFUL: each connect/disconnect
+    cycle advances the host's per-port failure counter, and after enough failed enumerations a host
+    (Windows especially) DISABLES the port -- turning a transient glitch into a dead KVM that only a
+    host-side action can clear. Users understandably click the button again when nothing happens, so the
+    guard belongs here, not in the docs. The single-flight lock only stops CONCURRENT bounces."""
+    now = time.time()
+    _bounce_times[:] = [t for t in _bounce_times if now - t < _BOUNCE_WINDOW]
+    if _bounce_times and now - _bounce_times[-1] < _BOUNCE_MIN_GAP:
+        raise HTTPException(status_code=429, detail=(
+            "wait %ds before bouncing USB again -- repeated re-plugs make a host give up on the port "
+            "entirely (it is how a port gets disabled)." % int(_BOUNCE_MIN_GAP - (now - _bounce_times[-1]))))
+    if len(_bounce_times) >= _BOUNCE_MAX:
+        raise HTTPException(status_code=429, detail=(
+            "%d USB re-plugs in %d minutes already; another will not help and risks the target disabling "
+            "the port. If USB is still dead the fault is at the target: try a different USB port there, a "
+            "known-good cable, or reboot the target." % (_BOUNCE_MAX, _BOUNCE_WINDOW // 60)))
+    _bounce_times.append(now)
+
+
 def _bounce_gadget(verb, timeout):
     """Run the privileged gadget bounce (`reenumerate` or `recover`) under the app-level single-flight lock,
-    reopen HID afterward (the /dev/hidg* are recreated), and publish a 'reenumerate' event. Sync/blocking:
+    reopen HID afterward (the /dev/hidg* may be recreated), and publish a 'reenumerate' event. Sync/blocking:
     the caller is a `def` route, so FastAPI runs it in a worker thread, off the event loop. Overlapping
-    bounces get 409 (they bounce ALL USB); a failure/timeout gets 502. Returns {hid_reopened, detail}."""
+    bounces get 409, too-frequent ones 429; a failure/timeout gets 502. Returns {hid_reopened, detail}."""
+    _bounce_rate_check()
     if not _reenum_lock.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="a re-enumerate is already in progress")
     try:
@@ -1178,11 +1205,42 @@ def _power_key(pw):
                         for t in pw.get("targets", [])]}
 
 
+def _host_link_probe():
+    """Tell apart the two very different reasons the gadget can sit at 'not attached'.
+
+    dwc2 logs 'new device is <speed>' every time the HOST resets our port and completes speed negotiation,
+    and 'new address N' when it goes on to address us. Resets far outnumbering addresses means the host is
+    reaching us but ABANDONING enumeration before the first control transfer -- a fault at the target (a
+    port latched into its give-up state, or a marginal data pair), not on the Pi. No resets at all means
+    nothing is reaching us (cable/target-power). Cheap enough to poll: one dmesg read, cached briefly."""
+    now = time.time()
+    cached = getattr(_host_link_probe, "_cache", None)
+    if cached and now - cached[0] < 15:
+        return cached[1]
+    out = {"resets": None, "addresses": None, "diagnosis": None}
+    try:
+        txt = subprocess.run(["dmesg"], capture_output=True, text=True, timeout=5).stdout
+        lines = [l for l in txt.splitlines() if "dwc2" in l]
+        out["resets"] = sum(1 for l in lines if "new device is" in l)
+        out["addresses"] = sum(1 for l in lines if "new address" in l)
+        if out["resets"] > out["addresses"] + 2:
+            out["diagnosis"] = ("host-abandons-enumeration: the target keeps resetting our port (%d resets, "
+                                "%d completed) but never finishes enumerating. Check the TARGET's USB port "
+                                "and cable -- not the Pi." % (out["resets"], out["addresses"]))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    _host_link_probe._cache = (now, out)
+    return out
+
+
 def _usb_state():
     """Gadget/USB state from the kernel: which UDC the gadget is bound to, and the controller's USB state
     -- 'configured' once the target has enumerated the gadget, 'not attached' when the target is gone or has
     no USB/HID driver (e.g. a dead OS), etc. This is the signal that exposes the target re-enumerating or
-    losing the gadget (HID/serial go dead while it is not 'configured')."""
+    losing the gadget (HID/serial go dead while it is not 'configured').
+
+    NOTE: 'not attached' means only that enumeration never COMPLETED -- it is NOT a VBUS/power indicator.
+    When we are stuck there, 'link_diagnosis' says whether the host is reaching us at all."""
     try:
         with open(_GADGET_UDC) as f:
             udc = f.read().strip()
@@ -1195,7 +1253,12 @@ def _usb_state():
                 state = f.read().strip()
         except OSError:
             state = "unknown"
-    return {"udc": udc or None, "bound": bool(udc), "state": state}
+    out = {"udc": udc or None, "bound": bool(udc), "state": state}
+    if state == "not attached":                  # only pay for the probe when something is actually wrong
+        probe = _host_link_probe()
+        if probe.get("diagnosis"):
+            out["link_diagnosis"] = probe["diagnosis"]
+    return out
 
 
 def _hid_state():

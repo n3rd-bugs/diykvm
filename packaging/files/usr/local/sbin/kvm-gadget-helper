@@ -52,6 +52,10 @@ GADGET_UP = "/usr/local/sbin/kvm-gadget-up.sh"
 GADGET_DOWN = "/usr/local/sbin/kvm-gadget-down.sh"
 DWC2_DRV = "/sys/bus/platform/drivers/dwc2"    # platform driver dir: unbind/bind re-probe the controller
 EXIT_BUSY = 3          # another re-enumerate is already running (the endpoint maps this to HTTP 409)
+# Hold times. The USB spec gives the host ~100ms of connect debounce, and a hold shorter than that can be
+# coalesced into no connect-change event at all -- so never go below ~1s even for the "quick" bounce.
+HOLD_REENUM = 1.5
+HOLD_RECOVER = 2.5
 
 
 def die(msg):
@@ -107,15 +111,37 @@ def _rebind(udc):
 
 
 def link_state():
-    """The UDC's view of the USB link: 'configured' once the host has enumerated us, 'not attached' when no
-    VBUS/session is seen at all, or an intermediate ('default', 'addressed', ...) mid-enumeration."""
-    for udc in available_udcs():
-        try:
-            with open(os.path.join(UDC_DIR, udc, "state")) as f:
-                return f.read().strip()
-        except OSError:
-            pass
-    return "unknown"
+    """The gadget's USB state: 'configured' once the host has enumerated us, an intermediate ('default',
+    'addressed', ...) mid-enumeration, or 'not attached'.
+
+    'not attached' is usb_gadget->state == USB_STATE_NOTATTACHED, which means only that enumeration never
+    COMPLETED. It is NOT a VBUS indicator: a host that resets the port and then abandons enumeration leaves
+    us here with a perfectly valid session. Use host_resets_without_enumerating() to tell those apart."""
+    udc = current_udc() or (available_udcs()[0] if available_udcs() else "")
+    if not udc:                            # report the UDC the gadget is actually BOUND to, not just the
+        return "unknown"                   # first one present (wrong on a board with several UDCs)
+    try:
+        with open(os.path.join(UDC_DIR, udc, "state")) as f:
+            return f.read().strip()
+    except OSError:
+        return "unknown"
+
+
+def host_resets_without_enumerating():
+    """(resets, addresses) since boot, from the kernel log.
+
+    dwc2 logs 'new device is <speed>' when the HOST has reset the port and completed speed negotiation,
+    and 'new address N' when it goes on to actually address us. Resets climbing while addresses stay flat
+    is the fingerprint of a host that keeps resetting the port but abandons enumeration before the first
+    control transfer -- i.e. the fault is at the far end (a latched/failed host port, or a marginal data
+    pair), NOT on this Pi. Best effort: returns (None, None) when dmesg is unreadable."""
+    try:
+        out = subprocess.run(["dmesg"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    resets = sum(1 for ln in out.splitlines() if "new device is" in ln and "dwc2" in ln)
+    addrs = sum(1 for ln in out.splitlines() if "new address" in ln and "dwc2" in ln)
+    return resets, addrs
 
 
 def _linked_up(settle=3.0):
@@ -127,6 +153,29 @@ def _linked_up(settle=3.0):
             return True
         time.sleep(0.25)
     return False
+
+
+def _soft_connect(hold):
+    """Electrically detach and re-attach by toggling ONLY the D+ pull-up (DCTL.SFTDISCON) via the UDC's
+    soft_connect attribute. This is what a host actually needs to see, and it is far gentler than a UDC
+    unbind: the gadget stays bound, endpoints stay allocated, and /dev/hidg* + /dev/ttyGS0 are NOT
+    destroyed -- so no HID reopen, and none of the teardown path that produced the GRSTCTL_TXFFLSH
+    flush timeouts. Returns True if the toggle was performed."""
+    udc = current_udc()
+    if not udc:
+        return False
+    path = os.path.join(UDC_DIR, udc, "soft_connect")
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, "w") as f:
+            f.write("disconnect\n")
+        time.sleep(hold)                   # hold well past the host's ~100ms debounce
+        with open(path, "w") as f:
+            f.write("connect\n")
+        return True
+    except OSError:
+        return False
 
 
 def _run(cmd, timeout=60):
@@ -174,16 +223,22 @@ def _reprobe_controller():
     return ok, err
 
 
-def _do_reenumerate(hold=0.4):
+def _do_reenumerate(hold=HOLD_REENUM):
     if not os.path.isdir(G) or not os.path.exists(UDC_FILE):
         die("gadget not present (%s) -- is kvm-gadget running?" % G)
     bound = current_udc()
     udc = bound or (available_udcs()[0] if available_udcs() else "")
     if not udc:
         die("no UDC available (is dwc2 in peripheral mode?)")
+    # Preferred: toggle just the D+ pull-up. The host sees exactly the detach/attach it needs, while the
+    # gadget stays bound -- so /dev/hidg* and /dev/ttyGS0 survive and we never run the UDC teardown that
+    # has produced GRSTCTL_TXFFLSH timeouts (and, repeated, drives hosts to disable the port).
+    if bound and _soft_connect(hold):
+        print("reenumerated udc=%s (soft-connect)" % udc)
+        return
     if bound:
         try:
-            _write_udc("")                 # unbind: the target sees the whole device disconnect
+            _write_udc("")                 # fallback: unbind so the target sees the whole device disconnect
         except OSError as e:
             die("unbind failed: %s" % e)
         time.sleep(hold)                   # hold the disconnect so the host registers it before re-binding
@@ -213,8 +268,8 @@ def _do_recover():
     steps = []
     before = link_state()
 
-    try:                                            # 1. long bounce -- unstick a host mid-enumeration
-        _do_reenumerate(hold=2.0)
+    try:                                            # 1. pull-up bounce -- gentlest attach the host can see
+        _do_reenumerate(hold=HOLD_RECOVER)
         steps.append("bounce")
     except SystemExit:                              # gadget absent/unbindable: the rebuild below is the fix
         steps.append("bounce:failed")
@@ -222,24 +277,46 @@ def _do_recover():
         print("recovered by %s (state=%s, was %s)" % (steps[-1], link_state(), before))
         return
 
-    ok, err = _rebuild_gadget()                     # 2. full gadget rebuild from config
+    if current_udc():                               # 2. full UDC unbind/rebind (a harder disconnect)
+        try:
+            _write_udc("")
+            time.sleep(HOLD_RECOVER)
+        except OSError:
+            pass
+        _rebind(current_udc() or (available_udcs()[0] if available_udcs() else ""))
+        steps.append("udc-bounce")
+        if _linked_up():
+            print("recovered by udc-bounce (state=%s, was %s)" % (link_state(), before))
+            return
+
+    ok, err = _rebuild_gadget()                     # 3. full gadget rebuild from config
     steps.append("rebuild" if ok else "rebuild:failed(%s)" % err)
     if _linked_up():
         print("recovered by rebuild (state=%s, was %s)" % (link_state(), before))
         return
 
-    ok, err = _reprobe_controller()                 # 3. re-initialise the USB controller itself
+    ok, err = _reprobe_controller()                 # 4. re-initialise the USB controller itself
     steps.append("controller-reprobe" if ok else "controller-reprobe:failed(%s)" % err)
     if _linked_up(settle=5.0):
         print("recovered by controller reprobe (state=%s, was %s)" % (link_state(), before))
         return
 
-    # Everything the software can do is done and the controller still sees no session: this is physical.
+    # Everything on this side is done. Distinguish the two very different reasons we can still be down,
+    # because they need opposite actions from the operator.
     st = link_state()
+    resets, addrs = host_resets_without_enumerating()
+    if st == "not attached" and resets and addrs is not None and resets > addrs + 2:
+        die("the gadget is healthy and the host IS reaching us -- the kernel logged %d port resets but only "
+            "%d completed enumerations, so the far end resets us, negotiates speed, then abandons "
+            "enumeration before the first control transfer. That is a fault at the TARGET, not on the Pi: "
+            "its USB port has latched into a give-up state (Windows shows it as 'Port Reset Failed' / "
+            "'Device Descriptor Request Failed'), or the data pair is marginal. Move the cable to a "
+            "DIFFERENT port on the target, try a known-good USB 2.0 data cable, or reboot the target. "
+            "Steps tried: %s" % (resets, addrs, ", ".join(steps)))
     if st == "not attached":
-        die("gadget rebuilt and USB controller re-initialised, but the link is still 'not attached' -- the "
-            "controller sees NO VBUS from the target, which no software action can fix. Check the USB-C "
-            "data cable to the target (and that the target's port is powered). Steps tried: %s"
+        die("gadget rebuilt and USB controller re-initialised, but enumeration never completed (state 'not "
+            "attached') and the host is not even resetting the port -- nothing is reaching us. Check that "
+            "the USB-C data cable is seated at both ends and that the target is powered. Steps tried: %s"
             % ", ".join(steps))
     die("recovery incomplete: link state '%s' after %s" % (st, ", ".join(steps)))
 
