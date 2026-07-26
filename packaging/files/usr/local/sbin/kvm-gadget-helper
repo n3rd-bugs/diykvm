@@ -51,6 +51,7 @@ LOCK = "/run/kvm/gadget.lock"
 GADGET_UP = "/usr/local/sbin/kvm-gadget-up.sh"
 GADGET_DOWN = "/usr/local/sbin/kvm-gadget-down.sh"
 DWC2_DRV = "/sys/bus/platform/drivers/dwc2"    # platform driver dir: unbind/bind re-probe the controller
+SYSTEMCTL = "/bin/systemctl" if os.path.exists("/bin/systemctl") else "/usr/bin/systemctl"
 EXIT_BUSY = 3          # another re-enumerate is already running (the endpoint maps this to HTTP 409)
 # Hold times. The USB spec gives the host ~100ms of connect debounce, and a hold shorter than that can be
 # coalesced into no connect-change event at all -- so never go below ~1s even for the "quick" bounce.
@@ -354,16 +355,54 @@ def reenumerate(hold=0.4):
     _locked(lambda: _do_reenumerate(hold))
 
 
+MIN_UPTIME = 120       # refuse a reboot within this long of boot -- a reboot loop must be impossible
+
+
+def reboot_pi(delay=3):
+    """Reboot the Pi. This is the LAST rung of USB recovery: a dwc2 controller wedged by repeated UDC
+    teardowns keeps its pull-up asserted and logs phantom resets while no host ever sees a device, and
+    nothing short of re-initialising the SoC clears it (observed: a reboot enumerates cleanly 8s into
+    boot after every software recovery had failed).
+
+    The reboot is SCHEDULED as a transient systemd unit rather than run inline, for two reasons: the
+    caller (kvm-web, via sudo) gets to return an HTTP response first, and the reboot then survives its
+    own cgroup being torn down. Refuses if the Pi only just booted, so a caller in a retry loop can
+    never turn this into a boot loop."""
+    try:
+        with open("/proc/uptime") as f:
+            up = float(f.read().split()[0])
+    except (OSError, ValueError):
+        up = MIN_UPTIME + 1
+    if up < MIN_UPTIME:
+        die("refusing: the Pi booted %ds ago (min %ds) -- if USB is still dead a reboot will not help, "
+            "check the cable and the target's port" % (int(up), MIN_UPTIME))
+    delay = max(1, min(60, int(delay)))
+    rc, err = _run(["systemd-run", "--collect", "--unit=kvm-reboot",
+                    "--on-active=%ds" % delay, "systemctl", "reboot"], timeout=20)
+    if rc != 0:                            # no systemd-run (or the unit name is taken): detach and sleep
+        try:
+            if os.fork() == 0:
+                os.setsid()
+                time.sleep(delay)
+                os.execv(SYSTEMCTL, [SYSTEMCTL, "reboot"])
+                os._exit(1)
+        except OSError as e:
+            die("could not schedule the reboot: %s (%s)" % (e, err))
+    print("reboot scheduled in %ds (uptime was %ds)" % (delay, int(up)))
+
+
 def main():
     arg = sys.argv[1] if len(sys.argv) == 2 else None
     if arg == "status":
         status()
     elif arg == "reenumerate":
-        reenumerate()                      # quick bounce (0.4s hold): fresh COM port / re-enumerate on demand
+        reenumerate()                      # quick bounce: fresh COM port / re-enumerate on demand
     elif arg == "recover":
         _locked(_do_recover)               # escalating: bounce -> rebuild -> controller reprobe (see docstring)
+    elif arg == "reboot":
+        reboot_pi()                        # last rung: only a reboot clears a wedged dwc2 controller
     else:
-        die("usage: kvm-gadget-helper {reenumerate|recover|status}")
+        die("usage: kvm-gadget-helper {reenumerate|recover|reboot|status}")
 
 
 if __name__ == "__main__":

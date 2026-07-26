@@ -153,6 +153,7 @@
     <button id="kvmbtn" title="external KVM switch (GPIO)">⇄ KVM</button>
     <button id="replugbtn" title="unplug &amp; re-plug the USB device to the target (brief ~1s USB drop; the target re-detects keyboard, mouse, drive and COM)">⟳ Replug USB</button>
     <button id="recoverbtn" title="USB dead to the target? Escalating recovery: long re-plug, then a full gadget rebuild, then re-initialising the USB controller — stops as soon as the link is back">🛟 Recover USB</button>
+    <button id="rebootbtn" title="Reboot the Pi itself — the last resort when USB stays dead after Recover. Drops video, this page and USB for ~30-40s">⏻ Reboot Pi</button>
     <label class="barchk" title="send occasional mouse nudges so the target display doesn't sleep (paused while you interact)"><input type="checkbox" id="awake"> Keep awake</label>
     <span class="sp"></span>
     <span id="info">—</span>
@@ -1136,6 +1137,26 @@ recoverBtn.onclick = async () => {
   }
   recoverBtn.textContent = msg;
   setTimeout(() => { recoverBtn.disabled = false; recoverBtn.textContent = orig; }, 3000);
+};
+
+// Reboot the Pi — the last rung when USB stays dead after Recover (only re-initialising the SoC clears a
+// wedged dwc2 controller). Everything goes: video, this page, serial, USB. The page reconnects on its own
+// once the Pi is back, so just tell the operator what to expect rather than leaving a dead-looking UI.
+const rebootBtn = document.getElementById('rebootbtn');
+rebootBtn.onclick = async () => {
+  if (!confirm('Reboot the Raspberry Pi?\n\nEverything drops for about 30–40 seconds: video, this page, the serial console and USB to the target. The target itself is NOT affected.\n\nUse this only when USB is still dead after “Recover USB”.')) return;
+  const orig = rebootBtn.textContent;
+  rebootBtn.disabled = true; rebootBtn.textContent = '⏻ Rebooting…';
+  try {
+    await api('/api/system/reboot', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirm: true }),
+    });
+    info.textContent = 'Pi rebooting — this page reconnects automatically in ~40s';
+    setTimeout(() => location.reload(), 45000);      // come back once it is up
+  } catch (e) {
+    rebootBtn.disabled = false; rebootBtn.textContent = orig;
+    alert('Reboot failed:\n\n' + e.message);
+  }
 };
 function serAppend(t){ serout.textContent += t; serout.scrollTop = serout.scrollHeight;
   if(serout.textContent.length>200000) serout.textContent = serout.textContent.slice(-150000); }

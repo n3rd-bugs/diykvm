@@ -1,3 +1,5 @@
-# The unprivileged diykvm web service may run only these fixed helper verbs as root —
-# the mass-storage transitions, and the validating config writer / streamer restart. Nothing else.
-diykvm ALL=(root) NOPASSWD: /usr/local/sbin/kvm-msd-helper attach, /usr/local/sbin/kvm-msd-helper detach, /usr/local/sbin/kvm-msd-helper eject, /usr/local/sbin/kvm-msd-helper import, /usr/local/sbin/kvm-msd-helper delete, /usr/local/sbin/kvm-conf-helper write, /usr/local/sbin/kvm-conf-helper restart-streamer, /usr/local/sbin/kvm-gadget-helper reenumerate, /usr/local/sbin/kvm-gadget-helper recover
+# The unprivileged diykvm web service may run only these fixed helper verbs as root — the mass-storage
+# transitions, the validating config writer / streamer restart, the USB gadget re-enumerate/recover, and
+# a Pi reboot (the last rung of USB recovery: only re-initialising the SoC clears a wedged dwc2
+# controller; the helper refuses within 120s of boot so it can never become a boot loop). Nothing else.
+diykvm ALL=(root) NOPASSWD: /usr/local/sbin/kvm-msd-helper attach, /usr/local/sbin/kvm-msd-helper detach, /usr/local/sbin/kvm-msd-helper eject, /usr/local/sbin/kvm-msd-helper import, /usr/local/sbin/kvm-msd-helper delete, /usr/local/sbin/kvm-conf-helper write, /usr/local/sbin/kvm-conf-helper restart-streamer, /usr/local/sbin/kvm-gadget-helper reenumerate, /usr/local/sbin/kvm-gadget-helper recover, /usr/local/sbin/kvm-gadget-helper reboot

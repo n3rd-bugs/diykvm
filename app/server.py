@@ -316,6 +316,8 @@ API_INFO = {
          "desc": "Re-enumerate the USB gadget (unbind + re-bind its UDC) so the target re-detects the device and gets a fresh CDC-ACM COM port. Lets the other end request a fresh port on demand. Because USB enumerates per device, the keyboard, mouse and mass-storage interface also briefly re-appear (~1s); an open Pi-side serial port self-heals. Quick bounce (~0.4s); for a wedged gadget use /api/gadget/recover."},
         {"method": "POST", "path": "/api/gadget/recover", "auth": True,
          "desc": "Recover a DEAD/WEDGED USB gadget by escalation, stopping at the first step that brings the link back: (1) long re-plug -- unbind + re-bind the UDC holding the disconnect ~2s so a host stuck mid-enumeration deregisters and enumerates clean; (2) full gadget rebuild from config; (3) re-initialise the USB controller itself (dwc2 driver unbind/bind), the only step that clears a controller wedged with TX-FIFO flush timeouts. Drops ALL USB for a few seconds and can take ~30s. If every step runs and the link is still 'not attached', the controller sees no VBUS -- a physical cable/port fault -- and this returns 502 saying so. Returns {recovered, hid_reopened, detail} where detail names the step that worked."},
+        {"method": "POST", "path": "/api/system/reboot", "auth": True, "body": '{"confirm": true}',
+         "desc": "Reboot the Pi itself -- the LAST rung of USB recovery, for a dwc2 controller so wedged that no re-plug, gadget rebuild or driver re-probe restores it (it keeps asserting its pull-up and logging phantom bus resets while no host sees a device; a reboot enumerates cleanly seconds into boot). Drops EVERYTHING for ~30-40s: video, this API, serial and USB. The body must contain confirm:true, and the helper refuses within 120s of boot so a retry loop cannot become a boot loop. The reboot is scheduled a few seconds out so this call returns first. Returns {rebooting, detail}."},
         {"method": "WS", "path": "/ws/serial", "auth": True, "query": "device, baud, flow, dtr, rts, reconnect, token",
          "desc": "Serial console, binary-clean. Subscribes to the shared port (auto-opens it with the given "
                  "settings if needed), replays the backlog accumulated while detached (then dropped, so "
@@ -1176,6 +1178,33 @@ def gadget_recover(_: bool = Depends(require_auth)):
     If every step runs and the link is still down, the controller sees no VBUS: that is a physical cable/port
     fault and the helper says so (502) instead of reporting a hollow success. Single-flight with reenumerate."""
     return {"recovered": True, **_bounce_gadget("recover", timeout=90)}
+
+
+@app.post("/api/system/reboot")
+def system_reboot(payload: dict = Body(default={}), _: bool = Depends(require_auth)):
+    """Reboot the Pi itself. Deliberately explicit -- it drops EVERYTHING for ~30-40s: video, this API,
+    the serial console, and USB to the target.
+
+    This exists because it is the last rung of USB recovery: a dwc2 controller wedged by repeated UDC
+    teardowns keeps its pull-up asserted and logs phantom bus resets while no host ever sees a device,
+    and no gadget-level action -- not a re-plug, a rebuild, or even a driver re-probe -- clears it. A
+    reboot does, enumerating cleanly seconds into boot.
+
+    Requires {"confirm": true} in the body so a stray POST can never take the KVM down, and the helper
+    refuses within 120s of boot so a retry loop cannot become a boot loop. The reboot is scheduled a few
+    seconds out, so this call returns normally first."""
+    if not (isinstance(payload, dict) and payload.get("confirm") is True):
+        raise HTTPException(status_code=400, detail='reboot requires {"confirm": true} in the body')
+    try:
+        r = subprocess.run(["sudo", "-n", GADGET_HELPER, "reboot"],
+                           capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=502, detail="reboot request timed out")
+    if r.returncode != 0:
+        raise HTTPException(status_code=502, detail=(r.stderr or r.stdout or "reboot failed").strip())
+    detail = (r.stdout or "").strip()
+    EVENTS.publish("reboot", scheduled=True, detail=detail)
+    return {"rebooting": True, "detail": detail}
 
 
 # ----------------------------- events (state stream) -----------------------------
