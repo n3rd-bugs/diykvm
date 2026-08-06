@@ -14,7 +14,9 @@ import os
 import re
 import json
 import time
+import hmac
 import shutil
+import hashlib
 import asyncio
 import socket
 import subprocess
@@ -79,8 +81,28 @@ STORE_IMG = "/opt/kvm/store.img"           # scratch RW LUN backing file (host -
 EXTRA_ORIGINS = {o.strip() for o in _conf("web", "allowed_origins", "").split(",") if o.strip()}
 
 cfg = auth.load_config()
+
+
+def _boot_id():
+    """This boot's kernel id: stable for the life of the boot, different after every reboot. Preferred over
+    /proc/stat btime, which a clock-less Pi recomputes as (wall clock - uptime) and NTP therefore perturbs."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:      # mode 444: readable unprivileged
+            return f.read().strip()
+    except OSError:
+        return ""                                              # no /proc (dev box): sessions behave as before
+
+
+# "Stay logged in until the Pi reboots." The signing key mixes the PERSISTED secret with this boot's id, so
+# a session survives kvm-web restarts (the secret is stable in config.json) but every cookie signed under a
+# previous boot fails to verify after a reboot -- exactly the intended lifetime, enforced server-side rather
+# than by trusting a cookie claim. max_age must then exceed any realistic uptime, or IT becomes the binding
+# constraint again (this is a 24/7 appliance); 365d also stays under Chrome's 400-day persistent-cookie cap.
+# The API-key path is deliberately untouched: it never reads the cookie, so agents keep working across boots.
+_SESSION_KEY = hmac.new(cfg["secret_key"].encode(), (_boot_id() or "no-boot-id").encode(),
+                        hashlib.sha256).hexdigest()
 app = FastAPI(title="DIY PiKVM")
-app.add_middleware(SessionMiddleware, secret_key=cfg["secret_key"], max_age=86400,
+app.add_middleware(SessionMiddleware, secret_key=_SESSION_KEY, max_age=365 * 24 * 3600,
                    same_site="lax", https_only=TLS_ACTIVE)
 hid = HIDController()
 msd = MSD(image=MSD_IMAGE)
@@ -429,8 +451,9 @@ class _MJPEGTap:
             self._task.cancel()
             try:
                 await self._task
-            except Exception:
-                pass
+            except (Exception, asyncio.CancelledError):
+                pass          # CancelledError is a BaseException on 3.11 -- `except Exception` misses it,
+                              # which is what logs "Exception in ASGI application" on every /ws/video close
         if self.resp is not None:
             await self.resp.aclose()
         if self.client is not None:
@@ -627,20 +650,25 @@ class _H264Source:
             return c
 
     async def detach(self, c: _H264Client):
+        # Take the lock ONLY to unpublish the source, then release it before touching the pump. Awaiting the
+        # pump while holding the lock self-deadlocks: the pump's own finally needs the same lock, so the two
+        # coroutines wait on each other forever, the lock is never released, and every later attach() blocks
+        # on it -- H.264 is then dead for every viewer until kvm-web restarts (not even a reload clears it).
+        proc = task = None
         async with self.lock:
             self.clients.discard(c)
             if not self.clients and self.proc is not None:
                 proc, task, self.proc, self.task = self.proc, self.task, None, None
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-                if task:
-                    task.cancel()
-                    try:
-                        await task
-                    except Exception:
-                        pass
+        if proc is not None:
+            try:
+                proc.kill()                    # stdout hits EOF, so the pump ends through its normal path
+            except ProcessLookupError:
+                pass
+        if task is not None:
+            try:                               # bounded: never let a stuck pump wedge a disconnect
+                await asyncio.wait_for(asyncio.shield(task), 3)
+            except (Exception, asyncio.CancelledError):
+                pass                           # CancelledError is a BaseException on 3.11: catch it by name
 
     def _fan(self, idr: bool, au: bytes):
         payload = (b"\x01" if idr else b"\x00") + au
@@ -716,13 +744,35 @@ async def ws_h264(sock: WebSocket):
     if not on or not shutil.which("ffmpeg"):
         await sock.close(code=1011)
         return
-    client = await _h264_src.attach(kbps)
+    # Bound BOTH the attach and the first frame. A client that hangs here shows a blank video area with an
+    # OPEN socket, which is the one state the browser's fallback ladder cannot see (it is driven by close/
+    # error events). Closing instead lets the client drop to /ws/video. Measured healthy first-frame latency
+    # is 1.7-2.4s cold and ~0.9s for a late joiner, so 10s is generous rather than tight.
     try:
+        client = await asyncio.wait_for(_h264_src.attach(kbps), 8)
+    except (asyncio.TimeoutError, Exception):
+        print("[h264] attach timed out or failed; telling the client to fall back", flush=True)
+        await sock.close(code=1011)
+        return
+    try:
+        first = True
         while True:
-            payload = await client.q.get()
+            if first:
+                payload = await asyncio.wait_for(client.q.get(), 10)
+                first = False
+            else:
+                payload = await client.q.get()
             if payload is None:
                 break
             await sock.send_bytes(payload)
+    except asyncio.TimeoutError:
+        # No frame within the budget: ffmpeg is alive but producing nothing (no HDMI signal, a stalled
+        # capture). Close so the client falls back instead of staring at an open, silent socket.
+        print("[h264] no frame within 10s; closing so the client falls back", flush=True)
+        try:
+            await sock.close(code=1011)
+        except Exception:
+            pass
     except (WebSocketDisconnect, RuntimeError):
         pass
     except Exception:

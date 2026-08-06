@@ -281,6 +281,27 @@ function setView(el) {
   view = el;
 }
 
+// ---- deauthentication detection ----
+// A rejected WebSocket is indistinguishable from a dead server in the browser: the handshake is refused
+// with HTTP 403 (the server closes before accepting), which JS only ever sees as an opaque 1006. And an
+// expired session makes /stream return a JSON 401 that an <img> can only report as a generic error. So
+// whenever a transport fails, ASK an authenticated endpoint what happened: 401 means the session is gone
+// and the only cure is logging in again -- previously the page just retried forever behind a blank screen
+// and the user had to guess that a reload was needed.
+let _authChecking = false;
+function goLogin() { location.href = '/login'; }
+async function bailIfDeauthed() {
+  if (_authChecking) return false;
+  _authChecking = true;
+  try {
+    const r = await fetch('/api/events/state', { cache: 'no-store' });
+    if (r.status === 401 || r.status === 403) { goLogin(); return true; }
+  } catch (e) {
+    /* network/server error is NOT an auth failure -- keep retrying rather than bouncing to login */
+  } finally { _authChecking = false; }
+  return false;
+}
+
 // ---- video transport: H.264/WebCodecs first, paced-MJPEG WebSocket next, MJPEG <img> last ----
 // /ws/h264 is the Chrome-Remote-Desktop-style path: hardware-encoded H.264 at ~0.4-3 Mbit/s (vs ~25
 // for MJPEG), decoded by the browser's VideoDecoder onto a canvas. A slow viewer is resynced by the
@@ -317,11 +338,19 @@ function h264Connect() {
       if (!gotFrame) { gotFrame = true; hActive = true; hFails = 0; setView(hcanvas); }
     } catch (err) { h264Fail(); }
   };
+  // First-frame watchdog. An OPEN but silent socket is the one failure the fallback ladder cannot see --
+  // it is driven purely by close/error events -- so a stalled source used to mean a blank screen forever.
+  hws.onopen = () => {
+    setTimeout(() => {
+      if (hws && !gotFrame) { try { hws.close(); } catch (e) {} }   // -> onclose -> fallback ladder
+    }, 12000);                                 // healthy first frame is ~1-2.5s; this only catches stalls
+  };
   hws.onerror = () => { try { hws.close(); } catch (e) {} };
   hws.onclose = () => {
     hws = null;
     if (hdec) { try { hdec.close(); } catch (e) {} hdec = null; }
     if (document.hidden) return;               // visibilitychange resumes
+    if (!gotFrame) { bailIfDeauthed(); }        // a refused handshake looks like 1006; ask why
     if (!gotFrame && ++hFails >= 2) { hActive = false; setView(img); wsVideoConnect(); return; }
     setTimeout(h264Connect, 1000);             // streamer restart / transient drop: reconnect
   };
@@ -362,15 +391,27 @@ function wsVideoConnect() {
     if (prev) URL.revokeObjectURL(prev);
     if (vws && vws.readyState === 1) vws.send('a');  // ready for the next (freshest) frame
   };
+  vws.onopen = () => {
+    setTimeout(() => { if (vws && !gotFrame) { try { vws.close(); } catch (e) {} } }, 12000);
+  };
   vws.onerror = () => { try { vws.close(); } catch (e) {} };
   vws.onclose = () => {
     vws = null; vstat.textContent = '';
     if (document.hidden) return;                     // visibilitychange resumes
+    if (!gotFrame) { bailIfDeauthed(); }             // refused handshake surfaces as 1006; ask why
     if (!gotFrame && ++vwsFails >= 2) { videoFallback(); return; }   // WS video unavailable -> MJPEG
     setTimeout(wsVideoConnect, 1000);                // streamer restart / transient drop: reconnect
   };
 }
 function videoFallback() { vwsMode = false; vstat.textContent = ''; img.src = streamURL + '?t=' + Date.now(); }
+// The fail counters latch: two strikes pinned a tab on a lesser transport for its whole life, so a 5-second
+// blip (a capture-source switch restarts uStreamer) permanently cost H.264. Periodically clear the strikes
+// and, if we are not already on the best transport, try to climb back.
+setInterval(() => {
+  if (document.hidden) return;
+  hFails = 0; vwsFails = 0;
+  if (!hActive && window.VideoDecoder && !hws) h264Connect();
+}, 120000);
 function videoRestart() {                            // e.g. after switching the capture source
   if (hws) { try { hws.close(); } catch (e) {} }     // onclose reconnects to the fresh stream
   else if (vws) { try { vws.close(); } catch (e) {} }
@@ -379,9 +420,12 @@ function videoRestart() {                            // e.g. after switching the
 h264Connect();
 
 // MJPEG fallback path: reconnect if the <img> stream drops (streamer restarting etc.)
-img.addEventListener('error', () => { setTimeout(() => {
-  if (!document.hidden && !vwsMode && !hActive) img.src = streamURL + '?t=' + Date.now();
-}, 1000); });
+img.addEventListener('error', () => {
+  bailIfDeauthed();                              // /stream 401s once the session dies; the <img> just errors
+  setTimeout(() => {
+    if (!document.hidden && !vwsMode && !hActive) img.src = streamURL + '?t=' + Date.now();
+  }, 1000);
+});
 
 // ---- stream hygiene (MJPEG fallback only; WS video revokes its blobs every frame) ----
 // A multipart MJPEG <img> is "loading" forever, so the browser never releases what the element has
@@ -437,12 +481,16 @@ loadVideoSources();
 const dot  = document.getElementById('dot');
 const info = document.getElementById('info');
 const capBtn = document.getElementById('cap');
-let ws, capturing = false;
+let ws, capturing = false, wsEverOpen = false;
 
 function connect() {
   ws = new WebSocket(wsURL('/ws'));
-  ws.onopen  = () => { dot.classList.add('up'); };
-  ws.onclose = () => { dot.classList.remove('up'); setTimeout(connect, 1000); };
+  ws.onopen  = () => { dot.classList.add('up'); wsEverOpen = true; };
+  ws.onclose = () => {
+    dot.classList.remove('up');
+    if (!wsEverOpen) bailIfDeauthed();          // never opened => likely a refused (403) handshake
+    setTimeout(connect, 1000);
+  };
   ws.onerror = () => ws.close();
 }
 connect();
@@ -676,6 +724,7 @@ const fmtSize = (n) => n >= 1048576 ? (n/1048576).toFixed(1)+' MB'
 async function api(path, opts) {
   const r = await fetch(path, opts);
   const ct = r.headers.get('content-type') || '';
+  if (r.status === 401) { goLogin(); throw new Error('authentication required'); }
   if (!r.ok) { let d; try { d = (await r.json()).detail; } catch(e){} throw new Error(d || ('HTTP '+r.status)); }
   return ct.includes('json') ? r.json() : r;
 }
