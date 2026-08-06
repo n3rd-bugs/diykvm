@@ -39,10 +39,12 @@ credentials once:</p>
 <code>rejectUnauthorized:false</code> / an unverified TLS context) to accept the self-signed cert. If you set
 <code>[web] tls = false</code>, use <code>http://</code> and <code>ws://</code> instead.</p>
 <p>Then send the key on every request — HTTP header <b><code>X-API-Key: &lt;KEY&gt;</code></b> (or
-<code>Authorization: Bearer &lt;KEY&gt;</code>); for WebSockets add <b><code>?token=&lt;KEY&gt;</code></b> to the URL.</p>
+<code>Authorization: Bearer &lt;KEY&gt;</code>). <b>The same headers work on WebSockets.</b>
+<code>?token=&lt;KEY&gt;</code> in the URL is still accepted for compatibility, but prefer the header:
+the server logs WebSocket URLs (query string included) to the journal, headers it does not.</p>
 
 <h2>2. Input — keyboard &amp; mouse <span class="pill">WS /ws</span></h2>
-<p>Connect to <code>wss://&lt;pi&gt;:8000/ws?token=&lt;KEY&gt;</code> and send JSON messages:</p>
+<p>Connect to <code>wss://&lt;pi&gt;:8000/ws</code> with an <code>X-API-Key</code> header and send JSON messages:</p>
 <table>
 <tr><th>Message</th><th>Effect</th></tr>
 <tr><td><code>{"t":"kd","code":"KeyA"}</code></td><td>key down (<code>code</code> = JS <code>KeyboardEvent.code</code>)</td></tr>
@@ -66,7 +68,8 @@ Slash</code>. To type a capital "A": <code>kd ShiftLeft</code>, <code>kd KeyA</c
 <pre><code>import asyncio, json, ssl, websockets
 NOVERIFY = ssl.create_default_context(); NOVERIFY.check_hostname = False; NOVERIFY.verify_mode = ssl.CERT_NONE  # self-signed
 async def type_hello(pi, key):
-    async with websockets.connect(f"wss://{pi}:8000/ws?token={key}", ssl=NOVERIFY) as ws:
+    async with websockets.connect(f"wss://{pi}:8000/ws", ssl=NOVERIFY,
+                                  additional_headers={"X-API-Key": key}) as ws:   # header, not ?token=
         for c in ["KeyH","KeyI"]:
             await ws.send(json.dumps({"t":"kd","code":c}))
             await ws.send(json.dumps({"t":"ku","code":c}))
@@ -77,13 +80,13 @@ asyncio.run(type_hello("192.168.1.120","&lt;KEY&gt;"))</code></pre>
 <table>
 <tr><td><code>GET /snapshot</code></td><td>single JPEG of the target screen right now</td></tr>
 <tr><td><code>GET /stream</code></td><td>live MJPEG (<code>multipart/x-mixed-replace</code>) of the selected capture card. On slow links prefer <code>/ws/h264</code> or <code>/ws/video</code>.</td></tr>
-<tr><td><code>WS /ws/h264?token=&lt;KEY&gt;</code></td><td><b>H.264 video</b> (the low-bandwidth transport, ~0.4–3&nbsp;Mbit/s vs ~25 for MJPEG).
+<tr><td><code>WS /ws/h264</code></td><td><b>H.264 video</b> (the low-bandwidth transport, ~0.4–3&nbsp;Mbit/s vs ~25 for MJPEG).
     Each <b>BINARY</b> message is <code>[1 header byte (bit0&nbsp;=&nbsp;keyframe)]</code> + one Annex-B access unit;
     SPS/PPS ride on every frame, so decoding can start (and resync) at any keyframe — feed it to a WebCodecs
     <code>VideoDecoder</code> (no <code>description</code> = Annex-B). Hardware-encoded on the Pi at
     <code>[video] h264_bitrate</code>; a viewer that falls behind is resynced at the next keyframe. The socket
     closes immediately when <code>[video] h264=false</code> or ffmpeg is missing — fall back to <code>/ws/video</code>.</td></tr>
-<tr><td><code>WS /ws/video?token=&lt;KEY&gt;</code></td><td><b>Client-paced video.</b> Per frame the server sends a
+<tr><td><code>WS /ws/video</code></td><td><b>Client-paced video.</b> Per frame the server sends a
     <b>TEXT</b> message (JSON metadata <code>{ts,kb,level,q,scale}</code>) then the JPEG as a <b>BINARY</b>
     message, and waits for <b>any</b> reply before sending the next — so it always sends the freshest frame and
     bounds delay to ~1 frame + RTT (a slow link gets fewer fps, never a backlog). With <code>[video]
@@ -224,7 +227,9 @@ event instead of diffing state: <code>usb.enumerated</code>, <code>usb.enumerati
 <code>drive.editing</code>. Fold the coarse events to rebuild state; watch the semantic ones for edges.</p>
 <p>Browser — fold the stream into a live state object:</p>
 <pre><code>const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';        // match how the page was served
-const ws = new WebSocket(`${proto}${location.host}/ws/events?token=${KEY}`);  // browsers may also use the session cookie
+// In a browser the WebSocket API cannot set headers, so this is the one place ?token= is still required —
+// a page served by the appliance itself should just rely on the session cookie and drop the token entirely.
+const ws = new WebSocket(`${proto}${location.host}/ws/events?token=${KEY}`);
 const state = {};
 ws.onmessage = (e) =&gt; {
   const ev = JSON.parse(e.data);
@@ -239,7 +244,8 @@ async def watch(host, key):
     # HTTPS deployment: wss:// + a TLS context (self-signed -> no verify). Plain HTTP: use ws:// and ssl=None.
     ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
     state = {}
-    async with websockets.connect(f"wss://{host}:8000/ws/events?token={key}", ssl=ctx) as ws:
+    async with websockets.connect(f"wss://{host}:8000/ws/events", ssl=ctx,
+                                  additional_headers={"X-API-Key": key}) as ws:
         async for msg in ws:
             ev = json.loads(msg)
             if ev["type"] == "snapshot": state.update(ev)

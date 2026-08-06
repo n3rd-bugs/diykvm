@@ -136,11 +136,13 @@ async def origin_guard(request: Request, call_next):
     return await call_next(request)
 
 
-def _key_from_headers(request: Request) -> str:
-    a = request.headers.get("authorization", "")
+def _key_from_headers(conn) -> str:
+    """API key from `Authorization: Bearer <key>` or `X-Api-Key`. Takes any starlette connection -- both
+    Request and WebSocket expose .headers -- so HTTP and WebSocket auth read the key the same way."""
+    a = conn.headers.get("authorization", "")
     if a.lower().startswith("bearer "):
         return a[7:]
-    return request.headers.get("x-api-key", "")
+    return conn.headers.get("x-api-key", "")
 
 
 def require_auth(request: Request) -> bool:
@@ -156,8 +158,12 @@ def ws_authed(sock: WebSocket) -> bool:
     if not _origin_ok(sock.headers.get("origin"), sock.headers.get("host", "")):
         return False
     if sock.session.get("user"):
-        return True
-    return auth.check_api_key(cfg, sock.query_params.get("token", ""))
+        return True                        # browsers: the cookie (they cannot set WS headers at all)
+    # Agents: prefer a HEADER. ?token= works but the query string is written verbatim into the access log,
+    # so every connection leaks the key into the journal -- headers are not logged. Both are accepted; the
+    # header is checked first so a caller that sets it never has to put the key in the URL.
+    return (auth.check_api_key(cfg, _key_from_headers(sock))
+            or auth.check_api_key(cfg, sock.query_params.get("token", "")))
 
 
 # ----------------------------- login (rate-limited) -----------------------------
@@ -281,8 +287,9 @@ API_INFO = {
     "auth": {
         "type": "api_key",
         "obtain": "POST /api/login (form fields: username, password) -> {\"api_key\": \"...\"}",
-        "send": "HTTP header 'X-API-Key: <key>' or 'Authorization: Bearer <key>'; "
-                "for WebSockets append '?token=<key>' to the URL.",
+        "send": "HTTP header 'X-API-Key: <key>' or 'Authorization: Bearer <key>' -- the SAME headers work "
+                "on WebSockets. '?token=<key>' is still accepted for compatibility, but prefer the header: "
+                "uvicorn logs the WebSocket URL (query string included) to the journal, headers it does not.",
     },
     "endpoints": [
         {"method": "POST", "path": "/api/login", "auth": False, "body": "form: username, password",
@@ -300,14 +307,14 @@ API_INFO = {
                  "Annex-B access unit (SPS/PPS on every frame; join/rejoin at any keyframe). Hardware-encoded "
                  "on the Pi at [video] h264_bitrate (~0.4-3 Mbit/s vs ~25 for MJPEG); a viewer that falls "
                  "behind is resynced at the next keyframe. Closes immediately when [video] h264=false or "
-                 "ffmpeg is missing -- fall back to /ws/video. Auth like /ws (session cookie or ?token=)."},
+                 "ffmpeg is missing -- fall back to /ws/video. Auth like /ws (session cookie, or an API-key header)."},
         {"method": "WS", "path": "/ws/video", "auth": True,
          "desc": "Client-paced video: per frame the server sends a text message (JSON {ts,kb,level,q,scale}) "
                  "then the JPEG as a binary message, and waits for ANY reply before sending the next (always "
                  "the freshest). Bounds video delay to ~1 frame + RTT on any link -- a slow link gets fewer "
                  "fps, never a backlog -- and with [video] adaptive=true (default) frames are auto re-encoded "
                  "smaller when the measured send->ack cycle exceeds the latency budget. Auth like /ws "
-                 "(session cookie or ?token=)."},
+                 "(session cookie, or an API-key header)."},
         {"method": "GET", "path": "/api/video/sources", "auth": True, "desc": "Selectable capture cards (multi-PC): {sources:[{index,label}], active, multi}. Configure via [video] devices = Label:/dev/videoN, ..."},
         {"method": "POST", "path": "/api/video/select", "auth": True, "body": "{index}", "desc": "Switch the live stream to that capture card (restarts the streamer, ~1-2s). Only a configured [video] devices card is allowed."},
         {"method": "GET", "path": "/api/ocr", "auth": True, "query": "lang, psm, min_conf, region (x,y,w,h), scale, words",
@@ -1460,7 +1467,7 @@ async def ws_events(sock: WebSocket):
     serial.opened / serial.closed / serial.reconnected / serial.error[_cleared]), HID coming online
     (hid.online / hid.offline) and the virtual drive attaching (drive.attached / detached / editing). See
     target_events.EVENT_TYPES for the full list. ?replay=N replays up to N events from just before
-    connecting. Auth via ?token=<API key> (or session cookie)."""
+    connecting. Auth via an API-key header (or session cookie; ?token= still works)."""
     if not ws_authed(sock):
         await sock.close(code=1008)
         return
@@ -1959,8 +1966,9 @@ if __name__ == "__main__":
     import uvicorn
     # Bound graceful shutdown so a restart doesn't hang waiting on an open WebSocket (input/serial); after
     # this many seconds uvicorn force-closes connections. Clients just reconnect.
-    # access_log=False: WS endpoints take the API key as ?token=..., which uvicorn's access log would write
-    # to journald in cleartext. Auth failures/HTTP errors still surface via app logging.
+    # access_log=False: a ?token=<key> query string would otherwise be written to journald in cleartext.
+    # Note this does NOT cover the "WebSocket /path [accepted]" lines (a different uvicorn logger), which is
+    # why ws_authed accepts the key in a HEADER -- headers are never logged. Auth failures still surface.
     kw = dict(host=WEB_HOST, port=WEB_PORT, timeout_graceful_shutdown=5, access_log=False)
     if TLS_ACTIVE:
         kw["ssl_certfile"], kw["ssl_keyfile"] = TLS_CERT, TLS_KEY
